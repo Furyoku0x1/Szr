@@ -69,6 +69,38 @@ contract SzrRedemptionTest is SzrWorld {
         _assertCash();
     }
 
+    function testDonateSzrRetiresTokensToPublicInventory() public {
+        _acquire(alice);
+        uint256 amount = 100e18;
+        uint256 activeSupply = core.activeSupply();
+        uint256 inventory = core.unreleasedSupply();
+        uint256 publicInventory = core.publicInventory();
+        uint256 reserves = core.reserveCash();
+        uint256 nav = core.NAV();
+        Szr token = core.token();
+        uint256 donorBalance = token.balanceOf(alice);
+        uint256 coreBalance = token.balanceOf(address(core));
+        vm.startPrank(alice);
+        token.approve(address(core), amount);
+        core.donateSzr(amount);
+        vm.stopPrank();
+        assertEq(token.balanceOf(alice), donorBalance - amount);
+        assertEq(token.balanceOf(address(core)), coreBalance + amount);
+        assertEq(core.activeSupply(), activeSupply - amount);
+        assertEq(core.unreleasedSupply(), inventory + amount);
+        assertEq(core.publicInventory(), publicInventory + amount);
+        assertEq(core.reserveCash(), reserves);
+        assertGt(core.NAV(), nav);
+        _assertCash();
+    }
+
+    function testDonateSzrRejectsZeroAmount() public {
+        _acquire(alice);
+        vm.prank(alice);
+        vm.expectRevert(SzrCore.ZeroAmount.selector);
+        core.donateSzr(0);
+    }
+
     function testRecycleRequiresLiquidityController() public {
         _acquire(alice);
         vm.prank(alice);

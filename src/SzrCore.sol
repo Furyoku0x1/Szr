@@ -109,6 +109,7 @@ contract SzrCore is ReentrancyGuard {
     event BackingDonated(address indexed payer, uint256 amount);
     event Redeemed(address indexed owner, uint256 tokens, uint256 backing);
     event InventoryRecycled(uint256 tokens);
+    event SzrDonated(address indexed donor, uint256 tokens);
     event FeesAllocated(uint256 amount, uint256 reserves, uint256 team);
     event Initialized(address indexed liquidity, address indexed feeCollector);
     event Borrowed(
@@ -348,6 +349,17 @@ contract SzrCore is ReentrancyGuard {
         reserveCash -= backing;
         if (backing != 0) SafeTransferLib.safeTransfer(backingAsset, msg.sender, backing);
         emit Redeemed(msg.sender, amount, backing);
+    }
+
+    /// @notice Retires donated SZR into unreleased public auction inventory.
+    function donateSzr(uint256 amount) external nonReentrant live {
+        if (amount == 0) revert ZeroAmount();
+        uint256 beforeBalance = SafeTransferLib.balanceOf(address(token), address(this));
+        SafeTransferLib.safeTransferFrom(address(token), msg.sender, address(this), amount);
+        uint256 afterBalance = SafeTransferLib.balanceOf(address(token), address(this));
+        if (afterBalance != beforeBalance + amount) revert TransferAmountMismatch();
+        _retire(amount);
+        emit SzrDonated(msg.sender, amount);
     }
 
     /// @notice Only the fixed liquidity controller returns authenticated trading-fee tokens.
