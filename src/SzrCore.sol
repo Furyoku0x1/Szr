@@ -234,10 +234,14 @@ contract SzrCore is ReentrancyGuard {
         return startedAt + 1 days;
     }
 
+    /// @notice Active claims include tokens held by the one-sided genesis position or any other pool.
+    /// @dev Pool composition does not change active supply; only issuance and retirement do.
     function activeSupply() public view returns (uint256) {
         return token.totalSupply() - unreleasedSupply;
     }
 
+    /// @notice Core cash and collateral-backed loan principal. Pool reserves are trading depth, not backing.
+    /// @dev WETH in the one-sided genesis position is excluded because swaps can remove it.
     function backingAmount() public view returns (uint256) {
         return reserveCash + loanPrincipal;
     }
