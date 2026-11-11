@@ -450,6 +450,8 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         uint256 deadline
     ) internal {
         if (!started) revert NotStarted();
+        // Genesis POL is permanent: its SZR leaves only to pool buyers, never via the manager.
+        if (id == INITIAL_POSITION) revert InvalidPool();
         if (units == 0) revert InvalidUnits();
         SafeCastLib.toUint128(units);
         Deposit memory result =

@@ -95,6 +95,7 @@ contract SzrCore is ReentrancyGuard {
     error UncoveredLoan();
     error DeadlinePassed();
     error AccountingMismatch();
+    error NoActiveSupply();
 
     event MigrationClosed(uint256 unusedAllocation);
     event MigrationConfigured(
@@ -328,8 +329,10 @@ contract SzrCore is ReentrancyGuard {
         emit AuctionPurchased(msg.sender, amount, payment, backing, funding);
     }
 
+    /// @dev With zero active supply the first (even dust) holder would capture the whole gift.
     function donateBacking(uint256 amount) external nonReentrant live {
         if (amount == 0) revert ZeroAmount();
+        if (activeSupply() == 0) revert NoActiveSupply();
         _receiveBacking(msg.sender, amount);
         reserveCash += amount;
         emit BackingDonated(msg.sender, amount);

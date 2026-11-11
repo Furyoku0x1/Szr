@@ -154,14 +154,19 @@ holder-funded initial liquidity contribution.
 Use ordinary pool IDs for full-range positions and `INITIAL_POSITION()` for the launch position.
 `fundInitialLiquidity(minimumUnits, deadline)` funds the configured target once, entirely from its
 caller's active SZR balance. Core has no special initial-liquidity release path. Fees are collected
-through `collect(id)` for either position. Removed initial principal stays in custody and can be
-redeployed to ordinary positions. Different-partner moves can use withdrawal, bounded swaps,
+through `collect(id)` for either position. The initial position is permanent: `withdrawPrincipal`
+and `moveLiquidity` reject it, so its SZR leaves only to pool buyers. Different-partner moves can use withdrawal, bounded swaps,
 and deployment in separate steps. Unspent assets remain held.
 
 Every removal separates principal from fees. Internal moves cannot issue SZR, consume sale allowance,
 or turn liquidity principal into revenue. There is no general withdrawal, arbitrary recipient,
 external allowance setter, or arbitrary execution function. Pool assets and held WETH do not count
 as floor reserves and cannot be borrowed through Core.
+
+**The manager is a trusted role.** `addPool`, `deployPrincipal` and `swapPrincipal` can route held
+treasury assets and non-genesis positions through any pool the manager chooses, with a
+manager-set minimum output, so a malicious manager could transfer that value away. Floor reserves
+in Core and the permanent genesis position are out of its reach. Use a multisig.
 
 The manager controls asset/hook selection, allocation, and trade execution prices. It is trusted
 not to choose harmful hooks or assets, manipulated markets, or inappropriate slippage settings.

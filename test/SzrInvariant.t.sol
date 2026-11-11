@@ -155,6 +155,16 @@ contract SzrHandler is Test {
         core.donateBacking(amount);
     }
 
+    function donateTokens(uint256 actor, uint256 rawAmount) external preserveNAV {
+        address owner = actors[actor % 3];
+        uint256 held = token.balanceOf(owner);
+        if (held == 0) return;
+        uint256 amount = bound(rawAmount, 1, held);
+        if (amount == core.activeSupply()) return;
+        vm.prank(owner);
+        core.donateSzr(amount);
+    }
+
     function swap(uint256 actor, bool inputBacking, uint256 rawAmount) external preserveNAV {
         address owner = actors[actor % 3];
         address input = inputBacking ? address(backing) : address(token);
@@ -212,7 +222,8 @@ contract SzrInvariantTest is SzrWorld {
         handler = new SzrHandler(core, locker, jar, swapper);
         locker.nominateManager(address(handler));
         handler.acceptManagement();
-        bytes4[] memory selectors = new bytes4[](13);
+        bytes4[] memory selectors = new bytes4[](14);
+        selectors[13] = handler.donateTokens.selector;
         selectors[0] = handler.acquire.selector;
         selectors[1] = handler.borrow.selector;
         selectors[2] = handler.repay.selector;
