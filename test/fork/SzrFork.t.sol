@@ -19,8 +19,8 @@ import { Liquidity } from "../../src/Liquidity.sol";
 contract SzrForkTest is Test {
     address internal constant LEGACY = 0xbeD7c1660a01dbEEe225bd893ac31727a91A5773;
     uint256 internal constant INITIAL = 25_000_000e18;
-    // Real holders of the old token, impersonated on the fork to supply and migrate it.
-    address[7] internal funders = [
+    // Real holders of the old token, impersonated on the fork to migrate it.
+    address[7] internal holders = [
         0xA365B69A5AfCe3BD08577a9420902354365E951e,
         0x1305869ceD9527EA23f30E116f6E8dC7AdC21122,
         0xF27E6D330D1f61A01e17C987B07dB416434C2c85,
@@ -59,39 +59,35 @@ contract SzrForkTest is Test {
         config.teamBeneficiary = address(0xBEEF);
         config.manager = TEAM;
         config.legacyToken = LEGACY;
-        config.marketPrice = 4e12;
+        config.marketPrice = 507e9; // the script default: about 1.05x the fully migrated NAV
         config.bootstrapNAV = 1e12;
         config.launchAllocation = 350_000_000e18;
         config.initialLiquidityTokens = INITIAL;
-        config.auction = SzrCore.AuctionConfig(8e12, 1, 20_000e18);
+        config.auction = SzrCore.AuctionConfig(1014e9, 1, 20_000e18);
     }
 
-    /// Runs the real deploy script, with the deployer migrating 25M and funding genesis.
+    /// Runs the real deploy script; genesis liquidity comes from Core, not the deployer.
     function _deploy() internal {
         DeploySzr deployment = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr"));
-        uint256 snapshot = vm.snapshotState();
-        (SzrCore trial,,) = deployment.run(_config());
-        address broadcaster = trial.initializer();
-        vm.revertToState(snapshot); // also resets this contract's storage
-        deployer = broadcaster;
-        uint256 needed = INITIAL;
-        for (uint256 index; index < funders.length; index++) {
-            uint256 held = old.balanceOf(funders[index]);
-            uint256 amount = held < needed ? held : needed;
-            vm.prank(funders[index]);
-            old.transfer(deployer, amount);
-            needed -= amount;
-        }
-        assertEq(needed, 0, "impersonated holders no longer hold 25M old SZR at this block");
         DeploySzr.Config memory config = _config();
         config.fundInitialLiquidity = true;
-        config.initialLiquidityMinimumBacking = hook.quoteSellExactIn(INITIAL).netWethOut;
         (core,, locker) = deployment.run(config);
+        deployer = core.initializer();
         migrator = SzrMigration(core.migration());
         // The team address takes over; from here the deployer has no authority.
         assertEq(locker.pendingManager(), TEAM);
         vm.prank(TEAM);
         locker.acceptManager();
+    }
+
+    function _migrateAll(address owner) internal returns (uint256 amount, uint256 recovered) {
+        amount = old.balanceOf(owner);
+        assertGt(amount, 0, "impersonated holder no longer holds old SZR at this block");
+        (recovered,,) = migrator.quote(amount);
+        vm.startPrank(owner);
+        old.approve(address(migrator), amount);
+        assertEq(migrator.migrate(amount, recovered, block.timestamp), recovered);
+        vm.stopPrank();
     }
 
     function testLegacyHookPaysOneFlatPriceUpToCirculatingSupply() public {
@@ -118,41 +114,71 @@ contract SzrForkTest is Test {
 
     function testFullLaunchAgainstTheLiveLegacyHook() public {
         if (!live) return vm.skip(true);
-        uint256 quoted = hook.quoteSellExactIn(INITIAL).netWethOut;
         uint256 hookWeth = weth.balanceOf(address(hook));
         _deploy();
 
-        // The deploy script migrated 25M through the real hook and funded the genesis position.
+        // The deploy script funded the genesis position from Core's own inventory.
         assertTrue(locker.initialLiquidityFunded());
-        assertEq(core.activeSupply(), INITIAL);
-        assertEq(core.reserveCash(), quoted);
-        assertEq(weth.balanceOf(address(core)), quoted);
-        assertEq(hookWeth - weth.balanceOf(address(hook)), quoted);
+        uint256 genesis = core.activeSupply();
+        assertGt(genesis, INITIAL - 1e18);
+        assertEq(core.reserveCash(), 0);
+        assertEq(core.migrationRemaining(), 350_000_000e18);
+        assertEq(old.balanceOf(deployer), 0);
+        assertEq(weth.balanceOf(address(hook)), hookWeth);
         assertEq(core.auctionsOpenAt(), 0);
-        uint256 nav = core.NAV();
-        emit log_named_decimal_uint("NAV after the deployer's migration", nav, 18);
 
-        // A second real holder migrates everything: same price, so NAV does not move.
-        uint256 amount = old.balanceOf(HOLDER);
-        assertGt(amount, 0);
-        (uint256 expected,,) = migrator.quote(amount);
-        vm.startPrank(HOLDER);
-        old.approve(address(migrator), amount);
-        assertEq(migrator.migrate(amount, expected, block.timestamp), expected);
+        // Real holders migrate through the real hook, each at the same flat price.
+        uint256 migrated;
+        uint256 recovered;
+        for (uint256 index; index < holders.length; index++) {
+            (uint256 amount, uint256 backing) = _migrateAll(holders[index]);
+            migrated += amount;
+            recovered += backing;
+        }
+        (uint256 own, uint256 ownBacking) = _migrateAll(HOLDER);
+        migrated += own;
+        recovered += ownBacking;
         IERC20 szr = IERC20(address(core.token()));
-        assertEq(szr.balanceOf(HOLDER), amount);
-        assertApproxEqAbs(core.NAV(), nav, 1);
+        assertEq(szr.balanceOf(HOLDER), own);
+        assertEq(core.reserveCash(), recovered);
+        assertEq(hookWeth - weth.balanceOf(address(hook)), recovered);
+
+        // The unbacked genesis tokens share the reserves, so NAV is below what each migrator
+        // brought in.
+        uint256 nav = core.NAV();
+        assertEq(nav, recovered * 1e18 / (genesis + migrated));
+        assertLt(nav, hook.quoteSellExactIn(1e18).netWethOut);
+        emit log_named_decimal_uint("old SZR migrated in this rehearsal", migrated, 18);
+        emit log_named_decimal_uint("NAV after those migrations", nav, 18);
+        uint256 sellable = old.totalSupply() - old.balanceOf(address(hook)) - 1;
+        emit log_named_decimal_uint(
+            "NAV if every sellable old SZR migrates",
+            (recovered + hook.quoteSellExactIn(sellable).netWethOut) * 1e18
+                / (genesis + migrated + sellable),
+            18
+        );
 
         // Redemption pays real WETH at NAV while migration is still open.
-        szr.approve(address(core), amount);
-        uint256 paid = core.redeem(amount / 2, 0);
-        assertEq(weth.balanceOf(HOLDER), paid);
-        assertApproxEqAbs(paid, amount / 2 * nav / 1e18, 1e6);
+        vm.startPrank(HOLDER);
+        szr.approve(address(core), own);
+        uint256 paid = core.redeem(own / 2, 0);
         vm.stopPrank();
+        assertEq(weth.balanceOf(HOLDER), paid);
+        assertApproxEqAbs(paid, own / 2 * nav / 1e18, 1e6);
 
         _buyFromPool(szr);
         _openAndBuyFromAuction(szr);
         assertEq(weth.balanceOf(address(core)), core.reserveCash());
+
+        // The genesis price stays above NAV even after everyone has migrated.
+        assertGt(_config().marketPrice, nav);
+        // The script refuses a genesis price below the highest NAV migration could reach.
+        // Last, because a reverted script run leaves its broadcast open.
+        DeploySzr.Config memory low = _config();
+        low.marketPrice = hook.quoteSellExactIn(1e18).netWethOut * 350 / 375 - 1;
+        DeploySzr deployment = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr"));
+        vm.expectRevert(DeploySzr.InitialPriceBelowNav.selector);
+        deployment.run(low);
     }
 
     /// The genesis pool trades on the real PoolManager before migration closes.
@@ -211,5 +237,31 @@ contract SzrForkTest is Test {
         szr.approve(address(core), 50_000e18);
         core.borrow(50_000e18, core.backingRequired(25_000e18));
         vm.stopPrank();
+        _manageLiquidity(szr, funding);
+    }
+
+    /// The team address turns sale funding into pool liquidity on the real PoolManager.
+    function _manageLiquidity(IERC20 szr, uint256 funding) internal {
+        PoolKey memory pool = locker.key(0);
+        bool wethIn = Currency.unwrap(pool.currency0) == address(weth);
+        vm.startPrank(TEAM);
+        (uint256 spent, uint256 received) = locker.swapPrincipal(
+            pool,
+            wethIn,
+            funding / 2,
+            1,
+            wethIn ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1,
+            block.timestamp
+        );
+        assertEq(spent, funding / 2);
+        assertGt(received, 0);
+        locker.deployPrincipal(
+            0, 1e15, Liquidity.Bounds(type(uint256).max, type(uint256).max, block.timestamp)
+        );
+        vm.stopPrank();
+        assertEq(locker.liquidityHeld(0), 1e15);
+        assertEq(weth.balanceOf(address(locker)), locker.heldPrincipal(address(weth)));
+        assertEq(szr.balanceOf(address(locker)), locker.heldPrincipal(address(szr)));
+        assertLe(locker.unallocatedFunding(), locker.heldPrincipal(address(weth)));
     }
 }

@@ -3,7 +3,6 @@ pragma solidity 0.8.30;
 
 import { console2 } from "forge-std/console2.sol";
 import { Script } from "forge-std/Script.sol";
-import { IERC20 } from "forge-std/interfaces/IERC20.sol";
 import { FixedPointMathLib } from "solady/utils/FixedPointMathLib.sol";
 import { SafeCastLib } from "solady/utils/SafeCastLib.sol";
 import { IHooks } from "v4-core/interfaces/IHooks.sol";
@@ -29,7 +28,6 @@ contract DeploySzr is Script {
         uint256 initialLiquidityTokens;
         SzrCore.AuctionConfig auction;
         bool fundInitialLiquidity;
-        uint256 initialLiquidityMinimumBacking;
     }
 
     error WrongChain();
@@ -37,6 +35,7 @@ contract DeploySzr is Script {
     error MissingPoolManager();
     error InvalidMarketPrice();
     error ManagerIsDeployer();
+    error InitialPriceBelowNav();
 
     function run() external returns (SzrCore core, FeeCollector jar, Liquidity locker) {
         return run(_readConfig());
@@ -63,7 +62,12 @@ contract DeploySzr is Script {
         _setupMigration(core, config);
         _setupPools(core, locker, config.marketPrice);
         core.launch();
-        if (config.fundInitialLiquidity) _fundInitialLiquidity(core, locker, config);
+        // Genesis liquidity comes straight from Core's inventory; the deployer supplies nothing.
+        if (config.fundInitialLiquidity) {
+            if (core.initialLiquidityTarget() != 0) {
+                locker.fundInitialLiquidity(0, type(uint256).max);
+            }
+        }
         // The deployer only sets up; a separate manager takes over once it accepts.
         if (config.manager != address(0)) {
             if (config.manager == setupManager) revert ManagerIsDeployer();
@@ -86,7 +90,7 @@ contract DeploySzr is Script {
         config.manager = vm.envAddress("MANAGER");
         config.legacyToken =
             vm.envOr("LEGACY_SZR", address(0xbeD7c1660a01dbEEe225bd893ac31727a91A5773));
-        config.marketPrice = vm.envOr("INITIAL_MARKET_PRICE", uint256(4e12));
+        config.marketPrice = vm.envOr("INITIAL_MARKET_PRICE", uint256(507e9));
         if (config.marketPrice < 1e6) revert InvalidMarketPrice();
         if (config.marketPrice > 1e30) revert InvalidMarketPrice();
         config.bootstrapNAV = vm.envOr("BOOTSTRAP_NAV", uint256(1e12));
@@ -99,30 +103,17 @@ contract DeploySzr is Script {
             vm.envOr("AUCTION_BUFFER", uint256(20_000e18))
         );
         config.fundInitialLiquidity = vm.envOr("FUND_INITIAL_LIQUIDITY", true);
-        if (!config.fundInitialLiquidity) return config;
-        if (config.launchAllocation == 0) return config;
-        if (config.initialLiquidityTokens == 0) return config;
-        // Required: the least WETH the deployer's own legacy sale may recover.
-        config.initialLiquidityMinimumBacking = vm.envUint("INITIAL_LIQUIDITY_MIN_BACKING");
-    }
-
-    /// @dev The deployer migrates its own legacy SZR and contributes it as the genesis position,
-    /// so those are the only active tokens when migration opens to everyone else.
-    function _fundInitialLiquidity(SzrCore core, Liquidity locker, Config memory config)
-        internal
-    {
-        uint256 amount = core.initialLiquidityTarget();
-        if (amount == 0) return;
-        SzrMigration migrator = SzrMigration(core.migration());
-        IERC20(config.legacyToken).approve(address(migrator), amount);
-        migrator.migrate(amount, config.initialLiquidityMinimumBacking, type(uint256).max);
-        IERC20(address(core.token())).approve(address(locker), amount);
-        locker.fundInitialLiquidity(0, type(uint256).max);
     }
 
     function _setupMigration(SzrCore core, Config memory config) internal {
         if (config.launchAllocation == 0) return;
         ILegacySzrHook hook = ILegacySzrHook(ILegacySzrToken(config.legacyToken).hook());
+        // Genesis liquidity must not start below the highest NAV migration can reach, or it
+        // would be bought and redeemed against reserves at a profit. That NAV is what one old
+        // SZR recovers now, diluted by the genesis tokens, with the whole allocation migrated.
+        uint256 recovered = hook.quoteSellExactIn(1e18).netWethOut * config.launchAllocation;
+        uint256 claims = config.launchAllocation + config.initialLiquidityTokens;
+        if (config.marketPrice * claims < recovered) revert InitialPriceBelowNav();
         SzrMigration migrator = new SzrMigration(core, config.legacyToken, hook);
         core.configureMigration(
             address(migrator), config.launchAllocation, config.initialLiquidityTokens

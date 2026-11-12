@@ -433,7 +433,11 @@ contract SzrMigrationTest is Test {
         fresh.configureMigration(address(migration), 0, 0);
         vm.expectRevert(SzrCore.InsufficientInventory.selector);
         fresh.configureMigration(address(migration), 1_000_000_000e18 + 1, 0);
-        fresh.configureMigration(address(migration), ALLOCATION, 0);
+        // Genesis liquidity must fit in public inventory beside the migration reservation.
+        vm.expectRevert(SzrCore.InsufficientInventory.selector);
+        fresh.configureMigration(address(migration), ALLOCATION, 650_000_000e18 + 1);
+        fresh.configureMigration(address(migration), ALLOCATION, 650_000_000e18);
+        assertEq(fresh.initialLiquidityTarget(), 650_000_000e18);
         vm.expectRevert(SzrCore.MigrationAlreadyConfigured.selector);
         fresh.configureMigration(address(migration), ALLOCATION, 0);
         vm.prank(alice);

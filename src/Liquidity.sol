@@ -4,6 +4,7 @@ pragma solidity 0.8.30;
 import { FixedPointMathLib } from "solady/utils/FixedPointMathLib.sol";
 import { SafeCastLib } from "solady/utils/SafeCastLib.sol";
 import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
+import { Multicallable } from "solady/utils/Multicallable.sol";
 import { ReentrancyGuard } from "solady/utils/ReentrancyGuard.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { IUnlockCallback } from "v4-core/interfaces/callback/IUnlockCallback.sol";
@@ -21,7 +22,9 @@ import { FeeCollector } from "./FeeCollector.sol";
 /// @notice Native v4 treasury. All positions and idle principal belong to this contract.
 /// @dev Core alone funds acquisition WETH. The manager allocates it; no withdrawal recipient
 /// exists.
-contract Liquidity is ReentrancyGuard, IUnlockCallback {
+/// @dev `multicall` batches several calls into one atomic transaction, for example two swaps
+/// and a deployment. Each inner call keeps its own access check and reentrancy guard.
+contract Liquidity is ReentrancyGuard, Multicallable, IUnlockCallback {
     using StateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
 
@@ -88,6 +91,7 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
     FeeCollector public immutable feeJar;
     IPoolManager public immutable poolManager;
     address public immutable token;
+    address public immutable backingAsset;
     bytes32 public immutable poolManagerHash;
     address public manager;
     address public pendingManager;
@@ -99,7 +103,13 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
     mapping(address asset => uint256 amount) public heldPrincipal;
     /// @notice Notice period before held WETH can be sent to a newly announced destination.
     uint256 public constant DESTINATION_DELAY = 7 days;
+    /// @notice Pools the manager may deploy principal into or swap through: every pool added
+    /// with `addPool`, plus swap-only routes added with `registerRoute`.
+    mapping(bytes32 poolId => bool registered) public poolRegistered;
     mapping(address destination => uint256 readyAt) public destinationReadyAt;
+    /// @notice Sale funding that has never been deployed or swapped. Only this can be sent to a
+    /// destination; anything that has been liquidity stays available for liquidity only.
+    uint256 public unallocatedFunding;
     bytes32 internal expectedCallback;
 
     error ZeroAddress();
@@ -129,6 +139,7 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
     error TransferAmountMismatch();
     error AccountingMismatch();
     error DestinationNotReady();
+    error PoolNotRegistered();
 
     event PoolAdded(uint256 indexed id, bytes32 indexed poolId, address indexed partner);
     event ManagerNominated(address indexed nominee);
@@ -143,6 +154,7 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
     event FeesCollected(uint256 indexed id, uint256 szr, uint256 partner);
     event DestinationAnnounced(address indexed destination, uint256 readyAt);
     event DestinationRevoked(address indexed destination);
+    event RouteRegistered(bytes32 indexed poolId);
     event FundingSent(address indexed destination, uint256 weth);
 
     modifier onlyManager() {
@@ -166,6 +178,7 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         poolManager = venue;
         poolManagerHash = address(venue).codehash;
         token = address(reserveCore.token());
+        backingAsset = reserveCore.backingAsset();
         manager = operator;
     }
 
@@ -212,7 +225,7 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         feeJar.registerAsset(config.partner, feeConfig);
     }
 
-    /// @notice Registers the one-sided position that an existing holder will fund after launch.
+    /// @notice Registers the one-sided genesis position that Core's allocation funds after launch.
     function setInitialPool(
         PoolConfig calldata config,
         FeeCollector.AssetConfig calldata feeConfig
@@ -244,6 +257,7 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         else if (current != config.initialSqrtPriceX96) revert InvalidPrice();
         if (id == INITIAL_POSITION) _validateInitialPrice(config, first);
         positions[id] = Position(pool, config.partner, config.tickLower, config.tickUpper, 0);
+        poolRegistered[PoolId.unwrap(pool.toId())] = true;
         emit PoolAdded(id, PoolId.unwrap(pool.toId()), config.partner);
     }
 
@@ -298,8 +312,10 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         }
     }
 
-    /// @notice A holder explicitly contributes active SZR to permanent initial POL.
-    /// @dev Migration pays the holder 1:1 first; this function never draws Core inventory.
+    /// @notice Places Core's fixed genesis allocation as permanent one-sided POL. Anyone may
+    /// trigger it, once, while migration is open; the caller supplies and receives nothing.
+    /// @dev The whole allocation goes into the genesis position; any rounding remainder
+    /// returns to Core's inventory and never becomes held principal.
     function fundInitialLiquidity(uint256 minimumUnits, uint256 deadline)
         external
         nonReentrant
@@ -314,7 +330,7 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         uint256 units = _initialUnits(entry, maximum);
         if (units < minimumUnits) revert BelowMinimum();
         uint256 beforeBalance = SafeTransferLib.balanceOf(token, address(this));
-        SafeTransferLib.safeTransferFrom(token, msg.sender, address(this), maximum);
+        if (core.releaseInitialLiquidity() != maximum) revert AccountingMismatch();
         if (SafeTransferLib.balanceOf(token, address(this)) != beforeBalance + maximum) {
             revert TransferAmountMismatch();
         }
@@ -335,9 +351,7 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         if (result.partner != 0) revert AccountingMismatch();
         if (spent > maximum) revert AboveMaximum();
         _routeFees(INITIAL_POSITION, result);
-        if (spent != maximum) {
-            SafeTransferLib.safeTransfer(token, msg.sender, maximum - spent);
-        }
+        if (spent != maximum) _recycle(maximum - spent);
         if (SafeTransferLib.balanceOf(token, address(this)) != beforeBalance) {
             revert TransferAmountMismatch();
         }
@@ -366,6 +380,15 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         started = true;
     }
 
+    /// @notice Registers an existing pool, such as WETH/partner, that the manager may swap
+    /// through. Principal never trades through a pool that is not on this list.
+    function registerRoute(PoolKey calldata pool) external nonReentrant onlyManager {
+        (uint160 current,,,) = poolManager.getSlot0(pool.toId());
+        if (current == 0) revert InvalidPool();
+        poolRegistered[PoolId.unwrap(pool.toId())] = true;
+        emit RouteRegistered(PoolId.unwrap(pool.toId()));
+    }
+
     /// @notice Announces where held WETH may be sent once the notice period has passed.
     function announceDestination(address destination) external nonReentrant onlyManager {
         if (destination == address(0)) revert ZeroAddress();
@@ -382,8 +405,10 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         emit DestinationRevoked(destination);
     }
 
-    /// @notice Sends held WETH to an announced destination, for uses beyond pool liquidity.
-    /// @dev Only the backing asset can leave this way; SZR and every position stay in custody.
+    /// @notice Sends untouched sale funding to an announced destination, for uses beyond pool
+    /// liquidity.
+    /// @dev Only WETH that came from sales and was never deployed or swapped can leave this
+    /// way. SZR, every position, and WETH returned from a position or a swap stay in custody.
     function sendFunding(address destination, uint256 amount)
         external
         nonReentrant
@@ -393,10 +418,10 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         if (readyAt == 0) revert DestinationNotReady();
         if (block.timestamp < readyAt) revert DestinationNotReady();
         if (amount == 0) revert InvalidUnits();
-        address weth = core.backingAsset();
-        if (amount > heldPrincipal[weth]) revert MissingContribution();
-        heldPrincipal[weth] -= amount;
-        SafeTransferLib.safeTransfer(weth, destination, amount);
+        if (amount > unallocatedFunding) revert MissingContribution();
+        unallocatedFunding -= amount;
+        heldPrincipal[backingAsset] -= amount;
+        SafeTransferLib.safeTransfer(backingAsset, destination, amount);
         emit FundingSent(destination, amount);
     }
 
@@ -404,11 +429,12 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
     function recordFunding(uint256 amount) external nonReentrant {
         if (msg.sender != address(core)) revert NotCore();
         if (!started) revert NotStarted();
-        address weth = core.backingAsset();
-        if (SafeTransferLib.balanceOf(weth, address(this)) < heldPrincipal[weth] + amount) {
+        uint256 held = heldPrincipal[backingAsset];
+        if (SafeTransferLib.balanceOf(backingAsset, address(this)) < held + amount) {
             revert AccountingMismatch();
         }
-        heldPrincipal[weth] += amount;
+        heldPrincipal[backingAsset] = held + amount;
+        unallocatedFunding += amount;
         emit LiquidityFunded(amount);
     }
 
@@ -472,15 +498,55 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
     }
 
     function moveLiquidity(Move calldata request) external nonReentrant onlyManager {
+        _withdrawForMove(request);
+        _deployHeld(request.destination, request.addedUnits, request.depositBounds);
+    }
+
+    /// @notice The same move with one swap in the middle, so liquidity can go between pools
+    /// with different partner tokens in a single transaction.
+    /// @dev The swap may convert only what this move just withdrew; a larger amount is capped.
+    function moveLiquidityWithSwap(Move calldata request, SwapRequest calldata swap)
+        external
+        nonReentrant
+        onlyManager
+    {
+        (uint256 szr, uint256 partner) = _withdrawForMove(request);
+        address input =
+            Currency.unwrap(swap.zeroForOne ? swap.key.currency0 : swap.key.currency1);
+        uint256 limit;
+        if (input == token) limit = szr;
+        else if (input == _position(request.source).partner) limit = partner;
+        _swapHeld(
+            swap.key,
+            swap.zeroForOne,
+            swap.amount < limit ? swap.amount : limit,
+            swap.minimumOut,
+            swap.sqrtPriceLimitX96
+        );
+        _deployHeld(request.destination, request.addedUnits, request.depositBounds);
+    }
+
+    function _withdrawForMove(Move calldata request)
+        internal
+        returns (uint256 szr, uint256 partner)
+    {
         if (request.source == request.destination) revert InvalidPool();
-        _withdrawHeld(
+        return _withdrawHeld(
             request.source,
             request.removedUnits,
             request.minimumSzr,
             request.minimumPartner,
             request.depositBounds.deadline
         );
-        _deployHeld(request.destination, request.addedUnits, request.depositBounds);
+    }
+
+    /// @dev Spends held assets. Principal returned from pools is used before untouched sale
+    /// funding, so `unallocatedFunding` only ever shrinks here.
+    function _spendHeld(address asset, uint256 amount) internal {
+        uint256 remaining = heldPrincipal[asset] - amount;
+        heldPrincipal[asset] = remaining;
+        if (asset != backingAsset) return;
+        if (unallocatedFunding > remaining) unallocatedFunding = remaining;
     }
 
     function _withdrawHeld(
@@ -489,7 +555,7 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         uint256 minSzr,
         uint256 minPartner,
         uint256 deadline
-    ) internal {
+    ) internal returns (uint256, uint256) {
         if (!started) revert NotStarted();
         // Genesis POL is permanent: its SZR leaves only to pool buyers, never via the manager.
         if (id == INITIAL_POSITION) revert InvalidPool();
@@ -501,6 +567,7 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         heldPrincipal[_position(id).partner] += result.partner;
         _routeFees(id, result);
         emit PrincipalHeld(id, units, result.szr, result.partner);
+        return (result.szr, result.partner);
     }
 
     function _deployHeld(uint256 id, uint256 units, Bounds memory bounds) internal {
@@ -516,7 +583,7 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         }
         Deposit memory result = _modify(id, int256(units), bounds);
         heldPrincipal[token] -= result.szr;
-        heldPrincipal[partner] -= result.partner;
+        _spendHeld(partner, result.partner);
         _routeFees(id, result);
         emit PrincipalDeployed(id, units, result.szr, result.partner);
     }
@@ -531,8 +598,20 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         uint160 sqrtPriceLimitX96,
         uint256 deadline
     ) external nonReentrant onlyManager returns (uint256 spent, uint256 received) {
-        if (!started) revert NotStarted();
         if (block.timestamp > deadline) revert DeadlinePassed();
+        return _swapHeld(pool, zeroForOne, amount, minimumOut, sqrtPriceLimitX96);
+    }
+
+    /// @dev One swap of held assets; shared by the standalone trade and the atomic move.
+    function _swapHeld(
+        PoolKey memory pool,
+        bool zeroForOne,
+        uint256 amount,
+        uint256 minimumOut,
+        uint160 sqrtPriceLimitX96
+    ) internal returns (uint256 spent, uint256 received) {
+        if (!started) revert NotStarted();
+        if (!poolRegistered[PoolId.unwrap(pool.toId())]) revert PoolNotRegistered();
         if (amount == 0) revert InvalidUnits();
         if (amount > uint256(uint128(type(int128).max))) revert InvalidUnits();
         address input = Currency.unwrap(zeroForOne ? pool.currency0 : pool.currency1);
@@ -544,7 +623,7 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
             SwapRequest(pool, zeroForOne, amount, minimumOut, sqrtPriceLimitX96);
         bytes memory response = _unlock(abi.encode(true, abi.encode(request)));
         (spent, received) = abi.decode(response, (uint256, uint256));
-        heldPrincipal[input] -= spent;
+        _spendHeld(input, spent);
         heldPrincipal[output] += received;
         emit PrincipalSwapped(input, output, spent, received);
     }
@@ -722,12 +801,15 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         }
     }
 
+    /// @dev Returns SZR to Core's unreleased inventory.
+    function _recycle(uint256 amount) internal {
+        SafeTransferLib.safeApprove(token, address(core), amount);
+        core.recycle(amount);
+        SafeTransferLib.safeApprove(token, address(core), 0);
+    }
+
     function _routeFees(uint256 id, Deposit memory result) internal {
-        if (result.szrFees != 0) {
-            SafeTransferLib.safeApprove(token, address(core), result.szrFees);
-            core.recycle(result.szrFees);
-            SafeTransferLib.safeApprove(token, address(core), 0);
-        }
+        if (result.szrFees != 0) _recycle(result.szrFees);
         if (result.partnerFees != 0) {
             address partner = _position(id).partner;
             SafeTransferLib.safeTransfer(partner, address(feeJar), result.partnerFees);

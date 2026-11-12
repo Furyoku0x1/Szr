@@ -12,15 +12,18 @@ import { PoolModifyLiquidityTest } from "v4-core/test/PoolModifyLiquidityTest.so
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { Hooks } from "v4-core/libraries/Hooks.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
+import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
 import { Currency } from "v4-core/types/Currency.sol";
 
 contract MetaLiquidityTest is SzrWorld {
+    using PoolIdLibrary for PoolKey;
+
     function _newPool(uint24 fee, IHooks hooks) internal returns (uint256 id) {
         Liquidity.PoolConfig memory config = _config();
         config.feePips = fee;
         config.hooks = hooks;
         FeeCollector.AssetConfig memory unused;
-        return locker.addPool(config, unused);
+        id = locker.addPool(config, unused);
     }
 
     function testMigrationPreservesFloorAndDoesNotIssueTokens() public {
@@ -51,6 +54,166 @@ contract MetaLiquidityTest is SzrWorld {
         assertEq(core.totalReleased(), released);
         assertEq(core.token().balanceOf(address(this)), managerTokens);
         assertEq(backing.balanceOf(address(this)), managerWeth);
+        _assertCash();
+    }
+
+    /// A third token paired with SZR, plus an outside WETH/USD pool to convert through.
+    function _usdPools() internal returns (TestAsset usd, uint256 id, PoolKey memory route) {
+        usd = new TestAsset();
+        Liquidity.PoolConfig memory config = _config();
+        config.partner = address(usd);
+        id = locker.addPool(config, FeeCollector.AssetConfig(1e18, 20_000e18, 1e12));
+        bool wethFirst = address(backing) < address(usd);
+        route = PoolKey(
+            Currency.wrap(wethFirst ? address(backing) : address(usd)),
+            Currency.wrap(wethFirst ? address(usd) : address(backing)),
+            3_000,
+            60,
+            IHooks(address(0))
+        );
+        manager.initialize(route, uint160(1 << 96));
+        PoolModifyLiquidityTest provider = new PoolModifyLiquidityTest(manager);
+        backing.mint(address(this), 1_000_000e18);
+        usd.mint(address(this), 1_000_000e18);
+        backing.approve(address(provider), type(uint256).max);
+        usd.approve(address(provider), type(uint256).max);
+        provider.modifyLiquidity(
+            route,
+            IPoolManager.ModifyLiquidityParams(
+                TickMath.minUsableTick(60), TickMath.maxUsableTick(60), int256(1_000_000e18), 0
+            ),
+            ""
+        );
+        locker.registerRoute(route);
+    }
+
+    function _usdMove(uint256 id, uint256 units)
+        internal
+        view
+        returns (Liquidity.Move memory move)
+    {
+        move = Liquidity.Move(
+            0,
+            id,
+            units,
+            units / 2,
+            1,
+            1,
+            Liquidity.Bounds(type(uint256).max, type(uint256).max, block.timestamp)
+        );
+    }
+
+    function _wethToUsd(PoolKey memory route, uint256 amount, uint256 minimumOut)
+        internal
+        view
+        returns (Liquidity.SwapRequest memory)
+    {
+        bool zeroForOne = Currency.unwrap(route.currency0) == address(backing);
+        return Liquidity.SwapRequest(
+            route,
+            zeroForOne,
+            amount,
+            minimumOut,
+            zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+        );
+    }
+
+    /// SZR/WETH to SZR/USD in one transaction: withdraw, convert the WETH, deploy.
+    function testMoveBetweenDifferentPartnersWithOneAtomicSwap() public {
+        (TestAsset usd, uint256 id, PoolKey memory route) = _usdPools();
+        uint256 units = locker.liquidityHeld(0);
+        uint256 nav = core.NAV();
+        uint256 heldWeth = locker.heldPrincipal(address(backing));
+        uint256 funding = locker.unallocatedFunding();
+        assertGt(heldWeth, 0);
+        // Asking to swap "everything" converts only the WETH this move withdrew.
+        locker.moveLiquidityWithSwap(
+            _usdMove(id, units), _wethToUsd(route, type(uint256).max, 1)
+        );
+        assertEq(locker.liquidityHeld(0), 0);
+        assertEq(locker.liquidityHeld(id), units / 2);
+        assertEq(locker.heldPrincipal(address(backing)), heldWeth); // earlier WETH untouched
+        assertEq(locker.unallocatedFunding(), funding);
+        assertEq(usd.balanceOf(address(locker)), locker.heldPrincipal(address(usd)));
+        assertEq(core.NAV(), nav);
+        _assertCash();
+    }
+
+    function testMoveWithSwapRollsBackAndIsRestricted() public {
+        (TestAsset usd, uint256 id, PoolKey memory route) = _usdPools();
+        uint256 units = locker.liquidityHeld(0);
+        Liquidity.Move memory move = _usdMove(id, units);
+        // A missed minimum on the swap undoes the withdrawal too.
+        vm.expectRevert(Liquidity.BelowMinimum.selector);
+        locker.moveLiquidityWithSwap(
+            move, _wethToUsd(route, type(uint256).max, type(uint256).max)
+        );
+        assertEq(locker.liquidityHeld(0), units);
+        assertEq(locker.liquidityHeld(id), 0);
+        assertEq(locker.heldPrincipal(address(usd)), 0);
+        // The swap input must be something this move withdrew.
+        Liquidity.SwapRequest memory wrong = _wethToUsd(route, 1e18, 1);
+        wrong.zeroForOne = !wrong.zeroForOne; // would sell USD, which the source never returned
+        vm.expectRevert(Liquidity.InvalidUnits.selector);
+        locker.moveLiquidityWithSwap(move, wrong);
+        vm.prank(alice);
+        vm.expectRevert(Liquidity.NotManager.selector);
+        locker.moveLiquidityWithSwap(move, _wethToUsd(route, 1e18, 1));
+        assertEq(locker.liquidityHeld(0), units);
+        _assertCash();
+    }
+
+    /// Idle WETH becomes SZR/USD liquidity in one transaction: two swaps, then the deployment.
+    function testManagerBatchesTwoSwapsAndADeploymentInOneCall() public {
+        (TestAsset usd, uint256 id, PoolKey memory route) = _usdPools();
+        _acquire(alice);
+        uint256 idle = locker.heldPrincipal(address(backing));
+        assertGt(idle, 0);
+        PoolKey memory main = locker.key(0);
+        bool wethFirst = Currency.unwrap(main.currency0) == address(backing);
+        Liquidity.SwapRequest memory toUsd = _wethToUsd(route, idle / 4, 1);
+        Liquidity.Bounds memory open =
+            Liquidity.Bounds(type(uint256).max, type(uint256).max, block.timestamp);
+        bytes[] memory calls = new bytes[](3);
+        calls[0] = abi.encodeCall(
+            locker.swapPrincipal,
+            (route, toUsd.zeroForOne, idle / 4, 1, toUsd.sqrtPriceLimitX96, block.timestamp)
+        );
+        calls[1] = abi.encodeCall(
+            locker.swapPrincipal,
+            (
+                main,
+                wethFirst,
+                idle / 4,
+                1,
+                wethFirst ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1,
+                block.timestamp
+            )
+        );
+        calls[2] = abi.encodeCall(locker.deployPrincipal, (id, 1e12, open));
+
+        // Only the manager's batch goes through; each inner call checks the caller itself.
+        vm.prank(alice);
+        vm.expectRevert(Liquidity.NotManager.selector);
+        locker.multicall(calls);
+
+        // If the last step fails, the swaps before it are undone as well.
+        bytes[] memory failing = new bytes[](3);
+        failing[0] = calls[0];
+        failing[1] = calls[1];
+        failing[2] = abi.encodeCall(locker.deployPrincipal, (id, type(uint128).max, open));
+        vm.expectRevert(Liquidity.MissingContribution.selector);
+        locker.multicall(failing);
+        assertEq(locker.heldPrincipal(address(backing)), idle);
+        assertEq(locker.heldPrincipal(address(usd)), 0);
+
+        uint256 nav = core.NAV();
+        locker.multicall(calls);
+        assertEq(locker.liquidityHeld(id), 1e12);
+        assertEq(locker.heldPrincipal(address(backing)), idle - idle / 4 - idle / 4);
+        assertGt(locker.heldPrincipal(address(usd)), 0);
+        assertEq(usd.balanceOf(address(locker)), locker.heldPrincipal(address(usd)));
+        assertEq(core.NAV(), nav);
         _assertCash();
     }
 
@@ -198,6 +361,55 @@ contract MetaLiquidityTest is SzrWorld {
             ""
         );
         vm.stopPrank();
+        locker.registerRoute(route);
+    }
+
+    /// Principal may only trade through a pool on the contract's list, and a pool the manager
+    /// adds can take principal straight away.
+    function testSwapsNeedARegisteredPoolAndNewPoolsAreUsableAtOnce() public {
+        Liquidity.Bounds memory open =
+            Liquidity.Bounds(type(uint256).max, type(uint256).max, block.timestamp);
+        uint256 units = locker.liquidityHeld(0);
+        locker.withdrawPrincipal(0, units / 2, 0, 0, block.timestamp);
+
+        // A pool added now is on the list and takes principal in the same block.
+        Liquidity.PoolConfig memory config = _config();
+        config.feePips = 500;
+        FeeCollector.AssetConfig memory unused;
+        uint256 id = locker.addPool(config, unused);
+        assertTrue(locker.poolRegistered(PoolId.unwrap(locker.key(id).toId())));
+        locker.deployPrincipal(id, units / 8, open);
+        assertEq(locker.liquidityHeld(id), units / 8);
+
+        // A pool that is not on the list cannot be traded through, however it was created.
+        TestAsset other = new TestAsset();
+        bool first = address(backing) < address(other);
+        PoolKey memory route = PoolKey(
+            Currency.wrap(first ? address(backing) : address(other)),
+            Currency.wrap(first ? address(other) : address(backing)),
+            500,
+            60,
+            IHooks(address(0))
+        );
+        uint160 limit = first ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+        vm.expectRevert(Liquidity.InvalidPool.selector);
+        locker.registerRoute(route); // not even initialised
+        manager.initialize(route, uint160(1 << 96));
+        assertFalse(locker.poolRegistered(PoolId.unwrap(route.toId())));
+        vm.expectRevert(Liquidity.PoolNotRegistered.selector);
+        locker.swapPrincipal(route, first, 1e12, 0, limit, block.timestamp);
+        vm.expectRevert(Liquidity.PoolNotRegistered.selector);
+        locker.moveLiquidityWithSwap(
+            Liquidity.Move(0, id, units / 8, units / 16, 1, 1, open),
+            Liquidity.SwapRequest(route, first, 1e12, 0, limit)
+        );
+        // Only the manager can put a route on the list.
+        vm.prank(alice);
+        vm.expectRevert(Liquidity.NotManager.selector);
+        locker.registerRoute(route);
+        locker.registerRoute(route);
+        assertTrue(locker.poolRegistered(PoolId.unwrap(route.toId())));
+        _assertCash();
     }
 
     function testTreasuryCanAcquireANewPartnerThroughAnExternalV4Pool() public {

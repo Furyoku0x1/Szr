@@ -80,26 +80,27 @@ These numerical values are approved **testing defaults**, not final launch calib
 ## Legacy SZR migration
 
 The migration cap is **350M SZR**, and every redeemable holder receives **1 new SZR per old SZR**.
-A separate liquidity plan targets **25M of those already-migrated tokens**, contributed explicitly
-by an existing holder. If that holder migrates and contributes 25M, the other 325M can migrate to
-other holders. Normal migration does not deduct a liquidity percentage. The 25M funding target is
-not a second reservation or release from Core; the remaining **650M SZR** starts as inactive public
-auction inventory.
+The whole cap is for holders; migration does not deduct a liquidity percentage. Genesis liquidity
+is a separate **25M SZR taken from Core's public inventory**, leaving **625M SZR** as inactive
+public auction inventory.
 
-Launch starts with zero active supply and zero reserve cash. The migration contributor receives
-their full 1:1 wallet balance first and then separately approves Liquidity and calls
-`fundInitialLiquidity(minimumUnits, deadline)`. That call pulls only their own active tokens, funds
-the configured one-sided POL position, and refunds unused rounding to that contributor. It cannot
-spend Core inventory or take tokens from another wallet. Funding changes neither active supply nor
-NAV and does not consume sale allowance. There is no automatic initial-token issuance.
+`fundInitialLiquidity(minimumUnits, deadline)` can be called once by anyone while migration is
+open. Core releases the fixed 25M to Liquidity, which places all of it in the configured one-sided
+POL position; any rounding remainder returns to Core's inventory. The caller supplies and receives
+nothing. The release is not a scheduled sale and consumes no sale allowance.
+
+**These 25M tokens are active claims with no backing, so they dilute migrators.** NAV is the
+recovered WETH divided by migrated tokens plus the 25M. It is zero until the first migration, rises
+as holders migrate, and ends below what each migrator brought in (about 9% below if all of the
+roughly 246M sellable old SZR migrates). Because the release lowers NAV it is refused once
+migration has closed, when loans and sales can exist.
 
 Borrowing is disabled during migration. It becomes available when the migration cap is exhausted,
 or when the Liquidity manager permanently closes migration with `SzrCore.closeMigration()`.
 Closure returns every unused migration reservation to scheduled public inventory without changing
-active supply or creating release credit. Tokens already contributed to liquidity are not counted
-again. Already-active holder tokens may fund liquidity after closure without diluting open loans.
-There is no automatic timeout. Final migration eligibility and the contributor's available old
-holdings must be checked before deployment; these figures are configuration defaults.
+active supply or creating release credit. Genesis liquidity cannot be funded after closure.
+There is no automatic timeout. Final migration eligibility must be checked before deployment;
+these figures are configuration defaults.
 
 Legacy SZR is `0xbeD7c1660a01dbEEe225bd893ac31727a91A5773` on Robinhood. Deployment discovers its
 canonical hook using the old token's `hook()` getter and validates both directions of that binding,
@@ -124,11 +125,9 @@ A successful migration reduces both unreleased supply and the remaining migratio
 its token amount. It does not spend or create scheduled sale allowance, alter total supply, or reset
 auction pricing. Returned/redeemed new SZR subsequently enters ordinary public inventory; it does
 not replenish the original migration allocation. New SZR has the same redemption and borrowing
-rights as other active tokens. All net recovered WETH joins reserves. With zero active supply at
-launch, the first migration establishes actual backing for its delivered tokens. The liquidity
-contributor's migrated tokens are included in active supply before they move from their wallet into
-POL; this move introduces no new reserve claims. A 1:1 token payout does not guarantee preservation
-of the old hook's per-token floor.
+rights as other active tokens. All net recovered WETH joins reserves and is shared with the 25M
+genesis tokens, which are active from the moment the genesis position is funded. A 1:1 token payout
+therefore does not preserve the old hook's per-token floor.
 Migration can lower the new token's NAV when recovered WETH per token is below the current NAV.
 The normal public auction still requires full current-NAV backing. Because borrowing starts only
 after migration finishes permanently, migration cannot lower the backing of an outstanding loan.
@@ -161,47 +160,64 @@ update the addresses in the test when that happens.
 
 At block 112788329 the hook paid one flat price, about 0.000000532 WETH per old SZR with no sell
 fee, at every size. It accepts only tokens outside its own inventory: about 246.06M of the 330.35M
-supply, worth about 131 WETH in total. **Re-run the rehearsal immediately before deployment**; it
-simulates on a fork and does not replace checking the deployer's own balances and settings.
+supply, worth about 131 WETH in total. With the 25M genesis tokens sharing those reserves, NAV
+would be about 0.000000483 WETH if every sellable old SZR migrated, and lower while fewer have.
+**Re-run the rehearsal immediately before deployment**; it simulates on a fork and does not replace
+checking the deployer's own settings.
 
 ## Native v4 liquidity management
 
 `Liquidity` pins one PoolManager. It owns every position directly; pool keys, ticks, salts, and
 liquidity balances are stored internally. No per-pool contract is deployed. Full-range pools can be
-registered with reviewed hooks. A separate one-sided `INITIAL_POSITION()` accepts the configured
-holder-funded initial liquidity contribution.
+registered with reviewed hooks. A separate one-sided `INITIAL_POSITION()` holds the genesis
+liquidity that Core releases from its own inventory.
 
 - `addPool(config, feeConfig)`: register a full-range SZR/partner position and its fee asset.
+- `registerRoute(poolKey)`: put an existing pool, such as WETH/partner, on the list of pools the
+  manager may swap through.
 - `swapPrincipal(poolKey, zeroForOne, amount, minimumOut, priceLimit, deadline)`: acquire SZR or
-  partner assets from held treasury funds through any existing v4 pool, including WETH/partner pools.
+  partner assets from held treasury funds through a registered pool, including WETH/partner pools.
 - `deployPrincipal(id, units, bounds)`: add held assets to a registered position.
 - `withdrawPrincipal(id, units, minimumSzr, minimumPartner, deadline)`: return principal to custody.
 - `moveLiquidity(request)`: remove and redeploy atomically when the held assets cover the destination.
+- `moveLiquidityWithSwap(request, swap)`: the same move with one swap in the middle, so liquidity
+  can go between pools with different partner tokens in one transaction. The swap can convert only
+  what that move withdrew.
 - `collect(id)`: permissionless collection and fixed routing of trading fees.
+- `multicall(calls)`: run several of these in one atomic transaction, for example two swaps and a
+  deployment to turn idle WETH into SZR/partner liquidity. Each inner call keeps its own access
+  check, and a failure in any step undoes the whole batch.
 
 Use ordinary pool IDs for full-range positions and `INITIAL_POSITION()` for the launch position.
-`fundInitialLiquidity(minimumUnits, deadline)` funds the configured target once, entirely from its
-caller's active SZR balance. Core has no special initial-liquidity release path. Fees are collected
-through `collect(id)` for either position. The initial position is permanent: `withdrawPrincipal`
-and `moveLiquidity` reject it, so its SZR leaves only to pool buyers. Different-partner moves can use withdrawal, bounded swaps,
-and deployment in separate steps. Unspent assets remain held.
+`fundInitialLiquidity(minimumUnits, deadline)` funds the configured target once, entirely from
+Core's public inventory through `SzrCore.releaseInitialLiquidity()`, which only Liquidity can call.
+Fees are collected through `collect(id)` for either position. The initial position is permanent:
+`withdrawPrincipal` and both moves reject it, so its SZR leaves only to pool buyers. Unspent assets
+remain held.
 
 Every removal separates principal from fees. Internal moves cannot issue SZR, consume sale allowance,
 or turn liquidity principal into revenue. There is no external allowance setter or arbitrary
 execution function. Pool assets and held WETH do not count as floor reserves and cannot be borrowed
 through Core.
 
-**Held WETH can fund other protocol uses.** The manager may send held WETH (never SZR, never a
-position) to a destination with `sendFunding`, for example staking rewards or another product.
-A destination must first be announced with `announceDestination` and becomes usable only after
-`DESTINATION_DELAY` (7 days); `revokeDestination` takes effect immediately. Held WETH includes
-sale funding and any WETH the manager withdraws from non-genesis positions or swaps into.
+**Untouched sale funding can fund other protocol uses.** The manager may send WETH to a
+destination with `sendFunding`, for example staking rewards or another product, but only out of
+`unallocatedFunding`: sale funding that has never been deployed or swapped. Once WETH has been
+liquidity it stays for liquidity; WETH withdrawn from a position or received from a swap can only
+be redeployed or swapped. SZR and positions can never be sent. A destination must first be
+announced with `announceDestination` and becomes usable only after `DESTINATION_DELAY` (7 days);
+`revokeDestination` takes effect immediately.
 
-**The manager is a trusted role.** `addPool`, `deployPrincipal` and `swapPrincipal` can route held
-treasury assets and non-genesis positions through any pool the manager chooses, with a
-manager-set minimum output, so a malicious manager could transfer that value away. Floor reserves
-in Core and the permanent genesis position are out of its reach. Use a multisig. The 7-day
-notice applies to `sendFunding` only; it does not constrain those pool routes.
+**Principal only goes into, or trades through, registered pools.** Deployments and moves can
+only target positions added with `addPool`, and every swap must go through a pool in
+`poolRegistered`: one added with `addPool` or put there with `registerRoute`. There is no waiting
+period, so a newly added pool can be funded straight away.
+
+**The manager is still a trusted role.** It chooses which pools and hooks to register, how to
+allocate, and the minimum output of each trade, so a malicious manager could register a hostile
+pool and transfer that value away. Registration leaves a public record (`PoolAdded`,
+`RouteRegistered`); it is not a safeguard by itself. Floor reserves in Core and the permanent
+genesis position are out of its reach. Use a multisig.
 
 The manager controls asset/hook selection, allocation, and trade execution prices. It is trusted
 not to choose harmful hooks or assets, manipulated markets, or inappropriate slippage settings.
@@ -222,9 +238,9 @@ returned SZR are excluded. Loan opening fees and backing donations go entirely t
 ## Supply, backing and loans
 
 Total supply is **1,000,000,000 SZR**, with no team token allocation, token vesting, or privileged
-team token claim. Up to **350M SZR** migrates 1:1, including the existing holder's planned **25M**
-liquidity contribution. That contribution comes from the holder's delivered tokens, not an extra
-Core allocation. There is no genesis release. The remaining **650M SZR** and recycled inventory fund
+team token claim. Up to **350M SZR** migrates 1:1. A fixed **25M SZR** is released once from
+public inventory as permanent, protocol-owned genesis liquidity; it is unbacked and dilutes
+migrators as described above. The remaining **625M SZR** and recycled inventory fund
 public sales, subject to the release schedule and backing requirement. The team's compensation
 is its existing 33% share of realized liquidity revenue; its beneficiary has the same token-purchase
 terms as every other buyer.
@@ -277,11 +293,10 @@ Copy `.env.example` to `.env` and set the required chain ID, WETH, PoolManager a
 target exposed as `initialLiquidityTarget()`. It neither increases nor reduces `migrationAllocation()`.
 The script registers full-range and empty one-sided positions in one hook-less SZR/WETH pool with
 a 1% swap fee and tick spacing 200, and launches. By default
-(`FUND_INITIAL_LIQUIDITY=true`) the deploying address then migrates its own 25M legacy SZR and
-calls `fundInitialLiquidity`, so the genesis tokens are the only active supply when migration opens
-to other holders. That address must hold the legacy tokens, and `INITIAL_LIQUIDITY_MIN_BACKING`
-(the least WETH that sale may recover) is required. With `FUND_INITIAL_LIQUIDITY=false` the
-contributing holder migrates, approves Liquidity and funds separately.
+(`FUND_INITIAL_LIQUIDITY=true`) the script then calls `fundInitialLiquidity`, so the 25M genesis
+tokens from Core's inventory are the only active supply when migration opens. The deployer needs
+no old SZR. With `FUND_INITIAL_LIQUIDITY=false` anyone can make that call later, while migration
+is still open.
 For a deliberately allocation-free local rehearsal, explicitly set `MIGRATION_ALLOCATION=0`.
 For holder-migration-only tests, set `INITIAL_LIQUIDITY_ALLOCATION=0`. WETH
 must be an ordinary 18-decimal ERC-20. The script checks chain ID and deployed asset/PoolManager code,
@@ -304,18 +319,24 @@ do not deploy contracts. `AUCTION_OPENING_WAD` and `AUCTION_FLOOR_WAD` are WETH 
 These are accepted operating rules, not enforced in code.
 
 - Rehearse the full script on a fork against the real legacy hook before any broadcast.
-- Deploy from an address that has not been published; it must hold the 25M legacy SZR. It becomes
-  the interim manager only until the `MANAGER` address accepts.
+- Deploy from an address that has not been published. It needs no old SZR and is the interim
+  manager only until the `MANAGER` address accepts.
 - Have the `MANAGER` address (a multisig) call `Liquidity.acceptManager()` straight after deploy.
-  From then on only it can close migration, manage pools and send held WETH; there is no time
-  limit on when it closes migration.
-- Set `INITIAL_MARKET_PRICE` above the legacy hook's floor price, so the genesis range never
-  starts below NAV. Set `INITIAL_LIQUIDITY_MIN_BACKING` from the expected recovery.
-- If `FUND_INITIAL_LIQUIDITY=false`, check the pool price before funding; if it was moved into the
-  genesis range, send the restoring swap and `fundInitialLiquidity` back to back.
+  From then on only it can close migration, manage pools and send untouched sale funding; there
+  is no time limit on when it closes migration.
+- `INITIAL_MARKET_PRICE` is where the genesis liquidity starts. It defaults to 0.000000507 WETH,
+  about 1.05x the NAV reached if every sellable old SZR migrates (0.000000483 at block
+  112788329), and below the auction minimum of 1.5x NAV. The script refuses a value below the
+  highest NAV migration could reach (the old hook's live price diluted by the genesis tokens with
+  the whole allocation migrated); check the old hook's price again before deploying.
+- Fund the genesis position before closing migration; it cannot be funded afterwards. If
+  `FUND_INITIAL_LIQUIDITY=false`, check the pool price first; if it was moved into the genesis
+  range, send the restoring swap and `fundInitialLiquidity` back to back.
 - Closing migration opens the sale, the release schedule and the fee auctions. Nothing else does.
 - Watch `DestinationAnnounced` events: each one starts a 7-day notice before held WETH can be
   sent to that address.
+- Watch `PoolAdded` and `RouteRegistered` events: they list every pool the manager can use, with
+  no notice period.
 - Partner tokens: no rebasing, unbounded-mint, fee-on-transfer or transfer-restricted tokens, and
   always register them with the fee-auction floor at its minimum (`1`).
 

@@ -6,6 +6,8 @@ import { Liquidity } from "../src/Liquidity.sol";
 import { FeeCollector } from "../src/FeeCollector.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { IHooks } from "v4-core/interfaces/IHooks.sol";
+import { Currency } from "v4-core/types/Currency.sol";
+import { TickMath } from "v4-core/libraries/TickMath.sol";
 
 contract V4ValidationTest is SzrWorld {
     function testDuplicatePoolsCannotCreateSecondPositions() public {
@@ -89,8 +91,9 @@ contract V4ValidationTest is SzrWorld {
     function testHeldWethLeavesOnlyToADestinationAnnouncedSevenDaysAhead() public {
         address staking = address(0x57A);
         _acquire(alice);
-        uint256 held = locker.heldPrincipal(address(backing));
+        uint256 held = locker.unallocatedFunding(); // only untouched sale funding can leave
         assertGt(held, 0);
+        uint256 heldBefore = locker.heldPrincipal(address(backing));
         vm.startPrank(alice);
         vm.expectRevert(Liquidity.NotManager.selector);
         locker.announceDestination(staking);
@@ -120,7 +123,8 @@ contract V4ValidationTest is SzrWorld {
         uint256 szrHeld = locker.heldPrincipal(address(core.token()));
         locker.sendFunding(staking, held);
         assertEq(backing.balanceOf(staking), held);
-        assertEq(locker.heldPrincipal(address(backing)), 0);
+        assertEq(locker.unallocatedFunding(), 0);
+        assertEq(locker.heldPrincipal(address(backing)), heldBefore - held);
         assertEq(locker.heldPrincipal(address(core.token())), szrHeld);
         assertEq(core.NAV(), nav);
         assertEq(core.reserveCash(), reserves);
@@ -130,6 +134,67 @@ contract V4ValidationTest is SzrWorld {
         _acquire(alice);
         vm.expectRevert(Liquidity.DestinationNotReady.selector);
         locker.sendFunding(staking, 1); // revoked
+        _assertCash();
+    }
+
+    /// Anything that has been liquidity stays for liquidity: WETH withdrawn from a position
+    /// or received from a swap can be redeployed or swapped, never sent to a destination.
+    function testOnlyUntouchedSaleFundingCanBeSent() public {
+        address staking = address(0x57A);
+        locker.announceDestination(staking);
+        vm.warp(block.timestamp + 7 days);
+        _acquire(alice);
+        uint256 funding = locker.unallocatedFunding();
+        assertGt(funding, 0);
+        PoolKey memory pool = locker.key(0);
+        bool wethFirst = Currency.unwrap(pool.currency0) == address(backing);
+        Liquidity.Bounds memory open =
+            Liquidity.Bounds(type(uint256).max, type(uint256).max, block.timestamp);
+
+        // WETH withdrawn from a position is not sendable.
+        uint256 units = locker.liquidityHeld(0);
+        locker.withdrawPrincipal(0, units / 2, 0, 0, block.timestamp);
+        assertGt(locker.heldPrincipal(address(backing)), funding);
+        assertEq(locker.unallocatedFunding(), funding);
+        vm.expectRevert(Liquidity.MissingContribution.selector);
+        locker.sendFunding(staking, funding + 1);
+
+        // Redeploying uses that returned principal first and leaves the funding untouched.
+        locker.deployPrincipal(0, units / 4, open);
+        assertEq(locker.unallocatedFunding(), funding);
+
+        // Once funding itself has been through a swap it is liquidity for good.
+        locker.swapPrincipal(
+            pool,
+            wethFirst,
+            locker.heldPrincipal(address(backing)),
+            0,
+            wethFirst ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1,
+            block.timestamp
+        );
+        assertEq(locker.heldPrincipal(address(backing)), 0);
+        assertEq(locker.unallocatedFunding(), 0);
+        locker.swapPrincipal(
+            pool,
+            !wethFirst,
+            locker.heldPrincipal(address(core.token())) / 2,
+            0,
+            wethFirst ? TickMath.MAX_SQRT_PRICE - 1 : TickMath.MIN_SQRT_PRICE + 1,
+            block.timestamp
+        );
+        assertGt(locker.heldPrincipal(address(backing)), 0); // WETH is held again
+        vm.expectRevert(Liquidity.MissingContribution.selector);
+        locker.sendFunding(staking, 1); // but none of it is sendable
+
+        // Fresh sale funding is sendable again, and only that much.
+        _acquire(alice);
+        uint256 fresh = locker.unallocatedFunding();
+        assertGt(fresh, 0);
+        vm.expectRevert(Liquidity.MissingContribution.selector);
+        locker.sendFunding(staking, fresh + 1);
+        locker.sendFunding(staking, fresh);
+        assertEq(backing.balanceOf(staking), fresh);
+        assertLe(locker.unallocatedFunding(), locker.heldPrincipal(address(backing)));
         _assertCash();
     }
 

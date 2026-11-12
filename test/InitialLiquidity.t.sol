@@ -101,7 +101,19 @@ contract InitialLiquidityTest is Test {
         );
         vm.stopPrank();
         assertGt(backing.balanceOf(alice), 0);
-        assertEq(next.reserveCash(), INITIAL * 297e10 / 1e18); // pool trades never touch reserves
+        assertEq(next.reserveCash(), 0); // pool trades never touch reserves
+    }
+
+    function testDeployScriptRejectsGenesisPricedBelowTheHighestPossibleNav() public {
+        DeploySzr.Config memory config = _deployConfig();
+        DeploySzr deployment = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr"));
+        // One old SZR recovers 297e10 from the mock hook. With all 350M migrated and the 25M
+        // genesis tokens sharing the reserves, NAV tops out at 297e10 * 350 / 375.
+        config.marketPrice = 2_772e9;
+        deployment.run(config);
+        config.marketPrice = 2_772e9 - 1;
+        vm.expectRevert(DeploySzr.InitialPriceBelowNav.selector);
+        deployment.run(config);
     }
 
     function testDeployScriptRejectsTheDeployerAsManager() public {
@@ -112,30 +124,28 @@ contract InitialLiquidityTest is Test {
         deployment.run(config);
     }
 
-    function testDeployScriptMigratesAndFundsGenesisFromTheDeployer() public {
+    function testDeployScriptFundsGenesisFromCoreInventory() public {
         address deployer = core.initializer(); // the fixture's run used the same broadcaster
-        oldToken.mint(deployer, INITIAL);
         DeploySzr.Config memory config = _deployConfig();
         config.fundInitialLiquidity = true;
-        config.initialLiquidityMinimumBacking = INITIAL * 297e10 / 1e18;
         DeploySzr deployment = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr"));
         (SzrCore next,, Liquidity nextLocker) = deployment.run(config);
         assertEq(next.initializer(), deployer);
         assertTrue(nextLocker.initialLiquidityFunded());
-        assertEq(next.activeSupply(), INITIAL); // the genesis tokens are the only live supply
-        assertEq(next.reserveCash(), INITIAL * 297e10 / 1e18);
-        assertEq(next.migrationRemaining(), TOTAL - INITIAL);
+        // The genesis tokens are the only live supply, came from inventory and have no backing.
+        assertGt(next.activeSupply(), INITIAL - 1e18);
+        assertLe(next.activeSupply(), INITIAL);
+        assertEq(next.publicInventory(), 650_000_000e18 - next.activeSupply());
+        assertEq(next.reserveCash(), 0);
+        assertEq(next.NAV(), 0);
+        assertEq(next.migrationRemaining(), TOTAL); // the migration reservation is untouched
         assertEq(next.auctionsOpenAt(), 0);
-        assertLt(next.token().balanceOf(deployer), 1e18);
-        assertGt(next.token().balanceOf(address(manager)), INITIAL - 1e18);
+        assertEq(next.token().balanceOf(deployer), 0); // the deployer supplied and kept nothing
         assertEq(oldToken.balanceOf(deployer), 0);
+        assertEq(next.token().balanceOf(address(nextLocker)), 0);
+        assertGt(next.token().balanceOf(address(manager)), INITIAL - 1e18);
         _tradeBothWays(next, nextLocker);
         assertEq(next.auctionsOpenAt(), 0); // traded while migration is open and the sale closed
-
-        config.initialLiquidityMinimumBacking += 1;
-        oldToken.mint(deployer, INITIAL);
-        vm.expectRevert(SzrMigration.BelowMinimum.selector);
-        deployment.run(config);
     }
 
     function _legacy() internal {
@@ -188,6 +198,7 @@ contract InitialLiquidityTest is Test {
         assertFalse(locker.initialLiquidityFunded());
     }
 
+    /// An ordinary holder migrating; nothing about them is special any more.
     function _migrateContributor() internal {
         vm.startPrank(contributor);
         migrator.migrate(INITIAL, 0, block.timestamp);
@@ -197,37 +208,60 @@ contract InitialLiquidityTest is Test {
     }
 
     function _fundInitial() internal returns (uint256 spent) {
-        _migrateContributor();
-        vm.prank(contributor);
         return locker.fundInitialLiquidity(1, block.timestamp);
     }
 
-    function testExistingHolderExplicitlyFundsLiquidityWithoutNewIssuance() public {
-        _migrateContributor();
-        uint256 supply = core.activeSupply();
-        uint256 reserves = core.reserveCash();
-        uint256 nav = core.NAV();
-        uint256 inventory = core.publicInventory();
-        uint256 credit = core.releaseCredit();
-        vm.prank(contributor);
+    function testGenesisLiquidityComesFromCorePublicInventory() public {
+        vm.prank(alice);
         uint256 spent = locker.fundInitialLiquidity(1, block.timestamp);
         assertGt(spent, INITIAL - 1e18);
         assertLe(spent, INITIAL);
-        assertEq(core.token().balanceOf(contributor), INITIAL - spent);
-        assertEq(core.activeSupply(), supply);
-        assertEq(core.activeSupply(), INITIAL);
-        assertEq(core.reserveCash(), reserves);
-        assertEq(core.NAV(), nav);
-        assertEq(core.publicInventory(), inventory);
-        assertEq(core.releaseCredit(), credit);
-        assertEq(core.migrationRemaining(), HOLDERS);
+        // Exactly what went into the pool left inventory; the rounding remainder went back.
+        assertEq(core.activeSupply(), spent);
+        assertEq(core.publicInventory(), 650_000_000e18 - spent);
+        assertEq(core.unreleasedSupply(), 1_000_000_000e18 - spent);
+        assertEq(core.token().balanceOf(address(core)), core.unreleasedSupply());
+        assertEq(core.migrationRemaining(), TOTAL);
+        // Not a scheduled release, not backed, and nothing is left with the caller or held.
+        assertEq(core.totalReleased(), 0);
+        assertEq(core.releaseCredit(), 0);
+        assertEq(core.reserveCash(), 0);
+        assertEq(core.NAV(), 0);
+        assertEq(core.token().balanceOf(alice), 0);
+        assertEq(core.token().balanceOf(address(locker)), 0);
+        assertEq(locker.heldPrincipal(address(core.token())), 0);
         assertEq(core.token().totalSupply(), 1_000_000_000e18);
+        assertTrue(core.initialLiquidityReleased());
         assertTrue(locker.initialLiquidityFunded());
         assertGt(locker.liquidityHeld(locker.INITIAL_POSITION()), 0);
     }
 
-    function testFullMigrationCountsLiquidityContributorsTokensOnlyOnce() public {
-        _fundInitial();
+    /// Supply starts at 25M with no reserves. Everything must work from there, and the
+    /// unbacked genesis tokens dilute what each migrator brings in.
+    function testZeroBackingStartAndMigratorDilution() public {
+        uint256 spent = _fundInitial();
+        assertEq(core.price(), 8e12); // the sale has not opened, so no decay yet
+        assertEq(core.backingRequired(1e18), 0);
+        (uint256 recovered,,) = migrator.quote(100_000_000e18);
+        vm.prank(alice);
+        migrator.migrate(100_000_000e18, recovered, block.timestamp);
+        assertEq(core.reserveCash(), recovered);
+        assertEq(core.NAV(), recovered * 1e18 / (spent + 100_000_000e18));
+        assertLt(core.NAV(), recovered * 1e18 / 100_000_000e18); // below what alice brought in
+        vm.startPrank(alice);
+        core.token().approve(address(core), type(uint256).max);
+        uint256 paid = core.redeem(1_000_000e18, 0);
+        vm.stopPrank();
+        assertApproxEqAbs(paid, 1_000_000e18 * recovered / (spent + 100_000_000e18), 1);
+        vm.prank(core.initializer());
+        core.closeMigration();
+        assertEq(core.auctionsOpenAt(), block.timestamp);
+        assertEq(backing.balanceOf(address(core)), core.reserveCash());
+    }
+
+    function testFullMigrationFitsAlongsideGenesisLiquidity() public {
+        uint256 spent = _fundInitial();
+        _migrateContributor();
         vm.prank(alice);
         vm.expectRevert(SzrMigration.InsufficientAllocation.selector);
         migrator.migrate(HOLDERS + 1, 0, block.timestamp);
@@ -235,9 +269,9 @@ contract InitialLiquidityTest is Test {
         migrator.migrate(HOLDERS, 0, block.timestamp);
         assertEq(core.token().balanceOf(alice), HOLDERS);
         assertEq(migrator.totalMigrated(), TOTAL);
-        assertEq(core.activeSupply(), TOTAL);
+        assertEq(core.activeSupply(), TOTAL + spent);
         assertEq(core.migrationRemaining(), 0);
-        assertEq(core.publicInventory(), 650_000_000e18);
+        assertEq(core.publicInventory(), 650_000_000e18 - spent);
     }
 
     function testClosingMigrationReturnsAllUnusedTokensWithoutCountingLiquidityAgain() public {
@@ -259,7 +293,9 @@ contract InitialLiquidityTest is Test {
         assertEq(core.publicInventory(), core.unreleasedSupply());
     }
 
-    function testFundingFromAlreadyActiveTokensDoesNotDiluteAnOpenLoan() public {
+    /// Releasing unbacked tokens lowers NAV, so it must be impossible once migration has
+    /// closed and loans or sales can exist.
+    function testGenesisCannotBeFundedOnceMigrationHasClosed() public {
         _migrateContributor();
         vm.prank(alice);
         migrator.migrate(1_000e18, 0, block.timestamp);
@@ -267,40 +303,43 @@ contract InitialLiquidityTest is Test {
         core.closeMigration();
         vm.startPrank(alice);
         core.token().approve(address(core), type(uint256).max);
-        core.borrow(500e18, core.backingRequired(500e18) / 2);
+        core.borrow(500e18, core.backingRequired(500e18));
         vm.stopPrank();
         uint256 supply = core.activeSupply();
         uint256 nav = core.NAV();
         uint256 debt = core.loanPrincipal();
-        vm.prank(contributor);
+        vm.expectRevert(SzrCore.MigrationNotOpen.selector);
         locker.fundInitialLiquidity(1, block.timestamp);
         assertEq(core.activeSupply(), supply);
         assertEq(core.NAV(), nav);
         assertEq(core.loanPrincipal(), debt);
-        vm.prank(contributor);
-        vm.expectRevert(Liquidity.InitialLiquidityExists.selector);
-        locker.fundInitialLiquidity(1, block.timestamp);
-    }
-
-    function testAnotherCallerCannotSpendTheContributorsTokensOrCoreInventory() public {
-        _migrateContributor();
-        uint256 inventory = core.unreleasedSupply();
-        vm.prank(alice);
-        vm.expectRevert();
-        locker.fundInitialLiquidity(1, block.timestamp);
-        assertEq(core.token().balanceOf(contributor), INITIAL);
-        assertEq(core.unreleasedSupply(), inventory);
+        assertFalse(core.initialLiquidityReleased());
         assertFalse(locker.initialLiquidityFunded());
     }
 
-    function testHolderFundedInitialPoolTradesAndRoutesOnlyFees() public {
-        _fundInitial();
+    function testGenesisReleaseIsOnceOnlyAndOnlyThroughLiquidity() public {
+        _migrateContributor(); // holds 25M and has approved Liquidity; none of it may be taken
+        vm.prank(contributor);
+        vm.expectRevert(SzrCore.NotLiquidity.selector);
+        core.releaseInitialLiquidity();
+        vm.prank(contributor);
+        locker.fundInitialLiquidity(1, block.timestamp);
+        assertEq(core.token().balanceOf(contributor), INITIAL);
+        vm.expectRevert(Liquidity.InitialLiquidityExists.selector);
+        locker.fundInitialLiquidity(1, block.timestamp);
+        vm.prank(address(locker));
+        vm.expectRevert(SzrCore.InitialLiquidityAlreadyReleased.selector);
+        core.releaseInitialLiquidity();
+    }
+
+    function testGenesisPoolTradesAndRoutesOnlyFees() public {
+        uint256 spent = _fundInitial();
         uint256 supply = core.activeSupply();
         uint256 inventory = core.publicInventory();
         uint256 reserves = core.reserveCash();
         uint256 nav = core.NAV();
         uint256 initialUnits = locker.liquidityHeld(locker.INITIAL_POSITION());
-        assertEq(supply, INITIAL);
+        assertEq(supply, spent);
         (, uint256 initialPartnerAmount) =
             locker.quotePosition(locker.INITIAL_POSITION(), initialUnits);
         assertEq(initialPartnerAmount, 0);
@@ -399,18 +438,18 @@ contract InitialLiquidityTest is Test {
         assertGt(manager.getLiquidity(key.toId()), poolLiquidityBefore);
         assertEq(locker.liquidityHeld(locker.INITIAL_POSITION()), genesisUnits);
 
-        _sellBelowNavWithoutChangingAccounting(key, nav, supply, reserves, genesisUnits);
+        _sellInPoolWithoutChangingAccounting(key, nav, supply, reserves, genesisUnits);
     }
 
-    function _sellBelowNavWithoutChangingAccounting(
+    function _sellInPoolWithoutChangingAccounting(
         PoolKey memory key,
         uint256 nav,
         uint256 supply,
         uint256 reserves,
         uint256 genesisUnits
     ) internal {
-        // A holder may sell below NAV; the pool executes at market price and Core accounting
-        // is unchanged.
+        // A holder's pool sale executes at the pool's own price, whatever NAV is, and Core
+        // accounting is unchanged.
         PoolSwapTest router = new PoolSwapTest(manager);
         uint256 sellAmount = 500e18;
         uint256 tokenBalanceBefore = core.token().balanceOf(alice);
@@ -436,22 +475,19 @@ contract InitialLiquidityTest is Test {
         uint256 wethReceived = backing.balanceOf(alice) - backingBalanceBefore;
         assertEq(tokensSold, sellAmount);
         assertGt(wethReceived, 0);
-        assertLt(wethReceived, sellAmount * nav / 1e18);
         assertEq(locker.liquidityHeld(locker.INITIAL_POSITION()), genesisUnits);
         assertEq(core.activeSupply(), supply);
         assertEq(core.reserveCash(), reserves);
         assertEq(core.NAV(), nav);
     }
 
-    function testFundingDeadlineAndMinimumUnitsRollBackWithoutTakingTokens() public {
-        _migrateContributor();
-        vm.startPrank(contributor);
+    function testFundingDeadlineAndMinimumUnitsRollBackWithoutReleasingTokens() public {
         vm.expectRevert(Liquidity.DeadlinePassed.selector);
         locker.fundInitialLiquidity(1, block.timestamp - 1);
         vm.expectRevert(Liquidity.BelowMinimum.selector);
         locker.fundInitialLiquidity(type(uint256).max, block.timestamp);
-        vm.stopPrank();
-        assertEq(core.token().balanceOf(contributor), INITIAL);
+        assertEq(core.unreleasedSupply(), 1_000_000_000e18);
+        assertFalse(core.initialLiquidityReleased());
         assertFalse(locker.initialLiquidityFunded());
         assertEq(locker.liquidityHeld(locker.INITIAL_POSITION()), 0);
     }

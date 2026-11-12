@@ -187,15 +187,18 @@ contract AuditFindingsTest is InitialLiquidityTest {
         deployment.run(config);
     }
 
-    /// N-3 (accepted, calibration; legacy sellers get a known floor price): the genesis range
-    /// is fixed before launch but NAV is set later by
-    /// migration. If legacy recovery per token exceeds INITIAL_MARKET_PRICE, genesis SZR is sold
-    /// below NAV and redeemed against reserves. Holders' NAV is unchanged; the POL bears the loss.
+    /// N-3 (guarded at deploy; the script refuses a genesis price below the highest NAV
+    /// migration could reach): the genesis range is fixed before launch but NAV is set later.
+    /// The unbacked genesis tokens keep NAV below what migrators recover, so this now needs
+    /// the legacy price to rise well above the genesis price after deployment and most
+    /// holders to migrate. Then genesis SZR is sold below NAV and redeemed against reserves.
+    /// Holders' NAV is unchanged; the POL bears the loss.
     function testPoC_GenesisPricedBelowNavIsArbitragedAgainstReserves() public {
         oldHook.setPrice(8e12); // net recovery 7.92e-6 WETH/SZR vs 4e-6 genesis price
         _fundInitial();
         vm.prank(alice);
-        migrator.migrate(10_000_000e18, 0, block.timestamp);
+        migrator.migrate(300_000_000e18, 0, block.timestamp);
+        assertGt(core.NAV(), 7e12); // 7.92e-6 diluted by the 25M genesis tokens
         uint256 navBefore = core.NAV();
         uint256 id = locker.INITIAL_POSITION();
         PoolKey memory key = locker.key(id);
@@ -223,13 +226,13 @@ contract AuditFindingsTest is InitialLiquidityTest {
         vm.stopPrank();
 
         assertGt(bought, INITIAL / 4); // a quarter of the permanent POL is gone
-        assertGt(taken, 40e18 * 13 / 10); // >30% risk-free, paid from reserve cash
+        assertGt(taken, 40e18 * 125 / 100); // >30% risk-free, paid from reserve cash
         assertGe(core.NAV(), navBefore); // holders unaffected: the genesis position paid
     }
 
     /// M-1 extension (accepted, liveness not loss): once anyone has liquidity inside the genesis
     /// range, restoring the price needs a third party to sell real SZR into those bids (at
-    /// above-genesis prices). The contributor's exact 25M cannot be used for it.
+    /// above-genesis prices). Core's genesis allocation cannot be used for it.
     function testPoC_GenesisBlockedByInRangeLiquidityNeedsRealSzrToRestore() public {
         _migrateContributor();
         uint256 id = locker.INITIAL_POSITION();

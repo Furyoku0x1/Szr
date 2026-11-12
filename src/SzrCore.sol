@@ -41,6 +41,7 @@ contract SzrCore is ReentrancyGuard {
     address public feeJar;
     address public migration;
     uint256 public initialLiquidityTarget;
+    bool public initialLiquidityReleased;
     uint256 public migrationAllocation;
     uint256 public migrationRemaining;
     bool public initialized;
@@ -69,6 +70,7 @@ contract SzrCore is ReentrancyGuard {
     error ZeroAmount();
     error NotInitializer();
     error NotManager();
+    error InitialLiquidityAlreadyReleased();
     error AlreadyInitialized();
     error NotInitialized();
     error NotLaunched();
@@ -101,6 +103,7 @@ contract SzrCore is ReentrancyGuard {
     error NoActiveSupply();
 
     event MigrationClosed(uint256 unusedAllocation);
+    event InitialLiquidityReleased(uint256 tokens);
     event MigrationConfigured(
         address indexed migration, uint256 allocation, uint256 liquidityTarget
     );
@@ -170,7 +173,8 @@ contract SzrCore is ReentrancyGuard {
         emit Initialized(liquidityModule, feeModule);
     }
 
-    /// @notice Reserves full 1:1 migration and records the holder-funded initial liquidity target.
+    /// @notice Reserves full 1:1 migration and records the genesis liquidity allocation, which
+    /// is taken from public inventory, never from the migration reservation.
     function configureMigration(address module, uint256 allocation, uint256 liquidityTokens)
         external
     {
@@ -181,12 +185,29 @@ contract SzrCore is ReentrancyGuard {
         if (ISzrMigration(module).core() != address(this)) revert InvalidModule();
         if (allocation == 0) revert ZeroAmount();
         if (allocation > unreleasedSupply) revert InsufficientInventory();
-        if (liquidityTokens > allocation) revert InsufficientInventory();
+        if (liquidityTokens > unreleasedSupply - allocation) revert InsufficientInventory();
         migration = module;
         initialLiquidityTarget = liquidityTokens;
         migrationAllocation = allocation;
         migrationRemaining = migrationAllocation;
         emit MigrationConfigured(module, migrationAllocation, liquidityTokens);
+    }
+
+    /// @notice Hands the fixed genesis allocation from public inventory to Liquidity, once.
+    /// @dev These tokens become active claims with no backing, so NAV falls. That is only
+    /// allowed while migration is open: no sale or loan exists yet to be diluted. They are not
+    /// a scheduled release, so they consume no sale allowance.
+    function releaseInitialLiquidity() external nonReentrant live returns (uint256 amount) {
+        if (msg.sender != liquidity) revert NotLiquidity();
+        if (migrationRemaining == 0) revert MigrationNotOpen();
+        if (initialLiquidityReleased) revert InitialLiquidityAlreadyReleased();
+        amount = initialLiquidityTarget;
+        if (amount == 0) revert ZeroAmount();
+        _checkpointSale();
+        initialLiquidityReleased = true;
+        unreleasedSupply -= amount;
+        SafeTransferLib.safeTransfer(address(token), msg.sender, amount);
+        emit InitialLiquidityReleased(amount);
     }
 
     /// @notice Ends migration permanently; unused reserved tokens join the scheduled public sale.

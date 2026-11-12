@@ -327,6 +327,8 @@ contract SzrInvariantTest is SzrWorld {
             core.token().balanceOf(address(locker)), locker.heldPrincipal(address(core.token()))
         );
         assertEq(backing.balanceOf(address(locker)), locker.heldPrincipal(address(backing)));
+        // Sendable sale funding is always part of, never more than, the WETH actually held.
+        assertLe(locker.unallocatedFunding(), locker.heldPrincipal(address(backing)));
         assertLe(core.availableRelease(), core.publicInventory());
         uint256 elapsed = block.timestamp - core.auctionsOpenAt();
         uint256 scheduled = ReleaseSchedule.cumulativeScaled(elapsed) / 1 days;
