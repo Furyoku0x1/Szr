@@ -131,6 +131,44 @@ contract SzrLoansTest is SzrWorld {
         _assertCash();
     }
 
+    function testExpiredLoanCanBeRepaidInFullUntilSomeoneSettlesIt() public {
+        _acquire(alice);
+        uint256 tokens = core.token().balanceOf(alice);
+        vm.prank(alice);
+        core.borrow(100e18, 50e12);
+        (,, uint256 expiry) = core.loans(alice);
+        vm.warp(expiry + 365 days); // long expired, never settled
+        vm.prank(alice);
+        core.repayAndReclaim(50e12);
+        assertEq(core.token().balanceOf(alice), tokens);
+        assertEq(core.loanPrincipal(), 0);
+        assertEq(core.pledgedSupply(), 0);
+        vm.expectRevert(SzrCore.NoLoan.selector);
+        core.settleExpired(alice);
+        _assertCash();
+    }
+
+    function testSettlementLeavesEarlierFreedCollateralReclaimable() public {
+        _acquire(alice);
+        uint256 tokens = core.token().balanceOf(alice);
+        vm.startPrank(alice);
+        core.borrow(100e18, 50e12);
+        core.repay(25e12); // frees 50 SZR but leaves it in Core
+        vm.stopPrank();
+        (,, uint256 expiry) = core.loans(alice);
+        uint256 retired =
+            FixedPointMathLib.fullMulDivUp(25e12, core.activeSupply(), core.backingAmount());
+        vm.warp(expiry);
+        core.settleExpired(alice);
+        assertEq(core.token().balanceOf(alice), tokens - 50e18 - retired);
+        assertEq(core.reclaimableCollateral(alice), 50e18);
+        vm.prank(alice);
+        core.reclaimCollateral(50e18);
+        assertEq(core.token().balanceOf(alice), tokens - retired);
+        assertEq(core.totalReclaimable(), 0);
+        _assertCash();
+    }
+
     function testSettlementReturnsExcessAndCannotExecuteTwice() public {
         _acquire(alice);
         vm.prank(alice);

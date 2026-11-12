@@ -86,6 +86,53 @@ contract V4ValidationTest is SzrWorld {
         _assertCash();
     }
 
+    function testHeldWethLeavesOnlyToADestinationAnnouncedSevenDaysAhead() public {
+        address staking = address(0x57A);
+        _acquire(alice);
+        uint256 held = locker.heldPrincipal(address(backing));
+        assertGt(held, 0);
+        vm.startPrank(alice);
+        vm.expectRevert(Liquidity.NotManager.selector);
+        locker.announceDestination(staking);
+        vm.expectRevert(Liquidity.NotManager.selector);
+        locker.revokeDestination(staking);
+        vm.expectRevert(Liquidity.NotManager.selector);
+        locker.sendFunding(staking, 1);
+        vm.stopPrank();
+        vm.expectRevert(Liquidity.InvalidModule.selector);
+        locker.announceDestination(address(locker));
+        vm.expectRevert(Liquidity.InvalidModule.selector);
+        locker.announceDestination(address(core));
+
+        vm.expectRevert(Liquidity.DestinationNotReady.selector);
+        locker.sendFunding(staking, 1); // never announced
+        locker.announceDestination(staking);
+        assertEq(locker.destinationReadyAt(staking), block.timestamp + 7 days);
+        vm.warp(block.timestamp + 7 days - 1);
+        vm.expectRevert(Liquidity.DestinationNotReady.selector);
+        locker.sendFunding(staking, 1); // one second early
+        vm.warp(block.timestamp + 1);
+        vm.expectRevert(Liquidity.MissingContribution.selector);
+        locker.sendFunding(staking, held + 1);
+
+        uint256 nav = core.NAV();
+        uint256 reserves = core.reserveCash();
+        uint256 szrHeld = locker.heldPrincipal(address(core.token()));
+        locker.sendFunding(staking, held);
+        assertEq(backing.balanceOf(staking), held);
+        assertEq(locker.heldPrincipal(address(backing)), 0);
+        assertEq(locker.heldPrincipal(address(core.token())), szrHeld);
+        assertEq(core.NAV(), nav);
+        assertEq(core.reserveCash(), reserves);
+        _assertCash();
+
+        locker.revokeDestination(staking);
+        _acquire(alice);
+        vm.expectRevert(Liquidity.DestinationNotReady.selector);
+        locker.sendFunding(staking, 1); // revoked
+        _assertCash();
+    }
+
     function testUnknownPoolsAndZeroUnitsCannotConsumePrincipal() public {
         vm.expectRevert(Liquidity.UnknownPool.selector);
         locker.position(999);

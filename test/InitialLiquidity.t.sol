@@ -66,6 +66,44 @@ contract InitialLiquidityTest is Test {
         config.auction = SzrCore.AuctionConfig(8e12, 1, 20_000e18);
     }
 
+    /// The pool is buy-only until someone has bought, because genesis starts as SZR only.
+    function _tradeBothWays(SzrCore next, Liquidity nextLocker) internal {
+        address szr = address(next.token());
+        PoolKey memory pool = nextLocker.key(nextLocker.INITIAL_POSITION());
+        bool first = Currency.unwrap(pool.currency0) == address(backing);
+        PoolSwapTest router = new PoolSwapTest(manager);
+        PoolSwapTest.TestSettings memory settings;
+        backing.mint(alice, 1e18);
+        vm.startPrank(alice);
+        backing.approve(address(router), 1e18);
+        router.swap(
+            pool,
+            IPoolManager.SwapParams(
+                first,
+                -int256(1e18),
+                first ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            ),
+            settings,
+            ""
+        );
+        uint256 bought = TestAsset(szr).balanceOf(alice);
+        assertGt(bought, 0);
+        TestAsset(szr).approve(address(router), bought / 2);
+        router.swap(
+            pool,
+            IPoolManager.SwapParams(
+                !first,
+                -int256(bought / 2),
+                first ? TickMath.MAX_SQRT_PRICE - 1 : TickMath.MIN_SQRT_PRICE + 1
+            ),
+            settings,
+            ""
+        );
+        vm.stopPrank();
+        assertGt(backing.balanceOf(alice), 0);
+        assertEq(next.reserveCash(), INITIAL * 297e10 / 1e18); // pool trades never touch reserves
+    }
+
     function testDeployScriptMigratesAndFundsGenesisFromTheDeployer() public {
         address deployer = core.initializer(); // the fixture's run used the same broadcaster
         oldToken.mint(deployer, INITIAL);
@@ -83,6 +121,8 @@ contract InitialLiquidityTest is Test {
         assertLt(next.token().balanceOf(deployer), 1e18);
         assertGt(next.token().balanceOf(address(manager)), INITIAL - 1e18);
         assertEq(oldToken.balanceOf(deployer), 0);
+        _tradeBothWays(next, nextLocker);
+        assertEq(next.auctionsOpenAt(), 0); // traded while migration is open and the sale closed
 
         config.initialLiquidityMinimumBacking += 1;
         oldToken.mint(deployer, INITIAL);

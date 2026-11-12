@@ -25,7 +25,8 @@ contract ContinuousAuctionTest is Test {
         state.buy(10e18);
         state.project(2 days, state.depth);
         assertEq(state.price(), 1e12);
-        assertEq(state.excessTime, 0);
+        assertEq(state.excess, 0);
+        assertEq(state.deficit, 0);
         assertEq(state.decayMass, 0);
         assertGt(state.buy(1), 0);
     }
@@ -34,7 +35,7 @@ contract ContinuousAuctionTest is Test {
         ContinuousAuction.State memory state = ContinuousAuction.create(1_000e18, 1e18, 1e12);
         state.project(2 days - 60, state.depth);
         state.buy(1);
-        uint256 remaining = FixedPointMathLib.divUp(state.excessTime, state.decayMass);
+        uint256 remaining = FixedPointMathLib.divUp(_excessTime(state), state.decayMass);
         assertLe(remaining, 61);
         state.project(61, state.depth);
         assertEq(state.price(), 1e12);
@@ -47,7 +48,8 @@ contract ContinuousAuctionTest is Test {
         for (uint256 index; index < 100; index++) {
             many.project(17, many.depth);
         }
-        assertEq(many.excessTime, one.excessTime);
+        assertEq(many.excess, one.excess);
+        assertEq(many.deficit, one.deficit);
         assertEq(many.decayMass, one.decayMass);
         assertEq(many.price(), one.price());
     }
@@ -58,7 +60,7 @@ contract ContinuousAuctionTest is Test {
         uint256 price = state.price();
         state.project(0, 10_000e18);
         assertApproxEqAbs(state.price(), price, 1);
-        assertLe(FixedPointMathLib.divUp(state.excessTime, state.decayMass), 101);
+        assertLe(FixedPointMathLib.divUp(_excessTime(state), state.decayMass), 101);
         state.project(101, state.depth);
         assertEq(state.price(), 1);
     }
@@ -116,7 +118,7 @@ contract ContinuousAuctionTest is Test {
         uint256 excessive = 818592150592861781622465154682686326;
         vm.expectRevert(ContinuousAuction.InvalidDepth.selector);
         this.create(excessive, 2, 1);
-        ContinuousAuction.State memory state = ContinuousAuction.State(1, 1, 0, 0);
+        ContinuousAuction.State memory state = ContinuousAuction.State(1, 1, 0, 0, 0);
         vm.expectRevert(ContinuousAuction.InvalidDepth.selector);
         this.projectState(state, 0);
         vm.expectRevert(ContinuousAuction.InvalidDepth.selector);
@@ -129,17 +131,30 @@ contract ContinuousAuctionTest is Test {
         state.depth = excessive;
         vm.expectRevert(ContinuousAuction.InvalidDepth.selector);
         this.productOf(state);
+        vm.expectRevert(ContinuousAuction.InvalidDepth.selector);
+        this.projectState(state, 1);
     }
 
     function testUnrepresentableFloorOrExcessCannotEnterProduct() public {
+        // The product may now fill a whole word: depth 1 at the largest floor is representable.
         ContinuousAuction.State memory state =
-            ContinuousAuction.State(1, type(uint256).max, 0, 0);
+            ContinuousAuction.State(1, type(uint256).max, 0, 0, 0);
+        assertEq(this.productOf(state), type(uint256).max);
+        state.depth = 2;
         vm.expectRevert(ContinuousAuction.UnrepresentableCurve.selector);
         this.productOf(state);
+        state.depth = 1;
         state.floorWad = 1;
-        state.excessTime = type(uint256).max;
+        state.excess = type(uint256).max;
         vm.expectRevert(ContinuousAuction.UnrepresentableCurve.selector);
         this.productOf(state);
+        state.excess = type(uint256).max - 1;
+        assertEq(this.productOf(state), type(uint256).max);
+    }
+
+    /// @dev The exact decaying quantity; fits one word for the small states used here.
+    function _excessTime(ContinuousAuction.State memory state) internal pure returns (uint256) {
+        return state.excess * 2 days - state.deficit;
     }
 
     function productOf(ContinuousAuction.State memory state) external pure returns (uint256) {

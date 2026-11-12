@@ -1,9 +1,9 @@
 # Sazare / SZR
 
 A fixed-supply, WETH-backed token with one continuous sale auction and native Uniswap v4 liquidity
-management. Auction proceeds fund backing first. Two thirds of any premium buys productive pool
-assets held permanently under protocol custody; one third stays in reserves and raises NAV. There
-are no adapters, factories, per-pool rewards, or weights.
+management. Auction proceeds fund backing first. Two thirds of any premium goes to protocol
+custody, primarily for pool liquidity; one third stays in reserves and raises NAV. There are no
+adapters, factories, per-pool rewards, or weights.
 
 ## Contracts
 
@@ -35,6 +35,13 @@ Prices react to purchases through the continuous constant-product curve and deca
 of eligible sale time. The price is bounded below by one and a half times current token backing, so
 every sale carries a premium of at least half its NAV value. When that floor overtakes virtual
 pricing, fills start from the floor so demand still raises the curve.
+
+The curve can represent a price up to about 115,000 WETH per SZR at full-supply depth, so the floor
+can follow NAV to roughly 77,000 WETH per SZR; past that only new sales stop. The pricing library
+keeps its decaying term in two words to reach that range. `test/ContinuousAuctionEquivalence.t.sol`
+holds the evidence that this changes no result: a step-by-step fuzz against the original library
+(frozen in `test/utils/ContinuousAuctionV1.sol`) and exact vectors from an unbounded-integer
+reference (`test/fixtures/continuous_auction_reference.py`) above the original's range.
 Quotes include total payment, the reserve share (NAV backing plus a third of the premium), and
 treasury funding separately; the last two always sum to the payment.
 
@@ -163,14 +170,21 @@ and `moveLiquidity` reject it, so its SZR leaves only to pool buyers. Different-
 and deployment in separate steps. Unspent assets remain held.
 
 Every removal separates principal from fees. Internal moves cannot issue SZR, consume sale allowance,
-or turn liquidity principal into revenue. There is no general withdrawal, arbitrary recipient,
-external allowance setter, or arbitrary execution function. Pool assets and held WETH do not count
-as floor reserves and cannot be borrowed through Core.
+or turn liquidity principal into revenue. There is no external allowance setter or arbitrary
+execution function. Pool assets and held WETH do not count as floor reserves and cannot be borrowed
+through Core.
+
+**Held WETH can fund other protocol uses.** The manager may send held WETH (never SZR, never a
+position) to a destination with `sendFunding`, for example staking rewards or another product.
+A destination must first be announced with `announceDestination` and becomes usable only after
+`DESTINATION_DELAY` (7 days); `revokeDestination` takes effect immediately. Held WETH includes
+sale funding and any WETH the manager withdraws from non-genesis positions or swaps into.
 
 **The manager is a trusted role.** `addPool`, `deployPrincipal` and `swapPrincipal` can route held
 treasury assets and non-genesis positions through any pool the manager chooses, with a
 manager-set minimum output, so a malicious manager could transfer that value away. Floor reserves
-in Core and the permanent genesis position are out of its reach. Use a multisig.
+in Core and the permanent genesis position are out of its reach. Use a multisig. The 7-day
+notice applies to `sendFunding` only; it does not constrain those pool routes.
 
 The manager controls asset/hook selection, allocation, and trade execution prices. It is trusted
 not to choose harmful hooks or assets, manipulated markets, or inappropriate slippage settings.
@@ -279,6 +293,8 @@ These are accepted operating rules, not enforced in code.
 - If `FUND_INITIAL_LIQUIDITY=false`, check the pool price before funding; if it was moved into the
   genesis range, send the restoring swap and `fundInitialLiquidity` back to back.
 - Closing migration opens the sale, the release schedule and the fee auctions. Nothing else does.
+- Watch `DestinationAnnounced` events: each one starts a 7-day notice before held WETH can be
+  sent to that address.
 - Partner tokens: no rebasing, unbounded-mint, fee-on-transfer or transfer-restricted tokens, and
   always register them with the fee-auction floor at its minimum (`1`).
 

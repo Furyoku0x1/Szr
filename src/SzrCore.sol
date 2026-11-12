@@ -599,7 +599,7 @@ contract SzrCore is ReentrancyGuard {
 
     function _checkSaleDepth(ContinuousAuction.State memory curve) internal view {
         ContinuousAuction.State memory projected = ContinuousAuction.State(
-            curve.depth, curve.floorWad, curve.excessTime, curve.decayMass
+            curve.depth, curve.floorWad, curve.excess, curve.deficit, curve.decayMass
         );
         ContinuousAuction.project(projected, 0, token.totalSupply() + saleBuffer);
     }
@@ -614,7 +614,8 @@ contract SzrCore is ReentrancyGuard {
         uint256 floor = _saleMinimum(backingRequired(WAD));
         if (ContinuousAuction.price(curve) >= floor) return;
         curve.floorWad = floor;
-        curve.excessTime = 0;
+        curve.excess = 0;
+        curve.deficit = 0;
         curve.decayMass = 0;
     }
 }

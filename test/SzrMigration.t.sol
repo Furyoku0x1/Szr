@@ -8,6 +8,7 @@ import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { Hooks } from "v4-core/libraries/Hooks.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { Currency } from "v4-core/types/Currency.sol";
+import { Szr } from "../src/Szr.sol";
 import { SzrCore } from "../src/SzrCore.sol";
 import { SzrMigration, ILegacySzrHook } from "../src/SzrMigration.sol";
 import { FeeCollector } from "../src/FeeCollector.sol";
@@ -336,6 +337,49 @@ contract SzrMigrationTest is Test {
         assertEq(deployed.NAV(), deployed.reserveCash() * 1e18 / 1_000e18);
         assertEq(deployed.totalReleased(), 0);
         assertEq(deployed.releaseCredit(), 0);
+    }
+
+    /// While migration is open there are no loans or sales, so cash must equal backing and
+    /// every migrated token must be redeemable, whatever each migration recovered.
+    function testFuzzEveryMigratedTokenCanExitWhileMigrationIsOpen(
+        uint96[6] memory amounts,
+        uint64[6] memory prices,
+        uint96 gift
+    ) public {
+        backing.mint(address(oldHook), 1_000_000e18);
+        backing.mint(address(this), 100e18);
+        address[2] memory holders = [alice, bob];
+        Szr szr = core.token();
+        for (uint256 index; index < 2; index++) {
+            vm.prank(holders[index]);
+            szr.approve(address(core), type(uint256).max);
+        }
+        for (uint256 index; index < 6; index++) {
+            address owner = holders[index % 2];
+            oldHook.setPrice(bound(prices[index], 1e9, 3e13));
+            vm.prank(owner);
+            migrator.migrate(bound(amounts[index], 1e18, 50_000_000e18), 0, block.timestamp);
+            if (index == 2) {
+                uint256 half = core.token().balanceOf(alice) / 2;
+                vm.prank(alice);
+                core.redeem(half, 0);
+            }
+            if (index == 3) {
+                core.donateBacking(bound(gift, 1, 100e18));
+                vm.prank(bob);
+                core.donateSzr(1e18);
+            }
+            assertEq(core.loanPrincipal(), 0);
+            assertEq(backing.balanceOf(address(core)), core.reserveCash());
+        }
+        for (uint256 index; index < 2; index++) {
+            uint256 held = core.token().balanceOf(holders[index]);
+            vm.prank(holders[index]);
+            core.redeem(held, 0);
+        }
+        assertEq(core.activeSupply(), 0);
+        assertEq(core.reserveCash(), 0);
+        assertEq(backing.balanceOf(address(core)), 0);
     }
 
     function testAuctionStaysClosedUntilMigrationEnds() public {

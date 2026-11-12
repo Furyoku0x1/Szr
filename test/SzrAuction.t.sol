@@ -3,6 +3,7 @@ pragma solidity 0.8.30;
 
 import { SzrWorld } from "./utils/SzrWorld.sol";
 import { SzrCore } from "../src/SzrCore.sol";
+import { ContinuousAuction } from "../src/ContinuousAuction.sol";
 import { ReleaseSchedule } from "../src/ReleaseSchedule.sol";
 
 contract SzrAuctionTest is SzrWorld {
@@ -46,6 +47,57 @@ contract SzrAuctionTest is SzrWorld {
         vm.prank(alice);
         core.buy(amount, payment, block.timestamp);
         assertGt(core.NAV(), nav);
+        _assertCash();
+    }
+
+    function _raiseNavTo(uint256 target) internal {
+        uint256 gift = target * core.activeSupply() / 1e18 - core.backingAmount();
+        backing.mint(address(this), gift);
+        backing.approve(address(core), gift);
+        core.donateBacking(gift);
+    }
+
+    /// The original pricing library stopped selling for good once 1.5x NAV passed about
+    /// 0.67 WETH per SZR. The sale and every exit must now work far beyond that.
+    function testSaleAndExitsWorkFarAboveTheOldPriceCeiling() public {
+        _raiseNavTo(70_000e18);
+        assertGt(core.NAV(), 69_999e18);
+        (uint256 payment,,) = core.quote(1_000e18);
+        assertGe(payment, 105_000_000e18); // 1,000 SZR at 1.5 x 70,000 WETH
+        backing.mint(alice, payment);
+        uint256 nav = core.NAV();
+        vm.startPrank(alice);
+        core.buy(1_000e18, payment, block.timestamp);
+        assertGt(core.NAV(), nav);
+        core.redeem(100e18, 0);
+        core.donateSzr(1e18);
+        core.borrow(100e18, core.backingRequired(50e18));
+        vm.stopPrank();
+        (,, uint256 expiry) = core.loans(alice);
+        vm.warp(expiry);
+        core.settleExpired(alice);
+        (payment,,) = core.quote(1e18);
+        assertGt(payment, 0);
+        _assertCash();
+    }
+
+    /// Measured, not assumed: with the full supply the curve holds a floor up to about
+    /// 115,000 WETH per SZR. Past that only new sales stop; exits are unaffected.
+    function testPastTheNewCeilingOnlySalesStop() public {
+        _raiseNavTo(77_000e18); // floor 115,500 WETH
+        (uint256 payment,,) = core.quote(1e18);
+        assertGt(payment, 0);
+        _raiseNavTo(77_300e18); // floor 115,950 WETH
+        vm.expectRevert(ContinuousAuction.UnrepresentableCurve.selector);
+        core.quote(1e18);
+        vm.expectRevert(ContinuousAuction.UnrepresentableCurve.selector);
+        core.buy(1e18, type(uint256).max, block.timestamp);
+        uint256 held = core.token().balanceOf(alice);
+        vm.startPrank(alice);
+        assertGt(core.redeem(held / 2, 0), 0);
+        core.donateSzr(1e18);
+        vm.stopPrank();
+        assertGt(core.price(), 115_000e18);
         _assertCash();
     }
 

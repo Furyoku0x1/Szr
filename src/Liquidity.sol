@@ -97,6 +97,9 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
     mapping(uint256 id => Position) internal positions;
     mapping(bytes32 identity => bool used) public positionUsed;
     mapping(address asset => uint256 amount) public heldPrincipal;
+    /// @notice Notice period before held WETH can be sent to a newly announced destination.
+    uint256 public constant DESTINATION_DELAY = 7 days;
+    mapping(address destination => uint256 readyAt) public destinationReadyAt;
     bytes32 internal expectedCallback;
 
     error ZeroAddress();
@@ -125,6 +128,7 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
     error PositionMismatch();
     error TransferAmountMismatch();
     error AccountingMismatch();
+    error DestinationNotReady();
 
     event PoolAdded(uint256 indexed id, bytes32 indexed poolId, address indexed partner);
     event ManagerNominated(address indexed nominee);
@@ -137,6 +141,9 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         address indexed input, address indexed output, uint256 spent, uint256 received
     );
     event FeesCollected(uint256 indexed id, uint256 szr, uint256 partner);
+    event DestinationAnnounced(address indexed destination, uint256 readyAt);
+    event DestinationRevoked(address indexed destination);
+    event FundingSent(address indexed destination, uint256 weth);
 
     modifier onlyManager() {
         if (msg.sender != manager) revert NotManager();
@@ -359,7 +366,41 @@ contract Liquidity is ReentrancyGuard, IUnlockCallback {
         started = true;
     }
 
-    /// @notice Core transfers only sale proceeds left after fully funding the reserve claim.
+    /// @notice Announces where held WETH may be sent once the notice period has passed.
+    function announceDestination(address destination) external nonReentrant onlyManager {
+        if (destination == address(0)) revert ZeroAddress();
+        if (destination == address(this)) revert InvalidModule();
+        // WETH sent straight to Core is not counted as reserves and could not be recovered.
+        if (destination == address(core)) revert InvalidModule();
+        uint256 readyAt = block.timestamp + DESTINATION_DELAY;
+        destinationReadyAt[destination] = readyAt;
+        emit DestinationAnnounced(destination, readyAt);
+    }
+
+    function revokeDestination(address destination) external nonReentrant onlyManager {
+        delete destinationReadyAt[destination];
+        emit DestinationRevoked(destination);
+    }
+
+    /// @notice Sends held WETH to an announced destination, for uses beyond pool liquidity.
+    /// @dev Only the backing asset can leave this way; SZR and every position stay in custody.
+    function sendFunding(address destination, uint256 amount)
+        external
+        nonReentrant
+        onlyManager
+    {
+        uint256 readyAt = destinationReadyAt[destination];
+        if (readyAt == 0) revert DestinationNotReady();
+        if (block.timestamp < readyAt) revert DestinationNotReady();
+        if (amount == 0) revert InvalidUnits();
+        address weth = core.backingAsset();
+        if (amount > heldPrincipal[weth]) revert MissingContribution();
+        heldPrincipal[weth] -= amount;
+        SafeTransferLib.safeTransfer(weth, destination, amount);
+        emit FundingSent(destination, amount);
+    }
+
+    /// @notice Core transfers only the liquidity share of sale premiums; reserves keep the rest.
     function recordFunding(uint256 amount) external nonReentrant {
         if (msg.sender != address(core)) revert NotCore();
         if (!started) revert NotStarted();

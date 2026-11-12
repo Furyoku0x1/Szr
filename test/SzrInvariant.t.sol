@@ -28,6 +28,7 @@ contract SzrHandler is Test {
     address[3] internal actors;
     bool public floorFell;
     bool public soldBelowMinimum;
+    bool public redeemUnfunded;
     uint256 public acquisitions;
     uint256 public draws;
     uint256 public repayments;
@@ -123,7 +124,10 @@ contract SzrHandler is Test {
         uint256 amount = bound(rawAmount, 1, held);
         uint256 payout =
             FixedPointMathLib.fullMulDiv(amount, core.backingAmount(), core.activeSupply());
-        if (payout > core.reserveCash()) return;
+        if (payout > core.reserveCash()) {
+            redeemUnfunded = true; // unpledged tokens must always be redeemable
+            return;
+        }
         vm.prank(owner);
         core.redeem(amount, payout);
     }
@@ -263,8 +267,49 @@ contract SzrInvariantTest is SzrWorld {
         assertGe(core.reserveCash() * core.activeSupply(), core.backingAmount() * unlocked);
         assertFalse(handler.floorFell());
         assertFalse(handler.soldBelowMinimum());
+        assertFalse(handler.redeemUnfunded());
         assertEq(core.publicInventory() + core.migrationRemaining(), core.unreleasedSupply());
         assertGe(backing.balanceOf(address(core.economics())), core.economics().claimableFees());
+    }
+
+    /// After any sequence, everyone can leave. Wallets redeem first while every loan is still
+    /// outstanding (the worst case for cash), then live loans repay and expired ones settle.
+    function afterInvariant() public {
+        address[4] memory holders = [alice, bob, charlie, address(this)];
+        for (uint256 index; index < 4; index++) {
+            _exit(holders[index]);
+        }
+        for (uint256 index; index < 3; index++) {
+            address owner = holders[index];
+            (, uint256 debt, uint256 expiry) = core.loans(owner);
+            if (debt == 0) continue;
+            if (block.timestamp < expiry) {
+                vm.prank(owner);
+                core.repayAndReclaim(debt);
+            } else {
+                core.settleExpired(owner);
+            }
+            _exit(owner);
+        }
+        assertEq(core.loanPrincipal(), 0);
+        assertEq(core.pledgedSupply(), 0);
+        assertEq(core.totalReclaimable(), 0);
+        assertEq(core.reserveCash(), core.backingAmount());
+        _assertCash();
+    }
+
+    function _exit(address owner) internal {
+        vm.startPrank(owner);
+        uint256 reclaimable = core.reclaimableCollateral(owner);
+        if (reclaimable != 0) core.reclaimCollateral(reclaimable);
+        uint256 held = core.token().balanceOf(owner);
+        if (held != 0) {
+            core.token().approve(address(core), held);
+            uint256 expected =
+                FixedPointMathLib.fullMulDiv(held, core.backingAmount(), core.activeSupply());
+            assertEq(core.redeem(held, 0), expected);
+        }
+        vm.stopPrank();
     }
 
     function invariantGrossReleaseAndPhysicalLP() public view {

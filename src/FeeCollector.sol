@@ -166,7 +166,7 @@ contract FeeCollector is ReentrancyGuard {
     ) internal view {
         ContinuousAuction.State memory projected =
             ContinuousAuction.State(
-                curve.depth, curve.floorWad, curve.excessTime, curve.decayMass
+                curve.depth, curve.floorWad, curve.excess, curve.deficit, curve.decayMass
             );
         ContinuousAuction.project(projected, 0, ERC20(asset).totalSupply() + buffer);
     }
