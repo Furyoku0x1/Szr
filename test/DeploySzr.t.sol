@@ -44,6 +44,8 @@ contract DeploySzrTest is Test {
         assertEq(core.token().balanceOf(address(locker)), 0);
         assertEq(locker.heldPrincipal(address(core.token())), 0);
         assertEq(locker.position(0).partner, address(weth));
+        assertEq(locker.key(0).fee, 10_000); // the main pool charges 1%
+        assertEq(locker.key(0).tickSpacing, 200);
         assertEq(locker.poolCount(), 1);
         assertEq(core.releaseRatePerDay(), 1_000_000e18);
         vm.prank(core.initializer());

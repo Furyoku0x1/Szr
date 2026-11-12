@@ -243,7 +243,8 @@ Copy `.env.example` to `.env` and set the required chain ID, WETH, PoolManager a
 `350000000000000000000000000` (the full 1:1 migration cap in wei).
 `INITIAL_LIQUIDITY_ALLOCATION` defaults to `25000000000000000000000000`; it is only the funding
 target exposed as `initialLiquidityTarget()`. It neither increases nor reduces `migrationAllocation()`.
-The script registers full-range and empty one-sided positions and launches. By default
+The script registers full-range and empty one-sided positions in one hook-less SZR/WETH pool with
+a 1% swap fee and tick spacing 200, and launches. By default
 (`FUND_INITIAL_LIQUIDITY=true`) the deploying address then migrates its own 25M legacy SZR and
 calls `fundInitialLiquidity`, so the genesis tokens are the only active supply when migration opens
 to other holders. That address must hold the legacy tokens, and `INITIAL_LIQUIDITY_MIN_BACKING`

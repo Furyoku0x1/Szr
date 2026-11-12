@@ -150,10 +150,10 @@ contract DeploySzr is Script {
             : FixedPointMathLib.fullMulDiv(1e18, 1 << 192, price);
         config = Liquidity.PoolConfig({
             partner: core.backingAsset(),
-            feePips: 3_000,
-            tickSpacing: 60,
-            tickLower: TickMath.minUsableTick(60),
-            tickUpper: TickMath.maxUsableTick(60),
+            feePips: 10_000,
+            tickSpacing: 200,
+            tickLower: TickMath.minUsableTick(200),
+            tickUpper: TickMath.maxUsableTick(200),
             initialSqrtPriceX96: SafeCastLib.toUint160(FixedPointMathLib.sqrt(ratio)),
             hooks: IHooks(address(0))
         });

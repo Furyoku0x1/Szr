@@ -329,8 +329,8 @@ contract InitialLiquidityTest is Test {
         uint256 poolLiquidityBefore = manager.getLiquidity(key.toId());
 
         PoolModifyLiquidityTest externalLp = new PoolModifyLiquidityTest(manager);
-        int24 externalTickLower = TickMath.minUsableTick(60);
-        int24 externalTickUpper = TickMath.maxUsableTick(60);
+        int24 externalTickLower = TickMath.minUsableTick(key.tickSpacing);
+        int24 externalTickUpper = TickMath.maxUsableTick(key.tickSpacing);
         backing.mint(alice, 1e18);
         vm.startPrank(alice);
         core.token().approve(address(externalLp), type(uint256).max);

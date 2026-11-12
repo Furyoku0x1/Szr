@@ -150,7 +150,7 @@ contract AuditFindingsTest is InitialLiquidityTest {
 
     /// N-2 (accepted; FIFO sequencer, deploy from an unpublished address): `addPool` requires
     /// the pool price to equal the configured price exactly.
-    /// If the 3000/60 pool is initialised at another price first, `addPool` reverts. Before
+    /// If the main 1% pool is initialised at another price first, `addPool` reverts. Before
     /// the script runs this fails the local simulation (nothing is broadcast); between the
     /// script's separate transactions it leaves Core deployed but unlaunched. Redeploy fixes it.
     function testPoC_PoolPreInitialisationBreaksScriptedDeployment() public {
@@ -176,8 +176,8 @@ contract AuditFindingsTest is InitialLiquidityTest {
         PoolKey memory key = PoolKey(
             Currency.wrap(first ? szr : address(backing)),
             Currency.wrap(first ? address(backing) : szr),
-            3_000,
-            60,
+            10_000,
+            200,
             IHooks(address(0))
         );
         vm.prank(address(0x6121));
