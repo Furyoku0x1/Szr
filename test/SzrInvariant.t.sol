@@ -27,6 +27,7 @@ contract SzrHandler is Test {
     PoolSwapTest public swapper;
     address[3] internal actors;
     bool public floorFell;
+    bool public soldBelowMinimum;
     uint256 public acquisitions;
     uint256 public draws;
     uint256 public repayments;
@@ -65,6 +66,7 @@ contract SzrHandler is Test {
         if (quantity > 100e18) quantity = 100e18;
         address owner = actors[actor % 3];
         (uint256 payment,,) = core.quote(quantity);
+        if (payment * 2 < core.backingRequired(quantity) * 3) soldBelowMinimum = true;
         if (backing.balanceOf(owner) < payment) return;
         vm.prank(owner);
         core.buy(quantity, payment, block.timestamp);
@@ -260,6 +262,7 @@ contract SzrInvariantTest is SzrWorld {
         uint256 unlocked = core.activeSupply() - totalCollateral;
         assertGe(core.reserveCash() * core.activeSupply(), core.backingAmount() * unlocked);
         assertFalse(handler.floorFell());
+        assertFalse(handler.soldBelowMinimum());
         assertEq(core.publicInventory() + core.migrationRemaining(), core.unreleasedSupply());
         assertGe(backing.balanceOf(address(core.economics())), core.economics().claimableFees());
     }

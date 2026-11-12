@@ -3,6 +3,7 @@ pragma solidity 0.8.30;
 
 import { console2 } from "forge-std/console2.sol";
 import { Script } from "forge-std/Script.sol";
+import { IERC20 } from "forge-std/interfaces/IERC20.sol";
 import { FixedPointMathLib } from "solady/utils/FixedPointMathLib.sol";
 import { SafeCastLib } from "solady/utils/SafeCastLib.sol";
 import { IHooks } from "v4-core/interfaces/IHooks.sol";
@@ -27,6 +28,8 @@ contract DeploySzr is Script {
         uint256 launchAllocation;
         uint256 initialLiquidityTokens;
         SzrCore.AuctionConfig auction;
+        bool fundInitialLiquidity;
+        uint256 initialLiquidityMinimumBacking;
     }
 
     error WrongChain();
@@ -59,6 +62,7 @@ contract DeploySzr is Script {
         _setupMigration(core, config);
         _setupPools(core, locker, config.marketPrice);
         core.launch();
+        if (config.fundInitialLiquidity) _fundInitialLiquidity(core, locker, config);
         if (config.manager != address(0)) {
             if (config.manager != setupManager) locker.nominateManager(config.manager);
         }
@@ -85,12 +89,32 @@ contract DeploySzr is Script {
         config.bootstrapNAV = vm.envOr("BOOTSTRAP_NAV", uint256(1e12));
         config.launchAllocation = vm.envOr("MIGRATION_ALLOCATION", uint256(350_000_000e18));
         config.initialLiquidityTokens =
-            vm.envOr("INITIAL_LIQUIDITY_ALLOCATION", uint256(100_000_000e18));
+            vm.envOr("INITIAL_LIQUIDITY_ALLOCATION", uint256(25_000_000e18));
         config.auction = SzrCore.AuctionConfig(
             vm.envOr("AUCTION_OPENING_WAD", config.marketPrice * 2),
             vm.envOr("AUCTION_FLOOR_WAD", uint256(1)),
             vm.envOr("AUCTION_BUFFER", uint256(20_000e18))
         );
+        config.fundInitialLiquidity = vm.envOr("FUND_INITIAL_LIQUIDITY", true);
+        if (!config.fundInitialLiquidity) return config;
+        if (config.launchAllocation == 0) return config;
+        if (config.initialLiquidityTokens == 0) return config;
+        // Required: the least WETH the deployer's own legacy sale may recover.
+        config.initialLiquidityMinimumBacking = vm.envUint("INITIAL_LIQUIDITY_MIN_BACKING");
+    }
+
+    /// @dev The deployer migrates its own legacy SZR and contributes it as the genesis position,
+    /// so those are the only active tokens when migration opens to everyone else.
+    function _fundInitialLiquidity(SzrCore core, Liquidity locker, Config memory config)
+        internal
+    {
+        uint256 amount = core.initialLiquidityTarget();
+        if (amount == 0) return;
+        SzrMigration migrator = SzrMigration(core.migration());
+        IERC20(config.legacyToken).approve(address(migrator), amount);
+        migrator.migrate(amount, config.initialLiquidityMinimumBacking, type(uint256).max);
+        IERC20(address(core.token())).approve(address(locker), amount);
+        locker.fundInitialLiquidity(0, type(uint256).max);
     }
 
     function _setupMigration(SzrCore core, Config memory config) internal {

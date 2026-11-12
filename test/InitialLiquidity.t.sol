@@ -34,7 +34,7 @@ contract InitialLiquidityTest is Test {
     address internal alice = address(0xA11CE);
     address internal contributor = address(0xF00D);
     uint256 internal constant TOTAL = 350_000_000e18;
-    uint256 internal constant INITIAL = 100_000_000e18;
+    uint256 internal constant INITIAL = 25_000_000e18;
     uint256 internal constant HOLDERS = TOTAL - INITIAL;
 
     function setUp() public {
@@ -42,7 +42,18 @@ contract InitialLiquidityTest is Test {
         manager =
             IPoolManager(deployCode("PoolManager.sol:PoolManager", abi.encode(address(this))));
         _legacy();
-        DeploySzr.Config memory config;
+        DeploySzr deployment = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr"));
+        (core,, locker) = deployment.run(_deployConfig());
+        migrator = SzrMigration(core.migration());
+        oldToken.mint(alice, HOLDERS + 1e18);
+        oldToken.mint(contributor, INITIAL);
+        vm.prank(alice);
+        oldToken.approve(address(migrator), type(uint256).max);
+        vm.prank(contributor);
+        oldToken.approve(address(migrator), type(uint256).max);
+    }
+
+    function _deployConfig() internal view returns (DeploySzr.Config memory config) {
         config.chainId = block.chainid;
         config.asset = address(backing);
         config.poolManager = address(manager);
@@ -53,15 +64,30 @@ contract InitialLiquidityTest is Test {
         config.launchAllocation = TOTAL;
         config.initialLiquidityTokens = INITIAL;
         config.auction = SzrCore.AuctionConfig(8e12, 1, 20_000e18);
+    }
+
+    function testDeployScriptMigratesAndFundsGenesisFromTheDeployer() public {
+        address deployer = core.initializer(); // the fixture's run used the same broadcaster
+        oldToken.mint(deployer, INITIAL);
+        DeploySzr.Config memory config = _deployConfig();
+        config.fundInitialLiquidity = true;
+        config.initialLiquidityMinimumBacking = INITIAL * 297e10 / 1e18;
         DeploySzr deployment = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr"));
-        (core,, locker) = deployment.run(config);
-        migrator = SzrMigration(core.migration());
-        oldToken.mint(alice, HOLDERS + 1e18);
-        oldToken.mint(contributor, INITIAL);
-        vm.prank(alice);
-        oldToken.approve(address(migrator), type(uint256).max);
-        vm.prank(contributor);
-        oldToken.approve(address(migrator), type(uint256).max);
+        (SzrCore next,, Liquidity nextLocker) = deployment.run(config);
+        assertEq(next.initializer(), deployer);
+        assertTrue(nextLocker.initialLiquidityFunded());
+        assertEq(next.activeSupply(), INITIAL); // the genesis tokens are the only live supply
+        assertEq(next.reserveCash(), INITIAL * 297e10 / 1e18);
+        assertEq(next.migrationRemaining(), TOTAL - INITIAL);
+        assertEq(next.auctionsOpenAt(), 0);
+        assertLt(next.token().balanceOf(deployer), 1e18);
+        assertGt(next.token().balanceOf(address(manager)), INITIAL - 1e18);
+        assertEq(oldToken.balanceOf(deployer), 0);
+
+        config.initialLiquidityMinimumBacking += 1;
+        oldToken.mint(deployer, INITIAL);
+        vm.expectRevert(SzrMigration.BelowMinimum.selector);
+        deployment.run(config);
     }
 
     function _legacy() internal {
@@ -257,7 +283,8 @@ contract InitialLiquidityTest is Test {
         assertEq(core.publicInventory(), inventory);
         assertEq(locker.liquidityHeld(locker.INITIAL_POSITION()), initialUnits);
 
-        // A normal exact-input sell can trade through the same one-sided position without touching Core backing.
+        // A normal exact-input sell can trade through the same one-sided position without
+        // touching Core backing.
         vm.startPrank(alice);
         core.token().approve(address(router), boughtTokens / 2);
         router.swap(
@@ -334,7 +361,8 @@ contract InitialLiquidityTest is Test {
         uint256 reserves,
         uint256 genesisUnits
     ) internal {
-        // A holder may sell below NAV; the pool executes at market price and Core accounting is unchanged.
+        // A holder may sell below NAV; the pool executes at market price and Core accounting
+        // is unchanged.
         PoolSwapTest router = new PoolSwapTest(manager);
         uint256 sellAmount = 500e18;
         uint256 tokenBalanceBefore = core.token().balanceOf(alice);

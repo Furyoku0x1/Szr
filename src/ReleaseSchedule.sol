@@ -8,7 +8,7 @@ import { FixedPointMathLib } from "solady/utils/FixedPointMathLib.sol";
 library ReleaseSchedule {
     uint256 internal constant DAY = 1 days;
     uint256 internal constant HALF_LIFE = 365 days;
-    uint256 internal constant INITIAL_RATE = 500_000e18;
+    uint256 internal constant INITIAL_RATE = 1_000_000e18;
     uint256 internal constant MINIMUM_RATE = 100_000e18;
     uint256 internal constant LN_2_WAD = 693147180559945309;
     uint256 internal constant WAD = 1e18;

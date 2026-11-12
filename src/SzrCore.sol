@@ -17,7 +17,7 @@ contract SzrCore is ReentrancyGuard {
     using ReleaseSchedule for ReleaseSchedule.State;
     uint256 public constant WAD = 1e18;
     uint256 public constant INACTIVITY_SECONDS = 90 days;
-    uint256 public constant RELEASE_PER_DAY = 500_000e18;
+    uint256 public constant RELEASE_PER_DAY = 1_000_000e18;
     uint256 public constant MIN_RELEASE_PER_DAY = 100_000e18;
     uint256 public constant RELEASE_HALF_LIFE = 365 days;
 
@@ -46,6 +46,8 @@ contract SzrCore is ReentrancyGuard {
     bool public initialized;
     bool public launched;
     uint256 public startedAt;
+    /// @notice Zero until migration ends; the sale, release schedule and fee auctions start then.
+    uint256 public auctionsOpenAt;
 
     uint256 public unreleasedSupply;
     uint256 public reserveCash;
@@ -187,12 +189,14 @@ contract SzrCore is ReentrancyGuard {
     }
 
     /// @notice Ends migration permanently; unused reserved tokens join the scheduled public sale.
+    /// @dev Closing starts the sale, the release clock and the fee auctions.
     function closeMigration() external nonReentrant live {
         if (msg.sender != initializer) revert NotInitializer();
         uint256 unused = migrationRemaining;
         if (unused == 0) revert MigrationNotOpen();
         _checkpointSale();
         migrationRemaining = 0;
+        _openAuctions();
         emit MigrationClosed(unused);
     }
 
@@ -214,34 +218,40 @@ contract SzrCore is ReentrancyGuard {
         unreleasedSupply -= amount;
         SafeTransferLib.safeTransfer(address(token), owner, amount);
         emit MigrationReleased(owner, amount, backing);
-        if (migrationRemaining == 0) emit MigrationClosed(0);
+        if (migrationRemaining == 0) {
+            _openAuctions();
+            emit MigrationClosed(0);
+        }
     }
 
-    /// @notice Starts migration and the sale clock without activating a separate LP allocation.
+    /// @notice Starts migration without activating a separate LP allocation.
+    /// @dev The sale clock starts only when migration ends, or here if none was configured.
     function launch() external nonReentrant {
         if (msg.sender != initializer) revert NotInitializer();
         if (!initialized) revert NotInitialized();
         if (launched) revert AlreadyLaunched();
         launched = true;
         startedAt = block.timestamp;
-        releaseBucket.updatedAt = auctionsOpenAt();
-        saleUpdatedAt = auctionsOpenAt();
+        if (migrationRemaining == 0) _openAuctions();
         ISzrLiquidity(liquidity).onLaunch();
         emit Launched(startedAt);
     }
 
-    function auctionsOpenAt() public view returns (uint256) {
-        if (!launched) return 0;
-        return startedAt + 1 days;
+    function _openAuctions() internal {
+        auctionsOpenAt = block.timestamp;
+        releaseBucket.updatedAt = block.timestamp;
+        saleUpdatedAt = block.timestamp;
     }
 
-    /// @notice Active claims include tokens held by the one-sided genesis position or any other pool.
+    /// @notice Active claims include tokens held by the one-sided genesis position or any
+    /// other pool.
     /// @dev Pool composition does not change active supply; only issuance and retirement do.
     function activeSupply() public view returns (uint256) {
         return token.totalSupply() - unreleasedSupply;
     }
 
-    /// @notice Core cash and collateral-backed loan principal. Pool reserves are trading depth, not backing.
+    /// @notice Core cash and collateral-backed loan principal. Pool reserves are trading
+    /// depth, not backing.
     /// @dev WETH in the one-sided genesis position is excluded because swaps can remove it.
     function backingAmount() public view returns (uint256) {
         return reserveCash + loanPrincipal;
@@ -273,15 +283,15 @@ contract SzrCore is ReentrancyGuard {
 
     function releaseCredit() public view returns (uint256) {
         return
-            ReleaseSchedule.projected(releaseBucket, auctionsOpenAt(), block.timestamp) / 1 days;
+            ReleaseSchedule.projected(releaseBucket, auctionsOpenAt, block.timestamp) / 1 days;
     }
 
     function releaseReadyAt() external view returns (uint256) {
-        return ReleaseSchedule.readyAt(releaseBucket, auctionsOpenAt());
+        return ReleaseSchedule.readyAt(releaseBucket, auctionsOpenAt);
     }
 
     function releaseDecayStartsAt() external view returns (uint256) {
-        return ReleaseSchedule.decayStartsAt(releaseBucket, auctionsOpenAt());
+        return ReleaseSchedule.decayStartsAt(releaseBucket, auctionsOpenAt);
     }
 
     function releaseState() external view returns (ReleaseSchedule.State memory) {
@@ -294,7 +304,8 @@ contract SzrCore is ReentrancyGuard {
         return credit < inventory ? credit : inventory;
     }
 
-    /// @notice Single continuous SZR/WETH sale. Reserve claims are funded before treasury WETH.
+    /// @notice Single continuous SZR/WETH sale, never priced below 1.5x NAV.
+    /// @dev Reserve claims are funded before treasury WETH.
     function buy(uint256 amount, uint256 maximumPayment, uint256 deadline)
         external
         nonReentrant
@@ -303,7 +314,7 @@ contract SzrCore is ReentrancyGuard {
     {
         if (block.timestamp > deadline) revert DeadlinePassed();
         if (amount == 0) revert ZeroAmount();
-        if (block.timestamp < auctionsOpenAt()) revert AuctionNotOpen();
+        if (auctionsOpenAt == 0) revert AuctionNotOpen();
         if (amount > availableRelease()) revert ReleaseLimit();
         _checkpointSale();
         ContinuousAuction.State memory curve = saleCurve;
@@ -311,7 +322,10 @@ contract SzrCore is ReentrancyGuard {
         payment = ContinuousAuction.buy(curve, amount);
         _checkSaleDepth(curve);
         uint256 backing = backingRequired(amount);
-        if (payment < backing) payment = backing;
+        payment = FixedPointMathLib.max(payment, _saleMinimum(backing));
+        // Two thirds of the premium funds liquidity; reserves keep the rest, raising NAV.
+        uint256 funding = (payment - backing) * 2 / 3;
+        backing = payment - funding;
         if (payment > maximumPayment) revert AboveMaximum();
         saleCurve = curve;
         releaseBucket.scaledCredit -= amount * 1 days;
@@ -319,7 +333,6 @@ contract SzrCore is ReentrancyGuard {
         _receiveBacking(msg.sender, payment);
         reserveCash += backing;
         unreleasedSupply -= amount;
-        uint256 funding = payment - backing;
         if (funding != 0) {
             SafeTransferLib.safeTransfer(backingAsset, liquidity, funding);
             ISzrLiquidity(liquidity).recordFunding(funding);
@@ -529,7 +542,7 @@ contract SzrCore is ReentrancyGuard {
     }
 
     function releaseRatePerDay() external view returns (uint256) {
-        uint256 opening = auctionsOpenAt();
+        uint256 opening = auctionsOpenAt;
         uint256 elapsed = block.timestamp > opening ? block.timestamp - opening : 0;
         if (opening == 0) return RELEASE_PER_DAY;
         return ReleaseSchedule.ratePerDay(elapsed);
@@ -547,14 +560,15 @@ contract SzrCore is ReentrancyGuard {
         payment = ContinuousAuction.buy(curve, amount);
         _checkSaleDepth(curve);
         backing = backingRequired(amount);
-        if (payment < backing) payment = backing;
-        funding = payment - backing;
+        payment = FixedPointMathLib.max(payment, _saleMinimum(backing));
+        funding = (payment - backing) * 2 / 3;
+        backing = payment - funding;
     }
 
     function price() external view returns (uint256 result) {
-        result = ContinuousAuction.price(_projectSale());
-        uint256 backing = backingRequired(WAD);
-        if (result < backing) result = backing;
+        result = FixedPointMathLib.max(
+            ContinuousAuction.price(_projectSale()), _saleMinimum(backingRequired(WAD))
+        );
     }
 
     function auctionState() external view returns (ContinuousAuction.State memory) {
@@ -563,7 +577,7 @@ contract SzrCore is ReentrancyGuard {
 
     function _projectSale() internal view returns (ContinuousAuction.State memory curve) {
         curve = saleCurve;
-        uint256 opening = auctionsOpenAt();
+        uint256 opening = auctionsOpenAt;
         uint256 available = availableRelease();
         uint256 start = saleUpdatedAt > opening ? saleUpdatedAt : opening;
         uint256 ready = ReleaseSchedule.decayStartsAt(releaseBucket, opening);
@@ -579,7 +593,7 @@ contract SzrCore is ReentrancyGuard {
 
     function _checkpointSale() internal {
         saleCurve = _projectSale();
-        releaseBucket.checkpoint(auctionsOpenAt());
+        releaseBucket.checkpoint(auctionsOpenAt);
         saleUpdatedAt = block.timestamp;
     }
 
@@ -590,9 +604,14 @@ contract SzrCore is ReentrancyGuard {
         ContinuousAuction.project(projected, 0, token.totalSupply() + saleBuffer);
     }
 
-    /// @dev A fill at the backing floor must still add constant-product demand pressure.
+    /// @dev No SZR is sold below one and a half times its NAV backing.
+    function _saleMinimum(uint256 backing) internal pure returns (uint256) {
+        return FixedPointMathLib.mulDivUp(backing, 3, 2);
+    }
+
+    /// @dev A fill at the sale floor must still add constant-product demand pressure.
     function _alignSaleFloor(ContinuousAuction.State memory curve) internal view {
-        uint256 floor = backingRequired(WAD);
+        uint256 floor = _saleMinimum(backingRequired(WAD));
         if (ContinuousAuction.price(curve) >= floor) return;
         curve.floorWad = floor;
         curve.excessTime = 0;

@@ -19,6 +19,7 @@ contract SzrAuctionTest is SzrWorld {
         uint256 team = core.economics().claimableFees();
         assertGt(funding, 0);
         assertEq(payment, required + funding);
+        assertEq(funding, (payment - core.backingRequired(quantity)) * 2 / 3);
         vm.startPrank(buyer);
         backing.approve(address(core), payment);
         core.buy(quantity, payment, block.timestamp);
@@ -28,24 +29,58 @@ contract SzrAuctionTest is SzrWorld {
         assertEq(core.unreleasedSupply(), inventory - quantity);
         assertEq(core.reserveCash(), cash + required);
         assertEq(locker.heldPrincipal(address(backing)), held + funding);
-        assertGe(core.NAV(), nav);
+        assertGt(core.NAV(), nav);
         assertEq(core.economics().claimableFees(), team);
         _assertCash();
     }
 
-    function testSaleNeverAcceptsLessThanExactNavBacking() public {
+    function testSaleNeverAcceptsLessThanOneAndAHalfTimesNav() public {
         vm.warp(block.timestamp + 2 days);
         uint256 amount = 1_000e18;
-        (uint256 payment, uint256 backingRequired, uint256 funding) = core.quote(amount);
-        assertGe(payment, backingRequired);
-        assertEq(funding, payment - backingRequired);
-        assertGt(funding, 0);
-        assertEq(backingRequired, core.backingRequired(amount));
+        (uint256 payment, uint256 reserves, uint256 funding) = core.quote(amount);
+        uint256 premium = payment - core.backingRequired(amount);
+        assertGe(payment * 2, core.backingRequired(amount) * 3);
+        assertEq(funding, premium * 2 / 3);
+        assertEq(reserves, payment - funding);
         uint256 nav = core.NAV();
         vm.prank(alice);
         core.buy(amount, payment, block.timestamp);
-        assertGe(core.NAV(), nav);
+        assertGt(core.NAV(), nav);
         _assertCash();
+    }
+
+    function testFullyDecayedSaleStillChargesTheMinimumOnOneWei() public {
+        vm.warp(block.timestamp + 365 days);
+        uint256 floor = (core.backingRequired(1e18) * 3 + 1) / 2;
+        assertEq(core.price(), floor);
+        uint256 required = core.backingRequired(1);
+        (uint256 payment,,) = core.quote(1);
+        assertEq(payment, (required * 3 + 1) / 2);
+        vm.prank(alice);
+        core.buy(1, payment, block.timestamp);
+        assertEq(core.auctionState().floorWad, floor);
+    }
+
+    /// The reserve third of the premium is shared with every holder, so a large holder
+    /// who buys and redeems everything must end with less WETH than by redeeming alone.
+    function testLargeHolderCannotProfitFromOwnPremium(uint96 rawAmount) public {
+        uint256 amount = bound(rawAmount, 1e18, core.availableRelease());
+        core.token().transfer(alice, core.token().balanceOf(address(this)));
+        uint256 held = core.token().balanceOf(alice);
+        assertGt(held * 4, core.activeSupply());
+        uint256 start = backing.balanceOf(alice);
+        uint256 snapshot = vm.snapshotState();
+        vm.prank(alice);
+        core.redeem(held, 0);
+        uint256 redeemOnly = backing.balanceOf(alice) - start;
+        vm.revertToState(snapshot);
+        (uint256 payment,, uint256 funding) = core.quote(amount);
+        assertGt(funding, 0);
+        vm.startPrank(alice);
+        core.buy(amount, payment, block.timestamp);
+        core.redeem(held + amount, 0);
+        vm.stopPrank();
+        assertLe(backing.balanceOf(alice) + funding, start + redeemOnly);
     }
 
     function testMaximumDeadlineAndSharedCreditAreEnforced() public {

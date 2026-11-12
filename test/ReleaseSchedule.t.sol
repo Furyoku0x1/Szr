@@ -25,9 +25,9 @@ contract ScheduleHarness {
 
 contract ReleaseScheduleTest is Test {
     function testRateHalvesSmoothlyAndStopsAtMinimum() public pure {
-        assertEq(ReleaseSchedule.ratePerDay(0), 500_000e18);
-        assertApproxEqAbs(ReleaseSchedule.ratePerDay(365 days), 250_000e18, 1e6);
-        assertApproxEqAbs(ReleaseSchedule.ratePerDay(730 days), 125_000e18, 1e6);
+        assertEq(ReleaseSchedule.ratePerDay(0), 1_000_000e18);
+        assertApproxEqAbs(ReleaseSchedule.ratePerDay(365 days), 500_000e18, 1e6);
+        assertApproxEqAbs(ReleaseSchedule.ratePerDay(730 days), 250_000e18, 1e6);
         uint256 beforeBoundary = ReleaseSchedule.ratePerDay(365 days - 1);
         uint256 afterBoundary = ReleaseSchedule.ratePerDay(365 days + 1);
         assertLt(beforeBoundary - afterBoundary, 5e16);
@@ -43,8 +43,8 @@ contract ReleaseScheduleTest is Test {
     }
 
     function testFirstYearMatchesIndependentIntegral() public pure {
-        // Python Decimal, precision 100: 500000 * 365 * (1 - 1/2) / ln(2).
-        uint256 expectedTokenWei = 131_645_922_481_117_910_921_593_127;
+        // Python Decimal, precision 100: 1000000 * 365 * (1 - 1/2) / ln(2).
+        uint256 expectedTokenWei = 263_291_844_962_235_821_843_186_254;
         uint256 actual = ReleaseSchedule.cumulativeScaled(365 days) / 1 days;
         assertApproxEqAbs(actual, expectedTokenWei, 1e9);
     }

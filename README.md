@@ -1,8 +1,9 @@
 # Sazare / SZR
 
 A fixed-supply, WETH-backed token with one continuous sale auction and native Uniswap v4 liquidity
-management. Auction proceeds fund backing first. Remaining WETH buys productive pool assets held
-permanently under protocol custody. There are no adapters, factories, per-pool rewards, or weights.
+management. Auction proceeds fund backing first. Two thirds of any premium buys productive pool
+assets held permanently under protocol custody; one third stays in reserves and raises NAV. There
+are no adapters, factories, per-pool rewards, or weights.
 
 ## Contracts
 
@@ -26,14 +27,16 @@ foreign fee asset separately; those auctions do not allocate or distribute SZR.
 2. The buyer supplies **WETH only**, approving Core. There is no requirement to bring pool SZR,
    partner tokens, or a liquidity position.
 3. Core receives the payment and retains the exact, rounded-up current NAV backing for the sold SZR.
-4. The remaining WETH goes to `Liquidity`, where it is recorded as held acquisition principal.
+4. The remaining premium is split: two thirds go to `Liquidity`, where they are recorded as held
+   acquisition principal, and one third stays in Core reserves, raising NAV for every holder.
 5. Core releases the purchased SZR to the buyer.
 
 Prices react to purchases through the continuous constant-product curve and decay over two days
-of eligible sale time. The price is bounded below by current token backing. When backing overtakes
-virtual pricing, fills start from that backing floor so demand still raises the curve. The integrated
-purchase premium can fund liquidity even when the starting marginal price has reached backing.
-Quotes include total payment, reserve backing, and treasury funding separately.
+of eligible sale time. The price is bounded below by one and a half times current token backing, so
+every sale carries a premium of at least half its NAV value. When that floor overtakes virtual
+pricing, fills start from the floor so demand still raises the curve.
+Quotes include total payment, the reserve share (NAV backing plus a third of the premium), and
+treasury funding separately; the last two always sum to the payment.
 
 Sale funding is not LP revenue: it does not pay the team. The former per-program allocation and
 buyer-funded LP reward mechanism, including its separate 5% backing premium, has been removed.
@@ -43,16 +46,17 @@ buyer-funded LP reward mechanism, including its separate 5% backing premium, has
 The reference is [Heesho's Rig.sol](https://github.com/Heesho/miner-launchpad-hardhat/blob/main/contracts/Rig.sol),
 which uses configurable stepwise halvings and a minimum emission rate. SZR uses this continuous rate:
 
-`rate(t) = max(500,000 * 2^(-t / 365 days), 100,000) SZR/day`
+`rate(t) = max(1,000,000 * 2^(-t / 365 days), 100,000) SZR/day`
 
-- Starts **24 hours after launch**, with zero accumulated allowance.
-- Initial allowance rate: **500,000 SZR/day**.
+- Starts **the moment migration closes**, with zero accumulated allowance. Until then the sale
+  and the fee auctions are closed; redemption stays open.
+- Initial allowance rate: **1,000,000 SZR/day**.
 - Continuous half-life: **365 days**; there is no sudden halving boundary.
-- Minimum rate: **100,000 SZR/day**, reached after approximately 2.32 years.
+- Minimum rate: **100,000 SZR/day**, reached after approximately 3.32 years.
 - **All scheduled, unsold allowance accumulates**, with no carry cap.
 - Actual sales are additionally limited by unreleased public inventory.
 
-The first year's integrated allowance is about **131.65M SZR**. Every unsold scheduled token remains
+The first year's integrated allowance is about **263.29M SZR**. Every unsold scheduled token remains
 available, limited by actual unreleased inventory. The schedule permits sales; it does not guarantee
 that purchases occur.
 The rate continues aging while inventory is empty, but sale-price decay freezes until tokens return.
@@ -69,9 +73,9 @@ These numerical values are approved **testing defaults**, not final launch calib
 ## Legacy SZR migration
 
 The migration cap is **350M SZR**, and every redeemable holder receives **1 new SZR per old SZR**.
-A separate liquidity plan targets **100M of those already-migrated tokens**, contributed explicitly
-by an existing holder. If that holder migrates and contributes 100M, the other 250M can migrate to
-other holders. Normal migration does not deduct a liquidity percentage. The 100M funding target is
+A separate liquidity plan targets **25M of those already-migrated tokens**, contributed explicitly
+by an existing holder. If that holder migrates and contributes 25M, the other 325M can migrate to
+other holders. Normal migration does not deduct a liquidity percentage. The 25M funding target is
 not a second reservation or release from Core; the remaining **650M SZR** starts as inactive public
 auction inventory.
 
@@ -186,7 +190,7 @@ returned SZR are excluded. Loan opening fees and backing donations go entirely t
 ## Supply, backing and loans
 
 Total supply is **1,000,000,000 SZR**, with no team token allocation, token vesting, or privileged
-team token claim. Up to **350M SZR** migrates 1:1, including the existing holder's planned **100M**
+team token claim. Up to **350M SZR** migrates 1:1, including the existing holder's planned **25M**
 liquidity contribution. That contribution comes from the holder's delivered tokens, not an extra
 Core allocation. There is no genesis release. The remaining **650M SZR** and recycled inventory fund
 public sales, subject to the release schedule and backing requirement. The team's compensation
@@ -237,11 +241,14 @@ enforces production runtime/initcode limits, short functions, one check per line
 Copy `.env.example` to `.env` and set the required chain ID, WETH, PoolManager and beneficiary.
 `LEGACY_SZR` defaults to the approved Robinhood legacy token; `MIGRATION_ALLOCATION` defaults to
 `350000000000000000000000000` (the full 1:1 migration cap in wei).
-`INITIAL_LIQUIDITY_ALLOCATION` defaults to `100000000000000000000000000`; it is only the funding
+`INITIAL_LIQUIDITY_ALLOCATION` defaults to `25000000000000000000000000`; it is only the funding
 target exposed as `initialLiquidityTarget()`. It neither increases nor reduces `migrationAllocation()`.
-The script registers full-range and empty one-sided positions, then launches without moving tokens.
-The contributing holder separately migrates their old tokens, approves Liquidity for the 100M target,
-and calls `fundInitialLiquidity(minimumUnits, deadline)` to fund POL from their delivered balance.
+The script registers full-range and empty one-sided positions and launches. By default
+(`FUND_INITIAL_LIQUIDITY=true`) the deploying address then migrates its own 25M legacy SZR and
+calls `fundInitialLiquidity`, so the genesis tokens are the only active supply when migration opens
+to other holders. That address must hold the legacy tokens, and `INITIAL_LIQUIDITY_MIN_BACKING`
+(the least WETH that sale may recover) is required. With `FUND_INITIAL_LIQUIDITY=false` the
+contributing holder migrates, approves Liquidity and funds separately.
 For a deliberately allocation-free local rehearsal, explicitly set `MIGRATION_ALLOCATION=0`.
 For holder-migration-only tests, set `INITIAL_LIQUIDITY_ALLOCATION=0`. WETH
 must be an ordinary 18-decimal ERC-20. The script checks chain ID and deployed asset/PoolManager code,
@@ -257,6 +264,21 @@ forge script script/DeploySzr.s.sol:DeploySzr --rpc-url "$RPC_URL" --account YOU
 
 Review the rehearsal and its inputs before intentionally adding `--broadcast`. Repository changes
 do not deploy contracts. `AUCTION_OPENING_WAD` and `AUCTION_FLOOR_WAD` are WETH per SZR scaled by 1e18.
+
+### Launch checklist
+
+These are accepted operating rules, not enforced in code.
+
+- Rehearse the full script on a fork against the real legacy hook before any broadcast.
+- Deploy from an address that has not been published; it must hold the 25M legacy SZR. It becomes
+  the permanent `initializer` (the only caller of `closeMigration`) and the interim manager.
+- Set `INITIAL_MARKET_PRICE` above the legacy hook's floor price, so the genesis range never
+  starts below NAV. Set `INITIAL_LIQUIDITY_MIN_BACKING` from the expected recovery.
+- If `FUND_INITIAL_LIQUIDITY=false`, check the pool price before funding; if it was moved into the
+  genesis range, send the restoring swap and `fundInitialLiquidity` back to back.
+- Closing migration opens the sale, the release schedule and the fee auctions. Nothing else does.
+- Partner tokens: no rebasing, unbounded-mint, fee-on-transfer or transfer-restricted tokens, and
+  always register them with the fee-auction floor at its minimum (`1`).
 
 ## Refactor complexity report
 

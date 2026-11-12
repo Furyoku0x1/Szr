@@ -32,7 +32,7 @@ contract DeploySzrTest is Test {
         assertEq(core.economics().beneficiary(), address(this));
         assertTrue(core.launched());
         assertTrue(locker.started());
-        assertEq(core.auctionsOpenAt(), core.startedAt() + 1 days);
+        assertEq(core.auctionsOpenAt(), core.startedAt()); // no migration configured
         assertEq(core.availableRelease(), 0);
         assertEq(core.activeSupply(), 0);
         assertEq(core.reserveCash(), 0);
@@ -45,7 +45,7 @@ contract DeploySzrTest is Test {
         assertEq(locker.heldPrincipal(address(core.token())), 0);
         assertEq(locker.position(0).partner, address(weth));
         assertEq(locker.poolCount(), 1);
-        assertEq(core.releaseRatePerDay(), 500_000e18);
+        assertEq(core.releaseRatePerDay(), 1_000_000e18);
         vm.prank(core.initializer());
         vm.expectRevert(SzrCore.AlreadyLaunched.selector);
         core.launch();

@@ -102,9 +102,10 @@ contract SzrMigrationTest is Test {
     }
 
     function testMigrationIsReservedAndDoesNotConsumeOrCreateSaleAllowance() public {
-        vm.warp(core.auctionsOpenAt() + 3 days);
+        vm.warp(block.timestamp + 3 days);
         uint256 available = core.availableRelease();
         uint256 credit = core.releaseCredit();
+        assertEq(credit, 0);
         uint256 publicInventory = core.publicInventory();
         uint256 price = core.price();
         vm.prank(alice);
@@ -337,31 +338,32 @@ contract SzrMigrationTest is Test {
         assertEq(deployed.releaseCredit(), 0);
     }
 
-    function testPublicAuctionCannotConsumeReservedMigrationTokens() public {
-        vm.warp(core.auctionsOpenAt() + 20 * 365 days);
-        uint256 inventory = core.publicInventory();
-        assertEq(core.availableRelease(), inventory);
-        vm.expectRevert(SzrCore.ReleaseLimit.selector);
-        core.quote(inventory + 1);
-        // Drain through bounded fills and normal decay, preserving the curve's numeric guard.
-        while (core.publicInventory() != 0) {
-            uint256 amount = core.publicInventory();
-            if (amount > 1_000_000e18) amount /= 2;
-            (uint256 payment,,) = core.quote(amount);
-            backing.mint(address(this), payment);
-            core.buy(amount, payment, block.timestamp);
-            vm.warp(block.timestamp + 2 days);
-        }
-        assertEq(core.publicInventory(), 0);
-        assertEq(core.unreleasedSupply(), ALLOCATION);
-        assertEq(core.migrationRemaining(), ALLOCATION);
-        uint256 credit = core.releaseCredit();
+    function testAuctionStaysClosedUntilMigrationEnds() public {
         vm.prank(alice);
-        migrator.migrate(1_000e18, 0, block.timestamp);
-        assertEq(core.publicInventory(), 0);
-        assertEq(core.releaseCredit(), credit);
-        assertEq(core.migrationRemaining(), ALLOCATION - 1_000e18);
-        assertEq(core.token().balanceOf(alice), 1_000e18);
+        migrator.migrate(10_000e18, 0, block.timestamp);
+        vm.warp(block.timestamp + 365 days);
+        assertEq(core.auctionsOpenAt(), 0);
+        assertEq(core.releaseCredit(), 0);
+        backing.mint(address(this), 1e18);
+        vm.expectRevert(SzrCore.AuctionNotOpen.selector);
+        core.buy(1e18, type(uint256).max, block.timestamp);
+        // Exits keep working while the sale is closed.
+        vm.startPrank(alice);
+        core.token().approve(address(core), type(uint256).max);
+        core.redeem(1_000e18, 0);
+        core.donateSzr(1_000e18);
+        vm.stopPrank();
+        uint256 price = core.price();
+        core.closeMigration();
+        assertEq(core.auctionsOpenAt(), block.timestamp);
+        assertEq(core.releaseCredit(), 0); // the idle year created no allowance
+        assertEq(core.price(), price);
+        vm.warp(block.timestamp + 1 days);
+        assertApproxEqRel(core.releaseCredit(), 1_000_000e18, 1e16); // one day at the opening rate
+        (uint256 payment,,) = core.quote(1_000e18);
+        backing.mint(address(this), payment);
+        core.buy(1_000e18, payment, block.timestamp);
+        assertEq(core.totalReleased(), 1_000e18);
     }
 
     function testConfigCannotBeReplacedOrReserveMoreThanSupply() public {
@@ -471,7 +473,7 @@ contract SzrMigrationTest is Test {
     {
         vm.prank(alice);
         migrator.migrate(10_000e18, 0, block.timestamp);
-        vm.warp(core.auctionsOpenAt() + 3 days);
+        vm.warp(block.timestamp + 3 days);
         uint256 inventory = core.publicInventory();
         uint256 unused = core.migrationRemaining();
         uint256 credit = core.releaseCredit();
@@ -479,6 +481,7 @@ contract SzrMigrationTest is Test {
         uint256 supply = core.activeSupply();
         uint256 initializerTokens = core.token().balanceOf(address(this));
         core.closeMigration();
+        assertEq(core.auctionsOpenAt(), block.timestamp);
         assertEq(core.migrationRemaining(), 0);
         assertEq(core.publicInventory(), inventory + unused);
         assertEq(core.releaseCredit(), credit);
