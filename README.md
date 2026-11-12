@@ -143,9 +143,26 @@ entry point. Unsolicited transfers do not earn migration credit; use `migrate`.
 
 Tests exercise the real local v4 PoolManager with an ABI-compatible legacy custom-accounting hook,
 including exact input settlement, partial exchanges, full allocation, quote fees, callback attacks,
-rollback, dust, loan interactions, and auction-inventory isolation. **A live Robinhood fork rehearsal
-against the actual legacy hook remains required before deployment**: public explorer/RPC access was
-blocked during implementation, so the local tests do not establish live-state compatibility.
+rollback, dust, loan interactions, and auction-inventory isolation.
+
+`test/fork/SzrFork.t.sol` rehearses the launch against the live legacy hook on Robinhood Chain
+(chain ID 4663). It runs the deploy script with the real WETH and PoolManager, migrates through
+the real hook, redeems, trades the genesis pool, closes migration and buys from the auction. It
+is skipped unless `FORK_RPC_URL` is set:
+
+```sh
+FORK_RPC_URL=https://rpc.mainnet.chain.robinhood.com FORK_BLOCK=112788329 \
+  forge test --match-path "test/fork/*" -vv
+```
+
+It impersonates real holders of the old token as they stood at that block. Without `FORK_BLOCK`
+it uses the latest block and stops on its own guard if those holders have since moved their tokens;
+update the addresses in the test when that happens.
+
+At block 112788329 the hook paid one flat price, about 0.000000532 WETH per old SZR with no sell
+fee, at every size. It accepts only tokens outside its own inventory: about 246.06M of the 330.35M
+supply, worth about 131 WETH in total. **Re-run the rehearsal immediately before deployment**; it
+simulates on a fork and does not replace checking the deployer's own balances and settings.
 
 ## Native v4 liquidity management
 
