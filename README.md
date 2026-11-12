@@ -182,7 +182,8 @@ are unsupported; v4 hook data is empty. Native ETH pools are unsupported; WETH i
 1. **SZR trading fees:** returned to Core's unreleased public sale inventory.
 2. **WETH trading fees:** **33% team / 67% reserves**, with integer rounding dust kept in reserves.
 3. **Other trading fees:** auctioned for WETH, then allocated using the same 67/33 split.
-4. Anyone can call `SzrEconomics.claimFees()` to pay the immutable team beneficiary.
+4. Anyone can call `SzrEconomics.claimFees()` to pay the immutable team beneficiary. It pays the
+   contract's whole WETH balance, so WETH sent there by mistake goes to the beneficiary too.
 
 Only realized liquidity revenue is split. Principal, primary-sale funding, loan repayments, and
 returned SZR are excluded. Loan opening fees and backing donations go entirely to reserves.

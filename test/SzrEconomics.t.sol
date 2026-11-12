@@ -2,6 +2,7 @@
 pragma solidity 0.8.30;
 
 import { SzrWorld } from "./utils/SzrWorld.sol";
+import { SzrEconomics } from "../src/SzrEconomics.sol";
 
 contract SzrEconomicsTest is SzrWorld {
     function testFixedBillionSupplyHasNoReservedTeamInventory() public view {
@@ -37,6 +38,31 @@ contract SzrEconomicsTest is SzrWorld {
         assertEq(core.economics().claimableFees(), 0);
         assertEq(core.reserveCash(), reserves);
         assertEq(core.NAV(), nav);
+        _assertCash();
+    }
+
+    function testWethSentByMistakeIsPaidToTheBeneficiaryWithTheNextClaim() public {
+        SzrEconomics economics = core.economics();
+        backing.mint(address(economics), 5e18); // a direct transfer, never recorded as fees
+        assertEq(economics.claimableFees(), 0);
+        uint256 reserves = core.reserveCash();
+        uint256 teamCash = backing.balanceOf(address(this));
+        vm.prank(alice);
+        assertEq(economics.claimFees(), 5e18);
+        assertEq(backing.balanceOf(address(this)) - teamCash, 5e18);
+
+        backing.mint(address(economics), 1e18);
+        backing.mint(address(jar), 100e18);
+        vm.prank(address(locker));
+        jar.recordFees(address(backing), 100e18);
+        assertEq(economics.claimableFees(), 33e18);
+        economics.claimFees();
+        assertEq(backing.balanceOf(address(this)) - teamCash, 39e18);
+        assertEq(economics.claimableFees(), 0);
+        assertEq(backing.balanceOf(address(economics)), 0);
+        assertEq(core.reserveCash(), reserves + 67e18);
+        vm.expectRevert(SzrEconomics.ZeroAmount.selector);
+        economics.claimFees();
         _assertCash();
     }
 

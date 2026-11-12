@@ -52,8 +52,9 @@ contract SzrEconomics is ReentrancyGuard {
     }
 
     /// @notice Anyone may deliver earned fees, but the immutable recipient cannot be changed.
+    /// @dev Pays the whole WETH balance, so WETH sent here by mistake also reaches the beneficiary.
     function claimFees() external nonReentrant returns (uint256 amount) {
-        amount = claimableFees;
+        amount = SafeTransferLib.balanceOf(backingAsset, address(this));
         if (amount == 0) revert ZeroAmount();
         claimableFees = 0;
         uint256 beforeBalance = SafeTransferLib.balanceOf(backingAsset, beneficiary);
