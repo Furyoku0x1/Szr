@@ -30,6 +30,7 @@ contract SzrForkTest is Test {
         0x77445B7a3592DBdcc8b0B03D51547C24923e2fb2
     ];
     address internal constant HOLDER = 0xf6be30ef5504aFd02E93dBAbe6E082177db5f644;
+    address internal constant TEAM = address(0x7EA);
 
     ILegacySzrHook internal hook;
     IERC20 internal weth;
@@ -56,6 +57,7 @@ contract SzrForkTest is Test {
         config.asset = address(weth);
         config.poolManager = address(hook.poolManager());
         config.teamBeneficiary = address(0xBEEF);
+        config.manager = TEAM;
         config.legacyToken = LEGACY;
         config.marketPrice = 4e12;
         config.bootstrapNAV = 1e12;
@@ -86,6 +88,10 @@ contract SzrForkTest is Test {
         config.initialLiquidityMinimumBacking = hook.quoteSellExactIn(INITIAL).netWethOut;
         (core,, locker) = deployment.run(config);
         migrator = SzrMigration(core.migration());
+        // The team address takes over; from here the deployer has no authority.
+        assertEq(locker.pendingManager(), TEAM);
+        vm.prank(TEAM);
+        locker.acceptManager();
     }
 
     function testLegacyHookPaysOneFlatPriceUpToCirculatingSupply() public {
@@ -182,6 +188,9 @@ contract SzrForkTest is Test {
     /// Closing migration opens the sale; a buyer pays at least 1.5x NAV in real WETH.
     function _openAndBuyFromAuction(IERC20 szr) internal {
         vm.prank(deployer);
+        vm.expectRevert(SzrCore.NotManager.selector);
+        core.closeMigration();
+        vm.prank(TEAM);
         core.closeMigration();
         assertEq(core.auctionsOpenAt(), block.timestamp);
         vm.warp(block.timestamp + 3 days);

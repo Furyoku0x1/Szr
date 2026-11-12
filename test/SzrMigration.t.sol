@@ -539,12 +539,23 @@ contract SzrMigrationTest is Test {
         migrator.migrate(1e18, 0, block.timestamp);
     }
 
-    function testOnlyInitializerCanCloseMigrationAndItCannotReopen() public {
+    function testOnlyTheLiquidityManagerCanCloseMigrationAndItCannotReopen() public {
         vm.prank(alice);
-        vm.expectRevert(SzrCore.NotInitializer.selector);
+        vm.expectRevert(SzrCore.NotManager.selector);
+        core.closeMigration();
+        // Once the manager role moves on, the deployer can no longer close migration.
+        locker.nominateManager(bob);
+        vm.prank(bob);
+        locker.acceptManager();
+        assertEq(core.initializer(), address(this));
+        vm.expectRevert(SzrCore.NotManager.selector);
         core.closeMigration();
         assertEq(core.migrationRemaining(), ALLOCATION);
+        assertEq(core.auctionsOpenAt(), 0);
+        vm.prank(bob);
         core.closeMigration();
+        assertEq(core.auctionsOpenAt(), block.timestamp);
+        vm.prank(bob);
         vm.expectRevert(SzrCore.MigrationNotOpen.selector);
         core.closeMigration();
         vm.expectRevert(SzrCore.AlreadyLaunched.selector);

@@ -104,6 +104,14 @@ contract InitialLiquidityTest is Test {
         assertEq(next.reserveCash(), INITIAL * 297e10 / 1e18); // pool trades never touch reserves
     }
 
+    function testDeployScriptRejectsTheDeployerAsManager() public {
+        DeploySzr.Config memory config = _deployConfig();
+        config.manager = core.initializer();
+        DeploySzr deployment = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr"));
+        vm.expectRevert(DeploySzr.ManagerIsDeployer.selector);
+        deployment.run(config);
+    }
+
     function testDeployScriptMigratesAndFundsGenesisFromTheDeployer() public {
         address deployer = core.initializer(); // the fixture's run used the same broadcaster
         oldToken.mint(deployer, INITIAL);

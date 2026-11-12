@@ -36,6 +36,7 @@ contract DeploySzr is Script {
     error MissingAsset();
     error MissingPoolManager();
     error InvalidMarketPrice();
+    error ManagerIsDeployer();
 
     function run() external returns (SzrCore core, FeeCollector jar, Liquidity locker) {
         return run(_readConfig());
@@ -63,8 +64,10 @@ contract DeploySzr is Script {
         _setupPools(core, locker, config.marketPrice);
         core.launch();
         if (config.fundInitialLiquidity) _fundInitialLiquidity(core, locker, config);
+        // The deployer only sets up; a separate manager takes over once it accepts.
         if (config.manager != address(0)) {
-            if (config.manager != setupManager) locker.nominateManager(config.manager);
+            if (config.manager == setupManager) revert ManagerIsDeployer();
+            locker.nominateManager(config.manager);
         }
         vm.stopBroadcast();
         console2.log("ECONOMICS", address(core.economics()));
@@ -80,7 +83,7 @@ contract DeploySzr is Script {
         config.asset = vm.envAddress("WETH");
         config.poolManager = vm.envAddress("POOL_MANAGER");
         config.teamBeneficiary = vm.envAddress("TEAM_BENEFICIARY");
-        config.manager = vm.envOr("MANAGER", address(0));
+        config.manager = vm.envAddress("MANAGER");
         config.legacyToken =
             vm.envOr("LEGACY_SZR", address(0xbeD7c1660a01dbEEe225bd893ac31727a91A5773));
         config.marketPrice = vm.envOr("INITIAL_MARKET_PRICE", uint256(4e12));

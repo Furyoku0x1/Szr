@@ -18,6 +18,7 @@ contract DeploySzrTest is Test {
         vm.setEnv("WETH", vm.toString(address(weth)));
         vm.setEnv("POOL_MANAGER", vm.toString(poolManager));
         vm.setEnv("TEAM_BENEFICIARY", vm.toString(address(this)));
+        vm.setEnv("MANAGER", vm.toString(address(0x7EA)));
         vm.setEnv("BOOTSTRAP_NAV", "1000000000000");
         vm.setEnv("INITIAL_MARKET_PRICE", "4000000000000");
         DeploySzr deployment = new DeploySzr();
@@ -29,6 +30,7 @@ contract DeploySzrTest is Test {
         assertEq(address(locker.core()), address(core));
         assertEq(address(locker.poolManager()), poolManager);
         assertEq(locker.manager(), core.initializer());
+        assertEq(locker.pendingManager(), address(0x7EA)); // the team address still has to accept
         assertEq(core.economics().beneficiary(), address(this));
         assertTrue(core.launched());
         assertTrue(locker.started());

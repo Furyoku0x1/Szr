@@ -94,7 +94,7 @@ spend Core inventory or take tokens from another wallet. Funding changes neither
 NAV and does not consume sale allowance. There is no automatic initial-token issuance.
 
 Borrowing is disabled during migration. It becomes available when the migration cap is exhausted,
-or when the deployment initializer permanently closes migration with `SzrCore.closeMigration()`.
+or when the Liquidity manager permanently closes migration with `SzrCore.closeMigration()`.
 Closure returns every unused migration reservation to scheduled public inventory without changing
 active supply or creating release credit. Tokens already contributed to liquidity are not counted
 again. Already-active holder tokens may fund liquidity after closure without diluting open loans.
@@ -286,7 +286,8 @@ For a deliberately allocation-free local rehearsal, explicitly set `MIGRATION_AL
 For holder-migration-only tests, set `INITIAL_LIQUIDITY_ALLOCATION=0`. WETH
 must be an ordinary 18-decimal ERC-20. The script checks chain ID and deployed asset/PoolManager code,
 binds all modules, registers the full-range and initial one-sided v4 positions, and launches once. The signer
-is initially manager; any nominated successor must explicitly accept.
+is manager only for setup: `MANAGER` is required, must be a different address, and takes over
+when it calls `acceptManager()`. After that the deployer has no authority anywhere.
 
 ```sh
 set -a
@@ -304,7 +305,10 @@ These are accepted operating rules, not enforced in code.
 
 - Rehearse the full script on a fork against the real legacy hook before any broadcast.
 - Deploy from an address that has not been published; it must hold the 25M legacy SZR. It becomes
-  the permanent `initializer` (the only caller of `closeMigration`) and the interim manager.
+  the interim manager only until the `MANAGER` address accepts.
+- Have the `MANAGER` address (a multisig) call `Liquidity.acceptManager()` straight after deploy.
+  From then on only it can close migration, manage pools and send held WETH; there is no time
+  limit on when it closes migration.
 - Set `INITIAL_MARKET_PRICE` above the legacy hook's floor price, so the genesis range never
   starts below NAV. Set `INITIAL_LIQUIDITY_MIN_BACKING` from the expected recovery.
 - If `FUND_INITIAL_LIQUIDITY=false`, check the pool price before funding; if it was moved into the

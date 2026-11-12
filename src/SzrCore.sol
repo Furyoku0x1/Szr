@@ -68,6 +68,7 @@ contract SzrCore is ReentrancyGuard {
     error ZeroAddress();
     error ZeroAmount();
     error NotInitializer();
+    error NotManager();
     error AlreadyInitialized();
     error NotInitialized();
     error NotLaunched();
@@ -189,9 +190,10 @@ contract SzrCore is ReentrancyGuard {
     }
 
     /// @notice Ends migration permanently; unused reserved tokens join the scheduled public sale.
-    /// @dev Closing starts the sale, the release clock and the fee auctions.
+    /// @dev Closing starts the sale, the release clock and the fee auctions. Only the current
+    /// Liquidity manager may close; the deployer keeps no authority once that role moves on.
     function closeMigration() external nonReentrant live {
-        if (msg.sender != initializer) revert NotInitializer();
+        if (msg.sender != ISzrLiquidity(liquidity).manager()) revert NotManager();
         uint256 unused = migrationRemaining;
         if (unused == 0) revert MigrationNotOpen();
         _checkpointSale();
