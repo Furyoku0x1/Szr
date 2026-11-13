@@ -9,6 +9,7 @@ import { IHooks } from "v4-core/interfaces/IHooks.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { MockHooks } from "v4-core/test/MockHooks.sol";
 import { PoolModifyLiquidityTest } from "v4-core/test/PoolModifyLiquidityTest.sol";
+import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { Hooks } from "v4-core/libraries/Hooks.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
@@ -364,6 +365,49 @@ contract MetaLiquidityTest is SzrWorld {
         locker.registerRoute(route);
     }
 
+    /// An empty pool's price can be moved by anyone for free. The manager can now move it back
+    /// and make the first deposit in one batch; a swap that spends nothing used to revert.
+    function testManagerRestoresAnEmptyPoolsPriceAndDepositsInOneBatch() public {
+        uint256 id = _newPool(500, IHooks(address(0)));
+        PoolKey memory pool = locker.key(id);
+        uint256 units = locker.liquidityHeld(0);
+        locker.withdrawPrincipal(0, units / 2, 0, 0, block.timestamp);
+        // A griefer with no tokens moves the empty pool far from its 1:1 price.
+        PoolSwapTest.TestSettings memory settings;
+        vm.prank(address(0x6121));
+        swapper.swap(
+            pool,
+            IPoolManager.SwapParams(true, -1e18, TickMath.getSqrtPriceAtTick(-6_000)),
+            settings,
+            ""
+        );
+        Liquidity.Bounds memory tight = Liquidity.Bounds(
+            locker.heldPrincipal(address(core.token())),
+            locker.heldPrincipal(address(backing)),
+            block.timestamp
+        );
+        uint256 deposit = units / 8;
+        // At the moved price the same deposit would go in badly lopsided.
+        (uint256 szrNeeded, uint256 wethNeeded) = locker.quotePosition(id, deposit);
+        uint256 gap = szrNeeded > wethNeeded ? szrNeeded - wethNeeded : wethNeeded - szrNeeded;
+        assertGt(gap, deposit / 4);
+        // A swap that spent nothing used to revert, so the price could not be restored.
+
+        uint256 heldWeth = locker.heldPrincipal(address(backing));
+        uint256 heldSzr = locker.heldPrincipal(address(core.token()));
+        bytes[] memory calls = new bytes[](2);
+        calls[0] = abi.encodeCall(
+            locker.swapPrincipal, (pool, false, 1, 0, uint160(1 << 96), block.timestamp)
+        );
+        calls[1] = abi.encodeCall(locker.deployPrincipal, (id, deposit, tight));
+        locker.multicall(calls);
+        assertEq(locker.liquidityHeld(id), deposit);
+        // The restoring swap spent nothing: both sides went into the position 1:1.
+        assertApproxEqAbs(heldWeth - locker.heldPrincipal(address(backing)), deposit, 2);
+        assertApproxEqAbs(heldSzr - locker.heldPrincipal(address(core.token())), deposit, 2);
+        _assertCash();
+    }
+
     /// Principal may only trade through a pool on the contract's list, and a pool the manager
     /// adds can take principal straight away.
     function testSwapsNeedARegisteredPoolAndNewPoolsAreUsableAtOnce() public {
@@ -450,5 +494,58 @@ contract MetaLiquidityTest is SzrWorld {
         assertEq(locker.liquidityHeld(id), removed / 2);
         assertEq(core.NAV(), nav);
         _assertCash();
+    }
+
+    /// Real pool fees, not simulated receipts: after the manager updates a partner token's
+    /// fee auction, collecting and withdrawing still record fees and the stock still sells.
+    function testUpdatingAFeeAuctionLeavesCollectionWithdrawalAndSalesWorking() public {
+        (TestAsset usd, uint256 id, PoolKey memory route) = _usdPools();
+        locker.moveLiquidityWithSwap(
+            _usdMove(id, locker.liquidityHeld(0)), _wethToUsd(route, type(uint256).max, 1)
+        );
+        _usdTrade(usd, id);
+        locker.collect(id);
+        uint256 stock = jar.auction(address(usd)).inventory;
+        assertGt(stock, 0);
+
+        jar.updateAsset(address(usd), FeeCollector.AssetConfig(1e18, stock * 2, 9e17));
+        assertEq(jar.auction(address(usd)).inventory, stock);
+        _usdTrade(usd, id);
+        locker.withdrawPrincipal(id, locker.liquidityHeld(id) / 2, 0, 0, block.timestamp);
+        uint256 grown = jar.auction(address(usd)).inventory;
+        assertGt(grown, stock);
+        _usdTrade(usd, id);
+        locker.collect(id);
+        grown = jar.auction(address(usd)).inventory;
+
+        uint256 cost = jar.quote(address(usd), grown);
+        assertGe(cost, grown * 9 / 10); // never below the floor of 0.9 WETH per token
+        uint256 reserves = core.reserveCash();
+        vm.prank(alice);
+        jar.take(address(usd), grown, cost, block.timestamp);
+        assertEq(usd.balanceOf(alice), grown);
+        assertGt(core.reserveCash(), reserves);
+        _assertCash();
+    }
+
+    function _usdTrade(TestAsset usd, uint256 id) internal {
+        PoolKey memory pool = locker.key(id);
+        bool zeroForOne = Currency.unwrap(pool.currency0) == address(usd);
+        address trader = address(0x7AD3);
+        usd.mint(trader, 1e15);
+        PoolSwapTest.TestSettings memory settings;
+        vm.startPrank(trader);
+        usd.approve(address(swapper), type(uint256).max);
+        swapper.swap(
+            pool,
+            IPoolManager.SwapParams(
+                zeroForOne,
+                -1e15,
+                zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            ),
+            settings,
+            ""
+        );
+        vm.stopPrank();
     }
 }

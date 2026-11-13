@@ -22,6 +22,11 @@ contract DeploySzrTest is Test {
         vm.setEnv("BOOTSTRAP_NAV", "1000000000000");
         vm.setEnv("INITIAL_MARKET_PRICE", "4000000000000");
         DeploySzr deployment = new DeploySzr();
+        // A zero manager, which is what a blank .env gives, must stop the script.
+        vm.setEnv("MANAGER", vm.toString(address(0)));
+        vm.expectRevert(DeploySzr.MissingManager.selector);
+        deployment.run();
+        vm.setEnv("MANAGER", vm.toString(address(0x7EA)));
         (SzrCore core, FeeCollector jar, Liquidity locker) = deployment.run();
         assertEq(core.token().totalSupply(), 1_000_000_000e18);
         assertEq(core.liquidity(), address(locker));
@@ -47,6 +52,8 @@ contract DeploySzrTest is Test {
         assertEq(locker.heldPrincipal(address(core.token())), 0);
         assertEq(locker.position(0).partner, address(weth));
         assertEq(locker.key(0).fee, 10_000); // the main pool charges 1%
+        // The sale's absolute floor defaults to the genesis price, not to nothing.
+        assertEq(core.auctionState().floorWad, 4_000_000_000_000);
         assertEq(locker.key(0).tickSpacing, 200);
         assertEq(locker.poolCount(), 1);
         assertEq(core.releaseRatePerDay(), 1_000_000e18);

@@ -36,6 +36,12 @@ of eligible sale time. The price is bounded below by one and a half times curren
 every sale carries a premium of at least half its NAV value. When that floor overtakes virtual
 pricing, fills start from the floor so demand still raises the curve.
 
+The decay is one straight line: each purchase lifts it and makes it steeper, and when it reaches
+the floor everything resets. A consequence worth knowing is that steady buying does not hold the
+price up indefinitely. With the same purchase every hour the price climbs to about 1.8x the floor
+over roughly 60 hours, then falls back to the floor by about hour 98 and starts again. The 1.5x
+NAV minimum always holds; this only affects how much premium the sale earns.
+
 The curve can represent a price up to about 115,000 WETH per SZR at full-supply depth, so the floor
 can follow NAV to roughly 77,000 WETH per SZR; past that only new sales stop. The pricing library
 keeps its decaying term in two words to reach that range. `test/ContinuousAuctionEquivalence.t.sol`
@@ -45,7 +51,10 @@ reference (`test/fixtures/continuous_auction_reference.py`) above the original's
 Quotes include total payment, the reserve share (NAV backing plus a third of the premium), and
 treasury funding separately; the last two always sum to the payment.
 
-Sale funding is not LP revenue: it does not pay the team. The former per-program allocation and
+Sale funding is not LP revenue: receiving it does not pay the team. If the manager later swaps
+that WETH through a pool where the protocol itself holds a position, the swap pays that pool's
+ordinary fee, and the protocol's share of it is split like any other trading fee (about 0.33% of
+the amount swapped reaches the team at a 1% pool fee). The former per-program allocation and
 buyer-funded LP reward mechanism, including its separate 5% backing premium, has been removed.
 
 ## Smoothed release schedule
@@ -95,10 +104,14 @@ as holders migrate, and ends below what each migrator brought in (about 9% below
 roughly 246M sellable old SZR migrates). Because the release lowers NAV it is refused once
 migration has closed, when loans and sales can exist.
 
-Borrowing is disabled during migration. It becomes available when the migration cap is exhausted,
-or when the Liquidity manager permanently closes migration with `SzrCore.closeMigration()`.
-Closure returns every unused migration reservation to scheduled public inventory without changing
-active supply or creating release credit. Genesis liquidity cannot be funded after closure.
+Borrowing, the sale and the fee auctions are closed during migration. They open only when the
+Liquidity manager permanently closes migration with `SzrCore.closeMigration()`. **Migration never
+ends by filling up**: the last unit of the allowance is never released, so nobody can end it for
+everyone by using the allowance up. Old SZR sold through the old hook can be bought back from it,
+so the allowance is not limited by the old supply; if it is ever used up, the manager can reserve
+more public inventory with `extendMigration(amount)` (once genesis is funded). Closure returns every unused reservation to
+scheduled public inventory without changing active supply or creating release credit. Migration
+cannot be closed until the genesis position has been funded; it could not be funded afterwards.
 There is no automatic timeout. Final migration eligibility must be checked before deployment;
 these figures are configuration defaults.
 
@@ -106,6 +119,14 @@ Legacy SZR is `0xbeD7c1660a01dbEEe225bd893ac31727a91A5773` on Robinhood. Deploym
 canonical hook using the old token's `hook()` getter and validates both directions of that binding,
 18 decimals, matching WETH, PoolManager code, and the initialized canonical zero-fee v4 pool. The
 legacy pool key and hook/PoolManager code hashes are pinned; callers cannot supply another route.
+
+The old hook's source is published and matches its bytecode exactly (Sourcify, chain 4663: the
+proxy `0x02973Ca0…a888`, its implementation `0x1d07f75d…bc3f` and the pricing module
+`0x21438fb2…5372`). Read for the final audit: the proxy has no admin or upgrade path; the hook has
+no owner; its pricing module, settings and fee recipient are set once at initialisation; the hook
+rejects any quote that would lower the floor price; selling to the floor carries no fee, while
+selling into WETH that buyers left in its band pays a 1% band fee; and its quote structure and
+zero-fee, tick-spacing-60 pool key are exactly what `SzrMigration` expects.
 
 1. A holder approves **SzrMigration**, then calls `migrate(amount, minimumBacking, deadline)`.
 2. Migration pulls exactly that holder's old SZR and sells the complete amount through the canonical
@@ -123,9 +144,10 @@ legacy pool key and hook/PoolManager code hashes are pinned; callers cannot supp
 
 A successful migration reduces both unreleased supply and the remaining migration reservation by
 its token amount. It does not spend or create scheduled sale allowance, alter total supply, or reset
-auction pricing. Returned/redeemed new SZR subsequently enters ordinary public inventory; it does
-not replenish the original migration allocation. New SZR has the same redemption and borrowing
-rights as other active tokens. All net recovered WETH joins reserves and is shared with the 25M
+auction pricing. While migration is open, redeemed, donated or recycled SZR frees its migration
+slot again (never beyond the original allowance), so migrating and redeeming in a loop cannot use
+the allowance up; after closure it enters ordinary public inventory. New SZR has the same
+redemption and borrowing rights as other active tokens. All net recovered WETH joins reserves and is shared with the 25M
 genesis tokens, which are active from the moment the genesis position is funded. A 1:1 token payout
 therefore does not preserve the old hook's per-token floor.
 Migration can lower the new token's NAV when recovered WETH per token is below the current NAV.
@@ -150,18 +172,23 @@ the real hook, redeems, trades the genesis pool, closes migration and buys from 
 is skipped unless `FORK_RPC_URL` is set:
 
 ```sh
-FORK_RPC_URL=https://rpc.mainnet.chain.robinhood.com FORK_BLOCK=112788329 \
-  forge test --match-path "test/fork/*" -vv
+FORK_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-path "test/fork/*" -vv
 ```
 
-It impersonates real holders of the old token as they stood at that block. Without `FORK_BLOCK`
-it uses the latest block and stops on its own guard if those holders have since moved their tokens;
-update the addresses in the test when that happens.
+It runs at the latest block (the public RPC stops serving older state within hours; `FORK_BLOCK`
+pins a block on an archive RPC). It impersonates real holders of the old token and stops on its
+own guard if they have since moved their tokens; update the addresses in the test when that
+happens. It also replays the attack an independent review found, buying old SZR from the old
+hook, migrating and redeeming in a loop, and checks that it can no longer use up the allowance.
 
-At block 112788329 the hook paid one flat price, about 0.000000532 WETH per old SZR with no sell
-fee, at every size. It accepts only tokens outside its own inventory: about 246.06M of the 330.35M
-supply, worth about 131 WETH in total. With the 25M genesis tokens sharing those reserves, NAV
-would be about 0.000000483 WETH if every sellable old SZR migrated, and lower while fewer have.
+On 2026-11-12 the hook paid one flat price while its band held no WETH, about 0.000000532 WETH
+per old SZR with no sell fee, at every size. It accepts only tokens outside its own inventory:
+about 246M of the 330M supply, worth about 131 WETH in total. With the 25M genesis tokens sharing
+those reserves, NAV would be about 0.000000483 WETH if every sellable old SZR migrated, and lower
+while fewer have. **The price is not flat once someone has bought old SZR from the hook**: that
+WETH sits in its band and the next sellers are paid from it at a higher price, so a migrator's
+quote can move between quoting and migrating. Front-ends should leave a margin in
+`minimumBacking`, and recovery above the floor price lifts NAV above the figures here.
 **Re-run the rehearsal immediately before deployment**; it simulates on a fork and does not replace
 checking the deployer's own settings.
 
@@ -215,7 +242,8 @@ period, so a newly added pool can be funded straight away.
 
 **The manager is still a trusted role.** It chooses which pools and hooks to register, how to
 allocate, and the minimum output of each trade, so a malicious manager could register a hostile
-pool and transfer that value away. Registration leaves a public record (`PoolAdded`,
+pool and transfer that value away. It also sets each partner token's fee-auction
+floor, so it could price that token's fee income cheaply. Registration leaves a public record (`PoolAdded`,
 `RouteRegistered`); it is not a safeguard by itself. Floor reserves in Core and the permanent
 genesis position are out of its reach. Use a multisig.
 
@@ -228,12 +256,21 @@ are unsupported; v4 hook data is empty. Native ETH pools are unsupported; WETH i
 
 1. **SZR trading fees:** returned to Core's unreleased public sale inventory.
 2. **WETH trading fees:** **33% team / 67% reserves**, with integer rounding dust kept in reserves.
-3. **Other trading fees:** auctioned for WETH, then allocated using the same 67/33 split.
+3. **Other trading fees:** auctioned for WETH, then allocated using the same 67/33 split. The
+   auction works like the SZR sale: arriving fees add stock without moving the price, the price
+   falls over two days while stock is waiting, each purchase lifts it, and it freezes while the
+   auction is empty. The sale's floor is 1.5x NAV; a partner token has no such number on-chain,
+   so each asset has a floor (WETH per unit) that the Liquidity manager keeps just under the
+   token's market rate. Fees never sell below it. `FeeCollector.updateAsset(asset, config)`
+   restarts an asset's auction with a new rate, buffer and floor, as its first registration
+   did: at twice the given rate, falling to the new floor.
 4. Anyone can call `SzrEconomics.claimFees()` to pay the immutable team beneficiary. It pays the
    contract's whole WETH balance, so WETH sent there by mistake goes to the beneficiary too.
 
 Only realized liquidity revenue is split. Principal, primary-sale funding, loan repayments, and
-returned SZR are excluded. Loan opening fees and backing donations go entirely to reserves.
+returned SZR are excluded. Loan opening fees and backing donations go entirely to reserves. If WETH
+fees are recognised while nobody holds SZR, the whole amount goes to the team: a reserve share with
+no holders would only belong to whoever bought the next unit.
 
 ## Supply, backing and loans
 
@@ -308,11 +345,13 @@ when it calls `acceptManager()`. After that the deployer has no authority anywhe
 set -a
 source .env
 set +a
-forge script script/DeploySzr.s.sol:DeploySzr --rpc-url "$RPC_URL" --account YOUR_KEYSTORE -vvvv
+forge script script/DeploySzr.s.sol:DeploySzr --sig "run()" --rpc-url "$RPC_URL" --account YOUR_KEYSTORE --slow -vvvv
 ```
 
 Review the rehearsal and its inputs before intentionally adding `--broadcast`. Repository changes
 do not deploy contracts. `AUCTION_OPENING_WAD` and `AUCTION_FLOOR_WAD` are WETH per SZR scaled by 1e18.
+`AUCTION_FLOOR_WAD` defaults to `INITIAL_MARKET_PRICE`, so the sale never sells below where the
+pool starts, even if migration is closed while reserves are still small.
 
 ### Launch checklist
 
@@ -325,20 +364,73 @@ These are accepted operating rules, not enforced in code.
   From then on only it can close migration, manage pools and send untouched sale funding; there
   is no time limit on when it closes migration.
 - `INITIAL_MARKET_PRICE` is where the genesis liquidity starts. It defaults to 0.000000507 WETH,
-  about 1.05x the NAV reached if every sellable old SZR migrates (0.000000483 at block
-  112788329), and below the auction minimum of 1.5x NAV. The script refuses a value below the
-  highest NAV migration could reach (the old hook's live price diluted by the genesis tokens with
-  the whole allocation migrated); check the old hook's price again before deploying.
-- Fund the genesis position before closing migration; it cannot be funded afterwards. If
-  `FUND_INITIAL_LIQUIDITY=false`, check the pool price first; if it was moved into the genesis
-  range, send the restoring swap and `fundInitialLiquidity` back to back.
+  about 1.05x the NAV reached if every sellable old SZR migrates at the floor price (0.000000483
+  on 2026-11-12), and below the auction minimum of 1.5x NAV. The script refuses a value below
+  that NAV, computed from the old hook's `floorPrice()` diluted by the genesis tokens with the
+  whole allowance migrated; check it again before deploying. Migrators who recover above the
+  floor (see the rehearsal notes) can lift NAV past this price, in which case the lowest genesis
+  tokens are bought and redeemed: a bounded loss to the pool position, not to holders.
+- The genesis position must be registered before launch and funded before migration can close;
+  the contracts enforce both. The script registers the pool and the genesis range in one
+  transaction and funds it right after launch. If `FUND_INITIAL_LIQUIDITY=false`, or that funding
+  transaction fails because someone moved the empty pool's price into the genesis range, the
+  manager restores the price and funds in one `multicall`: a `swapPrincipal` to a price below the
+  range (it spends nothing in an empty pool, so nothing needs to be held) followed by
+  `fundInitialLiquidity`.
+- Broadcast with `--slow`, so each transaction is sent only after the previous one has
+  succeeded, and check `pendingManager`, `initialLiquidityFunded` and `launched` afterwards.
+- If someone creates the SZR/WETH pool first at another price, the registration reverts and
+  nothing is left half-launched. Set `POOL_FEE` or `POOL_TICK_SPACING` (defaults 10000 and 200)
+  to deploy against a different pool instead of racing them.
+- If a griefer both moves the empty genesis pool's price and leaves a little liquidity of their
+  own there, restoring it needs someone to sell real SZR into that liquidity (above the genesis
+  price, so at a profit). Have a migrated wallet ready to do that and call
+  `fundInitialLiquidity` in the same transaction. The script's own funding, right after launch,
+  normally leaves no window for this.
+- Do not deploy with real funds using `INITIAL_LIQUIDITY_ALLOCATION=0`. Without the permanent
+  genesis tokens, active supply can shrink to dust, where a few wei can set NAV to any value and
+  price the sale out for good.
 - Closing migration opens the sale, the release schedule and the fee auctions. Nothing else does.
 - Watch `DestinationAnnounced` events: each one starts a 7-day notice before held WETH can be
   sent to that address.
 - Watch `PoolAdded` and `RouteRegistered` events: they list every pool the manager can use, with
   no notice period.
-- Partner tokens: no rebasing, unbounded-mint, fee-on-transfer or transfer-restricted tokens, and
-  always register them with the fee-auction floor at its minimum (`1`).
+- Partner tokens: no rebasing, unbounded-mint, fee-on-transfer or transfer-restricted tokens.
+  The mint rule matters most: in tests, once a token's supply had been multiplied 10,000 to
+  100,000 times, that token's fees could no longer be recorded or its auction updated, which
+  also blocks withdrawing that pool's liquidity.
+  A pool whose partner is WETH has no fee auction, so the rest of this applies only once a
+  pool with another partner is added.
+- Fee-auction floor: this is what stops fees selling cheaply. Register each partner token with
+  `initialPoolRateWad` at its market rate in WETH and `floorWad` just under it (90-95%), never
+  at the minimum: with a floor of `1`, a batch that arrives after the price has run down sells
+  for dust. Fees never sell below the floor. A floor above the market only makes fees wait; a
+  floor far below it lets a quiet auction sell down to it.
+- Updating a fee auction: each `updateAsset` restarts the price at twice the given rate, so
+  nothing sells for up to about two days afterwards. Do not update on a schedule: in a 30-day
+  run, updating every day or more often sold nothing, every two days about half, and weekly
+  96% of the fees received. Update in two cases only: the market has fallen below the floor
+  (fees have stopped selling), or the floor has slipped under about 80% of the market. Watch
+  `AssetUpdated` events for every change.
+- What to expect, from simulations with one buyer who takes whatever is cheaper than market
+  (buffer 20,000). Market held still, floor at 95%: fees arriving every minute sold at 99.7%
+  of market. Market moving 3% or 6% a day for 60 days, updating only when it fell below the
+  floor: 0 to 4 updates, 95-99.9% of fees sold within the period, at 96-99% of market, for
+  floors set at 80-95%. In a rising market with no updates the floor slipped to as little as
+  64% of market, which is why the 80% rule above exists.
+- Fee-auction units: rates and floors are WETH wei per smallest token unit, scaled by 1e18.
+  For an 18-decimal token worth 0.0004 WETH that is `4e14`; for a 6-decimal token worth the
+  same it is `4e26` (checked: one whole 6-decimal token then quotes 0.0008 WETH at the
+  restart price). A rate and floor both set far too low sell the waiting fees at once, and
+  the only check is that the floor sits below twice the rate, so review these numbers as
+  carefully as a transfer.
+- Fee-auction buffer: how much stock a purchase is measured against. Size it around the most
+  fees expected to wait at once, and never a dust amount: a dust buffer lets one cheap purchase
+  push the frozen price out of range, after which recording that token's fees (and so
+  withdrawing that pool's liquidity) reverts until the manager calls `updateAsset`.
+- A new, empty pool's price can be moved by anyone for free. Before the first deposit, check it;
+  the manager can move it back with a `swapPrincipal` (it spends nothing in an empty pool) and
+  deposit in the same `multicall`.
 
 ## Refactor complexity report
 

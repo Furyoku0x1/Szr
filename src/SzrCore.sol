@@ -71,6 +71,7 @@ contract SzrCore is ReentrancyGuard {
     error NotInitializer();
     error NotManager();
     error InitialLiquidityAlreadyReleased();
+    error InitialLiquidityNotReleased();
     error AlreadyInitialized();
     error NotInitialized();
     error NotLaunched();
@@ -104,6 +105,7 @@ contract SzrCore is ReentrancyGuard {
 
     event MigrationClosed(uint256 unusedAllocation);
     event InitialLiquidityReleased(uint256 tokens);
+    event MigrationExtended(uint256 tokens);
     event MigrationConfigured(
         address indexed migration, uint256 allocation, uint256 liquidityTarget
     );
@@ -217,14 +219,33 @@ contract SzrCore is ReentrancyGuard {
         if (msg.sender != ISzrLiquidity(liquidity).manager()) revert NotManager();
         uint256 unused = migrationRemaining;
         if (unused == 0) revert MigrationNotOpen();
+        _requireGenesisFunded();
         _checkpointSale();
         migrationRemaining = 0;
         _openAuctions();
         emit MigrationClosed(unused);
     }
 
+    /// @notice Reserves more public inventory for migration while it is open.
+    /// @dev Migration never ends by filling up. If the allowance is ever used up, by holders
+    /// or by someone holding migrated tokens to keep others out, the manager can make room.
+    function extendMigration(uint256 amount) external nonReentrant live {
+        if (msg.sender != ISzrLiquidity(liquidity).manager()) revert NotManager();
+        if (migrationRemaining == 0) revert MigrationNotOpen();
+        // Until genesis is funded, public inventory still holds its allocation.
+        _requireGenesisFunded();
+        if (amount == 0) revert ZeroAmount();
+        if (amount > publicInventory()) revert InsufficientInventory();
+        _checkpointSale();
+        migrationAllocation += amount;
+        migrationRemaining += amount;
+        emit MigrationExtended(amount);
+    }
+
     /// @notice Receives actual legacy proceeds and releases reserved tokens without a NAV minimum.
     /// @dev Migration can lower NAV. Public auction issuance retains its backing requirement.
+    /// The last unit of the allowance is never released, so migration cannot end by filling
+    /// up: only the manager's `closeMigration` ends it.
     function releaseMigration(address owner, uint256 amount, uint256 backing)
         external
         nonReentrant
@@ -234,17 +255,13 @@ contract SzrCore is ReentrancyGuard {
         if (owner == address(0)) revert ZeroAddress();
         if (owner == address(this)) revert InvalidModule();
         if (amount == 0) revert ZeroAmount();
-        if (amount > migrationRemaining) revert InsufficientInventory();
+        if (amount >= migrationRemaining) revert InsufficientInventory();
         _receiveBacking(msg.sender, backing);
         reserveCash += backing;
         migrationRemaining -= amount;
         unreleasedSupply -= amount;
         SafeTransferLib.safeTransfer(address(token), owner, amount);
         emit MigrationReleased(owner, amount, backing);
-        if (migrationRemaining == 0) {
-            _openAuctions();
-            emit MigrationClosed(0);
-        }
     }
 
     /// @notice Starts migration without activating a separate LP allocation.
@@ -258,6 +275,14 @@ contract SzrCore is ReentrancyGuard {
         if (migrationRemaining == 0) _openAuctions();
         ISzrLiquidity(liquidity).onLaunch();
         emit Launched(startedAt);
+    }
+
+    /// @dev Migration may not end while the genesis allocation is still in inventory. It could
+    /// never be released afterwards, and its permanent pool tokens are what stop active supply
+    /// shrinking to dust, where a few wei could set NAV to any value and price the sale out.
+    function _requireGenesisFunded() internal view {
+        if (initialLiquidityTarget == 0) return;
+        if (!initialLiquidityReleased) revert InitialLiquidityNotReleased();
     }
 
     function _openAuctions() internal {
@@ -423,6 +448,9 @@ contract SzrCore is ReentrancyGuard {
         uint256 held = SafeTransferLib.balanceOf(backingAsset, address(this));
         if (held < accounted + amount) revert AccountingMismatch();
         uint256 teamFee = economics.liquidityTeamFee(amount);
+        // With no holders, a reserve share would simply belong to whoever next bought a single
+        // unit. Nobody has a claim on it, so the whole amount goes to the team instead.
+        if (activeSupply() == 0) teamFee = amount;
         if (teamFee != 0) {
             uint256 beforeBalance = SafeTransferLib.balanceOf(backingAsset, address(economics));
             SafeTransferLib.safeTransfer(backingAsset, address(economics), teamFee);
@@ -555,6 +583,11 @@ contract SzrCore is ReentrancyGuard {
             emptySupplyDenominator = supply;
         }
         unreleasedSupply += amount;
+        // While migration is open a retired token frees its migration slot. Otherwise
+        // cycling migrate and redeem would use up the allowance and end migration for everyone.
+        uint256 remaining = migrationRemaining;
+        if (remaining == 0) return;
+        migrationRemaining = FixedPointMathLib.min(remaining + amount, migrationAllocation);
     }
 
     function _receiveBacking(address payer, uint256 amount) internal {

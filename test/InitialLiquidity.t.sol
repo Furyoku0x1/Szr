@@ -116,6 +116,23 @@ contract InitialLiquidityTest is Test {
         deployment.run(config);
     }
 
+    /// The pool's fee and tick spacing are script inputs, so a deployment can move to a
+    /// different pool if someone creates the default one first at another price.
+    function testDeployScriptCanUseAnotherFeeTier() public {
+        DeploySzr.Config memory config = _deployConfig();
+        config.poolFee = 3_000;
+        config.tickSpacing = 60;
+        config.fundInitialLiquidity = true;
+        DeploySzr deployment = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr"));
+        (SzrCore next,, Liquidity nextLocker) = deployment.run(config);
+        assertEq(nextLocker.key(0).fee, 3_000);
+        assertEq(nextLocker.key(0).tickSpacing, 60);
+        assertEq(nextLocker.key(nextLocker.INITIAL_POSITION()).fee, 3_000);
+        assertTrue(nextLocker.initialLiquidityFunded());
+        assertEq(locker.key(0).fee, 10_000); // the fixture used the defaults
+        assertEq(next.auctionsOpenAt(), 0);
+    }
+
     function testDeployScriptRejectsTheDeployerAsManager() public {
         DeploySzr.Config memory config = _deployConfig();
         config.manager = core.initializer();
@@ -264,13 +281,14 @@ contract InitialLiquidityTest is Test {
         _migrateContributor();
         vm.prank(alice);
         vm.expectRevert(SzrMigration.InsufficientAllocation.selector);
-        migrator.migrate(HOLDERS + 1, 0, block.timestamp);
-        vm.prank(alice);
         migrator.migrate(HOLDERS, 0, block.timestamp);
-        assertEq(core.token().balanceOf(alice), HOLDERS);
-        assertEq(migrator.totalMigrated(), TOTAL);
-        assertEq(core.activeSupply(), TOTAL + spent);
-        assertEq(core.migrationRemaining(), 0);
+        vm.prank(alice);
+        migrator.migrate(HOLDERS - 1, 0, block.timestamp);
+        assertEq(core.token().balanceOf(alice), HOLDERS - 1);
+        assertEq(migrator.totalMigrated(), TOTAL - 1);
+        assertEq(core.activeSupply(), TOTAL - 1 + spent);
+        assertEq(core.migrationRemaining(), 1); // the last unit never leaves
+        assertEq(core.auctionsOpenAt(), 0); // and filling up does not open the sale
         assertEq(core.publicInventory(), 650_000_000e18 - spent);
     }
 
@@ -293,28 +311,59 @@ contract InitialLiquidityTest is Test {
         assertEq(core.publicInventory(), core.unreleasedSupply());
     }
 
-    /// Releasing unbacked tokens lowers NAV, so it must be impossible once migration has
-    /// closed and loans or sales can exist.
-    function testGenesisCannotBeFundedOnceMigrationHasClosed() public {
+    /// Migration cannot end while the genesis allocation is still in Core's inventory. It
+    /// could never be released afterwards (the release lowers NAV, which must not happen once
+    /// loans and sales exist), and its pool tokens are what keep active supply from shrinking
+    /// to dust.
+    function testMigrationCannotCloseBeforeGenesisIsFunded() public {
         _migrateContributor();
+        vm.prank(core.initializer());
+        vm.expectRevert(SzrCore.InitialLiquidityNotReleased.selector);
+        core.closeMigration();
+        assertEq(core.auctionsOpenAt(), 0);
+        // Filling the allowance cannot end migration either; only the manager's call can.
         vm.prank(alice);
-        migrator.migrate(1_000e18, 0, block.timestamp);
+        migrator.migrate(HOLDERS - 1, 0, block.timestamp);
+        assertEq(core.auctionsOpenAt(), 0);
+
+        _fundInitial();
         vm.prank(core.initializer());
         core.closeMigration();
+        assertEq(core.auctionsOpenAt(), block.timestamp);
         vm.startPrank(alice);
         core.token().approve(address(core), type(uint256).max);
-        core.borrow(500e18, core.backingRequired(500e18));
+        core.borrow(500e18, core.backingRequired(500e18) - 1);
         vm.stopPrank();
-        uint256 supply = core.activeSupply();
-        uint256 nav = core.NAV();
-        uint256 debt = core.loanPrincipal();
-        vm.expectRevert(SzrCore.MigrationNotOpen.selector);
-        locker.fundInitialLiquidity(1, block.timestamp);
-        assertEq(core.activeSupply(), supply);
-        assertEq(core.NAV(), nav);
-        assertEq(core.loanPrincipal(), debt);
-        assertFalse(core.initialLiquidityReleased());
-        assertFalse(locker.initialLiquidityFunded());
+    }
+
+    /// Extending the allowance takes public inventory, which still holds the genesis
+    /// allocation until it is funded. Reserving that would leave the release with nothing to
+    /// draw on and break every later inventory calculation.
+    function testAllowanceCannotBeExtendedIntoTheGenesisAllocation() public {
+        address team = core.initializer(); // manager in this fixture
+        vm.prank(team);
+        vm.expectRevert(SzrCore.InitialLiquidityNotReleased.selector);
+        core.extendMigration(1e18);
+        uint256 spent = _fundInitial();
+        uint256 inventory = core.publicInventory();
+        assertEq(inventory, 650_000_000e18 - spent);
+        vm.prank(team);
+        vm.expectRevert(SzrCore.InsufficientInventory.selector);
+        core.extendMigration(inventory + 1);
+        vm.prank(team);
+        core.extendMigration(inventory); // every remaining public token, and no more
+        assertEq(core.publicInventory(), 0);
+        assertEq(core.migrationRemaining(), TOTAL + inventory);
+        // Everything still works with public inventory at zero.
+        _migrateContributor();
+        vm.startPrank(contributor);
+        core.token().approve(address(core), type(uint256).max);
+        core.redeem(1_000e18, 0);
+        vm.stopPrank();
+        assertEq(core.publicInventory() + core.migrationRemaining(), core.unreleasedSupply());
+        vm.prank(team);
+        core.closeMigration();
+        assertEq(core.publicInventory(), core.unreleasedSupply());
     }
 
     function testGenesisReleaseIsOnceOnlyAndOnlyThroughLiquidity() public {

@@ -5,6 +5,7 @@ import { ERC20 } from "solady/tokens/ERC20.sol";
 import { ReentrancyGuard } from "solady/utils/ReentrancyGuard.sol";
 import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
 import { ContinuousAuction } from "./ContinuousAuction.sol";
+import { ISzrLiquidity } from "./interfaces/ISzrModules.sol";
 import { SzrCore } from "./SzrCore.sol";
 
 /// @notice Per-asset partial-fill auctions. Receipts add depth; empty auctions freeze their price.
@@ -31,6 +32,7 @@ contract FeeCollector is ReentrancyGuard {
     error InvalidAsset();
     error InvalidRate();
     error NotLiquidity();
+    error NotManager();
     error ZeroAmount();
     error UnrecordedReceipt();
     error InsufficientInventory();
@@ -40,6 +42,9 @@ contract FeeCollector is ReentrancyGuard {
     error TransferAmountMismatch();
 
     event AssetRegistered(address indexed asset, uint256 buffer, uint256 openingRateWad);
+    event AssetUpdated(
+        address indexed asset, uint256 buffer, uint256 openingRateWad, uint256 floorWad
+    );
     event FeesRecorded(address indexed asset, uint256 amount);
     event AuctionTaken(
         address indexed asset, address indexed buyer, uint256 amount, uint256 paid
@@ -72,15 +77,38 @@ contract FeeCollector is ReentrancyGuard {
         if (asset == backingAsset) return;
         if (asset.code.length == 0) revert InvalidAsset();
         if (auctions[asset].buffer != 0) return;
+        emit AssetRegistered(asset, config.buffer, _setAuction(asset, config));
+        assets.push(asset);
+    }
+
+    /// @notice Restarts a registered asset's auction with new settings, exactly as its first
+    /// registration did: at twice the given rate, decaying over two days to the new floor.
+    /// The SZR sale's floor is 1.5x NAV; a partner token has no such number on-chain, so the
+    /// Liquidity manager keeps this floor just under the token's market rate. Fees never sell
+    /// below it, and a floor left above the market only makes them wait. Each call pauses
+    /// sales for up to about two days while the price falls back, so update when the market
+    /// has moved well past the floor, not on a schedule.
+    function updateAsset(address asset, AssetConfig calldata config) external nonReentrant {
+        if (msg.sender != ISzrLiquidity(core.liquidity()).manager()) revert NotManager();
+        if (auctions[asset].buffer == 0) revert InvalidAsset();
+        if (config.buffer == 0) revert ZeroAmount();
+        uint256 opening = _setAuction(asset, config);
+        emit AssetUpdated(asset, config.buffer, opening, config.floorWad);
+    }
+
+    function _setAuction(address asset, AssetConfig calldata config)
+        internal
+        returns (uint256 opening)
+    {
         if (config.initialPoolRateWad > type(uint256).max / 2) revert InvalidRate();
-        uint256 opening = config.initialPoolRateWad * 2;
+        opening = config.initialPoolRateWad * 2;
         Auction storage entry = auctions[asset];
-        entry.curve = ContinuousAuction.create(config.buffer, opening, config.floorWad);
+        entry.curve = ContinuousAuction.create(
+            entry.inventory + config.buffer, opening, config.floorWad
+        );
         entry.buffer = config.buffer;
         _checkSupplyDepth(asset, entry.curve, entry.buffer);
         entry.updatedAt = block.timestamp;
-        assets.push(asset);
-        emit AssetRegistered(asset, config.buffer, opening);
     }
 
     /// @notice Only actual received fees are recorded. Own-token fees bypass this contract.

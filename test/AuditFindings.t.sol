@@ -74,10 +74,11 @@ contract AuditFindingsTest is InitialLiquidityTest {
         assertGt(taken, brought * 5); // arb extracted alice's backing
     }
 
-    /// M-1 (accepted; the deploy script funds genesis right after launch): before genesis is
-    /// funded the pool is empty, so anyone can move its price into
-    /// the genesis range for free; fundInitialLiquidity then reverts until someone moves it back.
-    function testPoC_AnyoneBlocksGenesisFundingForFree() public {
+    /// M-1 (fixed for the manager): before genesis is funded the pool is empty, so anyone can
+    /// move its price into the genesis range for free and fundInitialLiquidity then reverts.
+    /// Moving it back was also free but could be undone again before the funding landed.
+    /// The manager can now restore the price and fund in one transaction, holding nothing.
+    function testFix_ManagerRestoresAMovedGenesisPriceAndFundsInOneBatch() public {
         _migrateContributor();
         uint256 id = locker.INITIAL_POSITION();
         PoolKey memory key = locker.key(id);
@@ -100,12 +101,24 @@ contract AuditFindingsTest is InitialLiquidityTest {
         vm.expectRevert(Liquidity.AboveMaximum.selector);
         locker.fundInitialLiquidity(1, block.timestamp);
 
-        // Recoverable: anyone can swap the empty pool back for free, then funding succeeds.
+        // The manager holds no SZR or WETH in Liquidity. A swap through the empty pool spends
+        // nothing, so it can move the price back and fund genesis in the same transaction.
         uint160 restore =
             TickMath.getSqrtPriceAtTick(szrFirst ? g.tickLower - 600 : g.tickUpper + 600);
-        router.swap(key, IPoolManager.SwapParams(szrFirst, -1e18, restore), settings, "");
-        vm.prank(contributor);
-        assertGt(locker.fundInitialLiquidity(1, block.timestamp), 0);
+        assertEq(locker.heldPrincipal(address(core.token())), 0);
+        bytes[] memory calls = new bytes[](2);
+        calls[0] = abi.encodeCall(
+            locker.swapPrincipal, (key, szrFirst, 1, 0, restore, block.timestamp)
+        );
+        calls[1] = abi.encodeCall(locker.fundInitialLiquidity, (1, block.timestamp));
+        vm.prank(alice); // only the manager can make that swap
+        vm.expectRevert(Liquidity.NotManager.selector);
+        locker.multicall(calls);
+        vm.prank(core.initializer()); // the manager in this fixture
+        locker.multicall(calls);
+        assertTrue(locker.initialLiquidityFunded());
+        assertEq(locker.heldPrincipal(address(core.token())), 0);
+        assertEq(locker.heldPrincipal(address(backing)), 0);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -138,6 +151,7 @@ contract AuditFindingsTest is InitialLiquidityTest {
         migrator.migrate(50_000_000e18, 0, block.timestamp);
         vm.stopPrank();
 
+        _fundInitial(); // migration cannot close until the genesis position is funded
         vm.prank(core.initializer());
         core.closeMigration();
         vm.warp(block.timestamp + 30 days); // curve fully decayed
@@ -302,6 +316,7 @@ contract AuditFindingsTest is InitialLiquidityTest {
         core.redeem(1_000e18, 0);
         core.donateSzr(1e18);
         vm.stopPrank();
+        _fundInitial(); // migration cannot close until the genesis position is funded
         vm.prank(core.initializer());
         core.closeMigration();
         vm.warp(core.auctionsOpenAt() + bound(wait, 1 hours, 3 * 365 days));

@@ -81,6 +81,10 @@ contract LegacyMigrationHook is BaseTestHooks {
         reentryTarget = target;
     }
 
+    function floorPrice() external view returns (uint256) {
+        return quoteSellExactIn(1e18).netWethOut;
+    }
+
     function quoteSellExactIn(uint256 amount)
         public
         view

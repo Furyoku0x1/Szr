@@ -6,9 +6,10 @@ import { IERC20 } from "forge-std/interfaces/IERC20.sol";
 import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
+import { IHooks } from "v4-core/interfaces/IHooks.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { Currency } from "v4-core/types/Currency.sol";
-import { DeploySzr } from "../../script/DeploySzr.s.sol";
+import { DeploySzr, ILegacyFloor } from "../../script/DeploySzr.s.sol";
 import { SzrCore } from "../../src/SzrCore.sol";
 import { SzrMigration, ILegacySzrHook, ILegacySzrToken } from "../../src/SzrMigration.sol";
 import { Liquidity } from "../../src/Liquidity.sol";
@@ -78,6 +79,92 @@ contract SzrForkTest is Test {
         assertEq(locker.pendingManager(), TEAM);
         vm.prank(TEAM);
         locker.acceptManager();
+    }
+
+    /// Buys old SZR from the old hook, as anyone can.
+    function _buyOld(address buyer, uint256 spend) internal returns (uint256 bought) {
+        bool oldFirst = LEGACY < address(weth);
+        PoolKey memory legacyPool = PoolKey(
+            Currency.wrap(oldFirst ? LEGACY : address(weth)),
+            Currency.wrap(oldFirst ? address(weth) : LEGACY),
+            0,
+            60,
+            IHooks(address(hook))
+        );
+        PoolSwapTest router = new PoolSwapTest(IPoolManager(address(hook.poolManager())));
+        PoolSwapTest.TestSettings memory settings;
+        uint256 held = old.balanceOf(buyer);
+        vm.startPrank(buyer);
+        weth.approve(address(router), spend);
+        router.swap(
+            legacyPool,
+            IPoolManager.SwapParams(
+                !oldFirst,
+                -int256(spend),
+                oldFirst ? TickMath.MAX_SQRT_PRICE - 1 : TickMath.MIN_SQRT_PRICE + 1
+            ),
+            settings,
+            ""
+        );
+        vm.stopPrank();
+        bought = old.balanceOf(buyer) - held;
+    }
+
+    /// Someone buying old SZR leaves WETH in the old hook's band, so the next sells are paid
+    /// from the band at a higher price instead of straight from the floor. Migration must
+    /// settle that path too, and buying old SZR to migrate and redeem must not pay.
+    function testMigrationStillWorksAfterSomeoneBuysOldSzr() public {
+        if (!live) return vm.skip(true);
+        _deploy();
+        uint256 flat = hook.quoteSellExactIn(1e18).netWethOut;
+        address buyer = address(0xB0B);
+        deal(address(weth), buyer, 5e18);
+        uint256 bought = _buyOld(buyer, 5e18);
+        assertGt(bought, 0);
+        assertGt(hook.quoteSellExactIn(1e18).netWethOut, flat); // sells now pay above the floor
+        (uint256 quoted,,) = migrator.quote(bought);
+        vm.startPrank(buyer);
+        old.approve(address(migrator), bought);
+        assertEq(migrator.migrate(bought, quoted, block.timestamp), quoted);
+        assertGt(quoted, bought * flat / 1e18); // recovered at the band's higher price
+        assertLt(quoted, 5e18); // but less than was paid
+        IERC20(address(core.token())).approve(address(core), bought);
+        assertLt(core.redeem(bought, 0), 5e18);
+        vm.stopPrank();
+        assertEq(weth.balanceOf(address(core)), core.reserveCash());
+    }
+
+    /// Found by independent review and measured on this hook at about 20 WETH: buying old
+    /// SZR, migrating it and redeeming in a loop used to use up the whole allowance, which
+    /// closed migration for every real holder and opened the sale. A redeemed token now
+    /// frees its slot, and migration only ends when the manager closes it.
+    function testCyclingThroughTheOldHookCannotEndMigration() public {
+        if (!live) return vm.skip(true);
+        _deploy();
+        address attacker = address(0xBAD);
+        deal(address(weth), attacker, 40e18);
+        uint256 room = core.migrationRemaining();
+        IERC20 szr = IERC20(address(core.token()));
+        vm.startPrank(attacker);
+        old.approve(address(migrator), type(uint256).max);
+        szr.approve(address(core), type(uint256).max);
+        vm.stopPrank();
+        for (uint256 cycle; cycle < 22; cycle++) {
+            uint256 spend = weth.balanceOf(attacker);
+            if (spend > 10e18) spend = 10e18;
+            uint256 bought = _buyOld(attacker, spend);
+            vm.startPrank(attacker);
+            migrator.migrate(bought, 0, block.timestamp);
+            core.redeem(szr.balanceOf(attacker), 0);
+            vm.stopPrank();
+        }
+        assertEq(core.migrationRemaining(), room); // every slot came back
+        assertEq(core.auctionsOpenAt(), 0);
+        assertLt(weth.balanceOf(attacker), 40e18); // and the attacker paid for nothing
+        emit log_named_decimal_uint(
+            "attacker WETH lost over 22 cycles", 40e18 - weth.balanceOf(attacker), 18
+        );
+        _migrateAll(HOLDER); // a real holder still migrates
     }
 
     function _migrateAll(address owner) internal returns (uint256 amount, uint256 recovered) {
@@ -175,7 +262,7 @@ contract SzrForkTest is Test {
         // The script refuses a genesis price below the highest NAV migration could reach.
         // Last, because a reverted script run leaves its broadcast open.
         DeploySzr.Config memory low = _config();
-        low.marketPrice = hook.quoteSellExactIn(1e18).netWethOut * 350 / 375 - 1;
+        low.marketPrice = ILegacyFloor(address(hook)).floorPrice() * 350 / 375 - 1;
         DeploySzr deployment = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr"));
         vm.expectRevert(DeploySzr.InitialPriceBelowNav.selector);
         deployment.run(low);

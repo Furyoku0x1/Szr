@@ -181,7 +181,7 @@ contract SzrMigration is ReentrancyGuard, IUnlockCallback {
         if (block.timestamp > deadline) revert DeadlinePassed();
         if (amount == 0) revert InvalidAmount();
         if (amount > uint256(uint128(type(int128).max))) revert InvalidAmount();
-        if (amount > core.migrationRemaining()) revert InsufficientAllocation();
+        if (amount >= core.migrationRemaining()) revert InsufficientAllocation();
         if (address(legacyHook).codehash != hookCodehash) revert CodeChanged();
         if (address(poolManager).codehash != managerCodehash) revert CodeChanged();
     }

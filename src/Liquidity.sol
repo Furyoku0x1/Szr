@@ -377,6 +377,11 @@ contract Liquidity is ReentrancyGuard, Multicallable, IUnlockCallback {
     function onLaunch() external {
         if (msg.sender != address(core)) revert NotCore();
         if (started) revert AlreadyLaunched();
+        // The genesis position cannot be registered after launch, and migration cannot close
+        // until it is funded, so launching without it would leave the system stuck for good.
+        // The registered range must also be one the allocation can actually be placed in.
+        uint256 target = core.initialLiquidityTarget();
+        if (target != 0) _initialUnits(_position(INITIAL_POSITION), target);
         started = true;
     }
 
@@ -618,11 +623,13 @@ contract Liquidity is ReentrancyGuard, Multicallable, IUnlockCallback {
         address output = Currency.unwrap(zeroForOne ? pool.currency1 : pool.currency0);
         if (input.code.length == 0) revert InvalidAsset();
         if (output.code.length == 0) revert InvalidAsset();
-        if (amount > heldPrincipal[input]) revert MissingContribution();
         SwapRequest memory request =
             SwapRequest(pool, zeroForOne, amount, minimumOut, sqrtPriceLimitX96);
         bytes memory response = _unlock(abi.encode(true, abi.encode(request)));
         (spent, received) = abi.decode(response, (uint256, uint256));
+        // Checked against what was actually spent: moving an empty pool's price spends
+        // nothing, so it must work even before anything is held.
+        if (spent > heldPrincipal[input]) revert MissingContribution();
         _spendHeld(input, spent);
         heldPrincipal[output] += received;
         emit PrincipalSwapped(input, output, spent, received);
@@ -763,7 +770,11 @@ contract Liquidity is ReentrancyGuard, Multicallable, IUnlockCallback {
         int128 input = request.zeroForOne ? delta.amount0() : delta.amount1();
         int128 output = request.zeroForOne ? delta.amount1() : delta.amount0();
         (spent, received) = _swapAmounts(input, output, request.amount, request.minimumOut);
-        _pay(request.zeroForOne ? request.key.currency0 : request.key.currency1, spent);
+        // A swap through an empty pool spends nothing and only moves its price. That is how
+        // the manager restores a price someone moved for free before the first deposit.
+        if (spent != 0) {
+            _pay(request.zeroForOne ? request.key.currency0 : request.key.currency1, spent);
+        }
         if (received != 0) {
             _take(request.zeroForOne ? request.key.currency1 : request.key.currency0, received);
         }
@@ -778,7 +789,6 @@ contract Liquidity is ReentrancyGuard, Multicallable, IUnlockCallback {
         if (output < 0) revert InvalidDelta();
         spent = uint256(-int256(input));
         received = uint128(output);
-        if (spent == 0) revert InvalidUnits();
         if (spent > maximum) revert AboveMaximum();
         if (received < minimum) revert BelowMinimum();
     }

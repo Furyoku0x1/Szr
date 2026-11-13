@@ -6,6 +6,7 @@ import { Test } from "forge-std/Test.sol";
 import { IHooks } from "v4-core/interfaces/IHooks.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { Hooks } from "v4-core/libraries/Hooks.sol";
+import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { Currency } from "v4-core/types/Currency.sol";
 import { Szr } from "../src/Szr.sol";
@@ -167,16 +168,44 @@ contract SzrMigrationTest is Test {
         _accounting(0);
     }
 
-    function testAllocationCannotBeOverdrawnOrSoldTwice() public {
+    /// The last unit of the allowance is never released, so migration cannot end, and the
+    /// sale cannot open, just because the allowance filled up. The manager can make room.
+    function testAllowanceCannotBeOverdrawnAndFillingItDoesNotEndMigration() public {
         vm.prank(alice);
+        vm.expectRevert(SzrMigration.InsufficientAllocation.selector);
         migrator.migrate(ALLOCATION, 0, block.timestamp);
-        assertEq(core.migrationRemaining(), 0);
-        assertEq(core.publicInventory(), core.unreleasedSupply());
+        vm.prank(address(migrator));
+        vm.expectRevert(SzrCore.InsufficientInventory.selector);
+        core.releaseMigration(alice, ALLOCATION, 0);
+        vm.prank(alice);
+        migrator.migrate(ALLOCATION - 1, 0, block.timestamp);
+        assertEq(core.migrationRemaining(), 1);
+        assertEq(core.auctionsOpenAt(), 0);
         vm.prank(bob);
         vm.expectRevert(SzrMigration.InsufficientAllocation.selector);
         migrator.migrate(1e18, 0, block.timestamp);
         assertEq(oldToken.balanceOf(bob), 400_000_000e18);
-        _accounting(ALLOCATION);
+        _accounting(ALLOCATION - 1);
+
+        // Only the manager can reserve more, only from public inventory, only while open.
+        vm.prank(bob);
+        vm.expectRevert(SzrCore.NotManager.selector);
+        core.extendMigration(10e18);
+        vm.expectRevert(SzrCore.ZeroAmount.selector);
+        core.extendMigration(0);
+        uint256 inventory = core.publicInventory();
+        vm.expectRevert(SzrCore.InsufficientInventory.selector);
+        core.extendMigration(inventory + 1);
+        core.extendMigration(10e18);
+        assertEq(core.migrationAllocation(), ALLOCATION + 10e18);
+        assertEq(core.publicInventory(), inventory - 10e18);
+        vm.prank(bob);
+        migrator.migrate(1e18, 0, block.timestamp);
+        assertEq(core.token().balanceOf(bob), 1e18);
+        assertEq(core.publicInventory() + core.migrationRemaining(), core.unreleasedSupply());
+        core.closeMigration();
+        vm.expectRevert(SzrCore.MigrationNotOpen.selector);
+        core.extendMigration(1e18);
     }
 
     function testOnlyBoundMigratorCanReleaseReservedInventory() public {
@@ -262,19 +291,107 @@ contract SzrMigrationTest is Test {
         _accounting(0);
     }
 
-    function testRedeemingMigratedTokensRecyclesThemIntoPublicInventory() public {
+    /// Found in review of the final fixes: the genesis position cannot be registered after
+    /// launch and migration cannot close until it is funded, so a launch without it would be
+    /// stuck for good. Launch now refuses.
+    function testLaunchRequiresTheGenesisPoolWhenAnAllocationIsConfigured() public {
+        SzrCore fresh = SzrCore(
+            deployCode(
+                "SzrCore.sol:SzrCore",
+                abi.encode(
+                    address(backing),
+                    uint256(1e12),
+                    address(this),
+                    SzrCore.AuctionConfig(4e12, 1, 20_000e18)
+                )
+            )
+        );
+        FeeCollector freshJar = new FeeCollector(fresh);
+        Liquidity freshLocker = new Liquidity(fresh, freshJar, manager, address(this));
+        fresh.initialize(address(freshLocker), address(freshJar));
+        SzrMigration freshMigrator =
+            new SzrMigration(fresh, address(oldToken), ILegacySzrHook(address(oldHook)));
+        fresh.configureMigration(address(freshMigrator), ALLOCATION, 25_000_000e18);
+        vm.expectRevert(Liquidity.UnknownPool.selector);
+        fresh.launch();
+        // A registered range that the allocation could never be placed in is refused too.
+        bool first = address(fresh.token()) < address(backing);
+        int24 edge = first ? TickMath.maxUsableTick(60) - 60 : TickMath.minUsableTick(60) + 60;
+        Liquidity.PoolConfig memory genesis = Liquidity.PoolConfig({
+            partner: address(backing),
+            feePips: 3_000,
+            tickSpacing: 60,
+            tickLower: first ? edge : TickMath.minUsableTick(60),
+            tickUpper: first ? TickMath.maxUsableTick(60) : edge,
+            initialSqrtPriceX96: TickMath.getSqrtPriceAtTick(edge),
+            hooks: IHooks(address(0))
+        });
+        FeeCollector.AssetConfig memory unused;
+        freshLocker.setInitialPool(genesis, unused);
+        vm.expectRevert();
+        fresh.launch();
+        assertFalse(fresh.launched());
+    }
+
+    /// Found in the final audit: fees recognised while nobody held SZR used to sit in reserves
+    /// for the first dust buyer to redeem. With no holders they now go to the team.
+    function testFix_FeesRecognisedWithNoHoldersCannotBeCapturedByADustBuyer() public {
+        vm.startPrank(alice);
+        migrator.migrate(1_000e18, 0, block.timestamp);
+        core.token().approve(address(core), type(uint256).max);
+        core.redeem(1_000e18, 0);
+        vm.stopPrank();
+        assertEq(core.activeSupply(), 0);
+        backing.mint(address(core), 10e18);
+        vm.prank(core.feeJar());
+        core.recognizeFees(10e18);
+        assertEq(core.reserveCash(), 0);
+        assertEq(core.economics().claimableFees(), 10e18);
+        assertEq(backing.balanceOf(address(core)), core.reserveCash());
+        // With holders the usual split applies again.
         vm.prank(alice);
         migrator.migrate(1_000e18, 0, block.timestamp);
+        uint256 reserves = core.reserveCash();
+        backing.mint(address(core), 10e18);
+        vm.prank(core.feeJar());
+        core.recognizeFees(10e18);
+        assertEq(core.reserveCash() - reserves, 6.7e18);
+        assertEq(core.economics().claimableFees(), 13.3e18);
+    }
+
+    /// While migration is open a redeemed token frees its migration slot instead of joining
+    /// the public sale, so migrating and redeeming in a loop cannot use up the allowance.
+    function testRedeemingDuringMigrationFreesTheMigrationSlot() public {
         uint256 inventory = core.publicInventory();
-        uint256 remaining = core.migrationRemaining();
+        vm.prank(alice);
+        migrator.migrate(1_000e18, 0, block.timestamp);
+        assertEq(core.migrationRemaining(), ALLOCATION - 1_000e18);
         vm.startPrank(alice);
         core.token().approve(address(core), type(uint256).max);
         core.redeem(1_000e18, 0);
         vm.stopPrank();
-        assertEq(core.publicInventory(), inventory + 1_000e18);
-        assertEq(core.migrationRemaining(), remaining);
+        assertEq(core.migrationRemaining(), ALLOCATION);
+        assertEq(core.publicInventory(), inventory);
         assertEq(core.totalReleased(), 0);
-        _accounting(1_000e18);
+        // Donated tokens free their slots the same way.
+        Szr szr = core.token();
+        vm.prank(bob);
+        migrator.migrate(10e18, 0, block.timestamp);
+        vm.prank(bob);
+        szr.transfer(alice, 10e18);
+        vm.prank(bob);
+        migrator.migrate(5e18, 0, block.timestamp);
+        vm.prank(alice);
+        core.donateSzr(10e18);
+        assertEq(core.migrationRemaining(), ALLOCATION - 5e18);
+        vm.prank(bob);
+        szr.transfer(alice, 5e18);
+        vm.prank(alice);
+        core.donateSzr(5e18);
+        assertEq(core.migrationRemaining(), ALLOCATION);
+        assertEq(core.publicInventory(), inventory);
+        assertEq(core.publicInventory() + core.migrationRemaining(), core.unreleasedSupply());
+        assertEq(backing.balanceOf(address(core)), core.reserveCash());
     }
 
     function testFuzzSplitMigrationsConserveSupplyAndActualBacking(uint96 raw, uint64 rawPrice)
@@ -567,14 +684,21 @@ contract SzrMigrationTest is Test {
         assertEq(core.migrationRemaining(), 0);
     }
 
-    function testExhaustingAllocationAutomaticallyEnablesBorrowing() public {
+    /// Using up the allowance does not end migration or open loans; only the manager does.
+    function testOnlyClosingMigrationEnablesBorrowing() public {
         vm.prank(alice);
-        migrator.migrate(ALLOCATION, 0, block.timestamp);
+        migrator.migrate(ALLOCATION - 1, 0, block.timestamp);
+        assertEq(core.migrationRemaining(), 1);
+        assertEq(core.auctionsOpenAt(), 0);
         uint256 debt = core.backingRequired(10_000e18) / 2;
         vm.startPrank(alice);
         core.token().approve(address(core), type(uint256).max);
+        vm.expectRevert(SzrCore.MigrationOpen.selector);
         core.borrow(10_000e18, debt);
         vm.stopPrank();
+        core.closeMigration();
+        vm.prank(alice);
+        core.borrow(10_000e18, debt);
         assertEq(core.migrationRemaining(), 0);
         assertEq(core.loanPrincipal(), debt);
         assertEq(core.pledgedSupply(), 10_000e18);

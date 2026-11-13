@@ -8,6 +8,7 @@ import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
 import { SzrWorld } from "./utils/SzrWorld.sol";
 import { SzrCore } from "../src/SzrCore.sol";
 import { FeeCollector } from "../src/FeeCollector.sol";
+import { Liquidity } from "../src/Liquidity.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 
 contract FeeCollectorTest is SzrWorld {
@@ -225,5 +226,125 @@ contract FeeCollectorTest is SzrWorld {
         uint256 second = jar.quote(address(feeAsset), quantity - quantity / 2);
         assertGe(first + second, combined);
         assertLe(first + second, combined + 1);
+    }
+
+    function _feeAssetWithFloor(uint256 floor) internal returns (TestAsset asset) {
+        asset = new TestAsset();
+        Liquidity.PoolConfig memory config = _config();
+        config.partner = address(asset);
+        locker.addPool(config, FeeCollector.AssetConfig(1e18, 20_000e18, floor));
+    }
+
+    function _takeAll(TestAsset asset) internal {
+        uint256 inventory = jar.auction(address(asset)).inventory;
+        uint256 payment = jar.quote(address(asset), inventory);
+        vm.prank(alice);
+        jar.take(address(asset), inventory, payment, block.timestamp);
+    }
+
+    /// Found in the final audit: the price only decays, so once it has run down, a batch that
+    /// arrives sells at the floor. The floor is therefore the protection: with the minimum
+    /// floor 600 WETH of fees sell for dust, with a real one they cannot sell below it.
+    function testFix_ARealFloorBoundsABatchThatArrivesAfterTheDecay() public {
+        TestAsset dust = _feeAssetWithFloor(1);
+        TestAsset kept = _feeAssetWithFloor(9e17); // market 1 WETH per token, floor 0.9
+        _recordFee(dust, 1);
+        _recordFee(kept, 1);
+        vm.warp(block.timestamp + 2 days);
+        _recordFee(dust, 600e18);
+        _recordFee(kept, 600e18);
+        assertLt(jar.quote(address(dust), 600e18), 1_000);
+        assertEq(jar.price(address(kept)), 9e17);
+        assertGe(jar.quote(address(kept), 600e18), 540e18);
+    }
+
+    function testUpdateAssetIsManagerKeptAndRestartsTheAuction() public {
+        TestAsset asset = _feeAssetWithFloor(1);
+        FeeCollector.AssetConfig memory config = FeeCollector.AssetConfig(3e18, 600e18, 27e17);
+        vm.prank(alice);
+        vm.expectRevert(FeeCollector.NotManager.selector);
+        jar.updateAsset(address(asset), config);
+        vm.expectRevert(FeeCollector.InvalidAsset.selector);
+        jar.updateAsset(address(0xDEAD), config);
+        vm.expectRevert(FeeCollector.ZeroAmount.selector);
+        jar.updateAsset(address(asset), FeeCollector.AssetConfig(3e18, 0, 27e17));
+        vm.expectRevert(); // the floor must sit below twice the rate
+        jar.updateAsset(address(asset), FeeCollector.AssetConfig(1e18, 600e18, 2e18));
+
+        // 600 fee tokens have waited until their price is almost gone; the market is now 3.
+        _recordFee(asset, 600e18);
+        vm.warp(block.timestamp + 2 days - 1);
+        assertLt(jar.quote(address(asset), 600e18), 1e18);
+        vm.expectEmit(address(jar));
+        emit FeeCollector.AssetUpdated(address(asset), 600e18, 6e18, 27e17);
+        jar.updateAsset(address(asset), config);
+        FeeCollector.Auction memory stored = jar.auction(address(asset));
+        assertEq(stored.buffer, 600e18);
+        assertEq(stored.inventory, 600e18);
+        assertEq(stored.curve.floorWad, 27e17);
+        assertEq(jar.price(address(asset)), 6e18); // restarted at twice the given rate
+        vm.warp(block.timestamp + 2 days);
+        assertEq(jar.price(address(asset)), 27e17); // and decays to the new floor, no lower
+        assertGe(jar.quote(address(asset), 600e18), 600 * 27e17);
+        _takeAll(asset);
+        _assertCash();
+    }
+
+    /// A dust buffer lets one cheap purchase push the frozen price so high that, once the
+    /// token's supply has grown, a later receipt cannot be recorded (and Liquidity withdrawals
+    /// record fees). Updating the asset restarts its auction and clears that.
+    function testFix_UpdatingAnAssetClearsAnAuctionPushedOutOfRange() public {
+        TestAsset asset = new TestAsset();
+        Liquidity.PoolConfig memory config = _config();
+        config.partner = address(asset);
+        locker.addPool(config, FeeCollector.AssetConfig(1e18, 14_902, 1));
+        backing.mint(alice, 1e40);
+        _recordFee(asset, 4.8e9);
+        _takeAll(asset);
+        _recordFee(asset, 2.6e11);
+        _takeAll(asset);
+
+        asset.mint(address(jar), 1.6e23);
+        vm.prank(address(locker));
+        vm.expectRevert();
+        jar.recordFees(address(asset), 1.6e23);
+
+        jar.updateAsset(address(asset), FeeCollector.AssetConfig(1e18, 1e22, 9e17));
+        vm.prank(address(locker));
+        jar.recordFees(address(asset), 1.6e23);
+        assertEq(jar.auction(address(asset)).inventory, 1.6e23);
+        assertEq(jar.price(address(asset)), 2e18);
+    }
+
+    /// Whatever arrives, waits, is bought or is updated, no fee token sells below its floor.
+    function testFuzzFeesNeverSellBelowTheFloor(
+        uint64[8] memory amounts,
+        uint32[8] memory waits,
+        uint64[8] memory floors
+    ) public {
+        TestAsset asset = _feeAssetWithFloor(9e17);
+        backing.mint(alice, 1e36);
+        uint256 floor = 9e17;
+        for (uint256 index; index < 8; index++) {
+            vm.warp(block.timestamp + bound(waits[index], 0, 3 days));
+            _recordFee(asset, bound(amounts[index], 1, 1e24));
+            if (index % 4 == 3) {
+                floor = bound(floors[index], 1, 1e20);
+                jar.updateAsset(
+                    address(asset),
+                    FeeCollector.AssetConfig(floor, bound(amounts[index], 1, 1e24), floor)
+                );
+            }
+            uint256 inventory = jar.auction(address(asset)).inventory;
+            uint256 part = inventory / 2 + 1;
+            uint256 payment = jar.quote(address(asset), part);
+            assertGe(payment, FixedPointMathLib.fullMulDiv(part, floor, 1e18));
+            assertGe(jar.price(address(asset)), floor);
+            if (index % 3 == 2) {
+                vm.prank(alice);
+                jar.take(address(asset), part, payment, block.timestamp);
+            }
+        }
+        _assertCash();
     }
 }

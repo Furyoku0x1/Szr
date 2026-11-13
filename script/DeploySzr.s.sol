@@ -13,6 +13,10 @@ import { FeeCollector } from "../src/FeeCollector.sol";
 import { SzrMigration, ILegacySzrToken, ILegacySzrHook } from "../src/SzrMigration.sol";
 import { Liquidity } from "../src/Liquidity.sol";
 
+interface ILegacyFloor {
+    function floorPrice() external view returns (uint256);
+}
+
 /// @notice Ordinary Foundry deployment transactions; signing is supplied by the caller.
 contract DeploySzr is Script {
     struct Config {
@@ -28,6 +32,10 @@ contract DeploySzr is Script {
         uint256 initialLiquidityTokens;
         SzrCore.AuctionConfig auction;
         bool fundInitialLiquidity;
+        // Zero means the defaults: a 1% fee and tick spacing 200. Changing them gives a
+        // different pool, which is the way out if someone creates the default one first.
+        uint24 poolFee;
+        int24 tickSpacing;
     }
 
     error WrongChain();
@@ -35,6 +43,7 @@ contract DeploySzr is Script {
     error MissingPoolManager();
     error InvalidMarketPrice();
     error ManagerIsDeployer();
+    error MissingManager();
     error InitialPriceBelowNav();
 
     function run() external returns (SzrCore core, FeeCollector jar, Liquidity locker) {
@@ -59,19 +68,20 @@ contract DeploySzr is Script {
         address setupManager = core.initializer();
         locker = new Liquidity(core, jar, IPoolManager(config.poolManager), setupManager);
         core.initialize(address(locker), address(jar));
+        // The deployer only sets up; a separate manager takes over once it accepts. Nominated
+        // first, so a later step failing on-chain cannot leave the handover undone.
+        if (config.manager != address(0)) {
+            if (config.manager == setupManager) revert ManagerIsDeployer();
+            locker.nominateManager(config.manager);
+        }
         _setupMigration(core, config);
-        _setupPools(core, locker, config.marketPrice);
+        _setupPools(core, locker, config);
         core.launch();
         // Genesis liquidity comes straight from Core's inventory; the deployer supplies nothing.
         if (config.fundInitialLiquidity) {
             if (core.initialLiquidityTarget() != 0) {
                 locker.fundInitialLiquidity(0, type(uint256).max);
             }
-        }
-        // The deployer only sets up; a separate manager takes over once it accepts.
-        if (config.manager != address(0)) {
-            if (config.manager == setupManager) revert ManagerIsDeployer();
-            locker.nominateManager(config.manager);
         }
         vm.stopBroadcast();
         console2.log("ECONOMICS", address(core.economics()));
@@ -88,6 +98,7 @@ contract DeploySzr is Script {
         config.poolManager = vm.envAddress("POOL_MANAGER");
         config.teamBeneficiary = vm.envAddress("TEAM_BENEFICIARY");
         config.manager = vm.envAddress("MANAGER");
+        if (config.manager == address(0)) revert MissingManager();
         config.legacyToken =
             vm.envOr("LEGACY_SZR", address(0xbeD7c1660a01dbEEe225bd893ac31727a91A5773));
         config.marketPrice = vm.envOr("INITIAL_MARKET_PRICE", uint256(507e9));
@@ -99,19 +110,24 @@ contract DeploySzr is Script {
             vm.envOr("INITIAL_LIQUIDITY_ALLOCATION", uint256(25_000_000e18));
         config.auction = SzrCore.AuctionConfig(
             vm.envOr("AUCTION_OPENING_WAD", config.marketPrice * 2),
-            vm.envOr("AUCTION_FLOOR_WAD", uint256(1)),
+            // The sale never goes below where the pool starts, even while reserves are small.
+            vm.envOr("AUCTION_FLOOR_WAD", config.marketPrice),
             vm.envOr("AUCTION_BUFFER", uint256(20_000e18))
         );
         config.fundInitialLiquidity = vm.envOr("FUND_INITIAL_LIQUIDITY", true);
+        config.poolFee = uint24(vm.envOr("POOL_FEE", uint256(10_000)));
+        config.tickSpacing = int24(int256(vm.envOr("POOL_TICK_SPACING", uint256(200))));
     }
 
     function _setupMigration(SzrCore core, Config memory config) internal {
         if (config.launchAllocation == 0) return;
         ILegacySzrHook hook = ILegacySzrHook(ILegacySzrToken(config.legacyToken).hook());
-        // Genesis liquidity must not start below the highest NAV migration can reach, or it
-        // would be bought and redeemed against reserves at a profit. That NAV is what one old
-        // SZR recovers now, diluted by the genesis tokens, with the whole allocation migrated.
-        uint256 recovered = hook.quoteSellExactIn(1e18).netWethOut * config.launchAllocation;
+        // Genesis liquidity must not start below the NAV that floor-price migration leads to,
+        // or it would be bought and redeemed against reserves at a profit. That NAV is the old
+        // hook's floor price, diluted by the genesis tokens, with the whole allocation
+        // migrated. The floor price is used, not a live sell quote: a quote moves with whatever
+        // WETH sits in the old hook's band, so anyone can shift it up or down for a moment.
+        uint256 recovered = ILegacyFloor(address(hook)).floorPrice() * config.launchAllocation;
         uint256 claims = config.launchAllocation + config.initialLiquidityTokens;
         if (config.marketPrice * claims < recovered) revert InitialPriceBelowNav();
         SzrMigration migrator = new SzrMigration(core, config.legacyToken, hook);
@@ -124,30 +140,40 @@ contract DeploySzr is Script {
         console2.log("INITIAL_LIQUIDITY_TARGET", config.initialLiquidityTokens);
     }
 
-    function _setupPools(SzrCore core, Liquidity locker, uint256 marketPrice) internal {
-        Liquidity.PoolConfig memory config = _config(core, marketPrice);
+    function _setupPools(SzrCore core, Liquidity locker, Config memory settings) internal {
+        Liquidity.PoolConfig memory config = _config(core, settings);
         FeeCollector.AssetConfig memory unused;
-        locker.addPool(config, unused);
-        if (core.initialLiquidityTarget() == 0) return;
+        if (core.initialLiquidityTarget() == 0) {
+            locker.addPool(config, unused);
+            return;
+        }
+        // Both registrations in one transaction: the first creates the pool, and nobody can
+        // move its price before the genesis range is registered against it.
+        bytes[] memory calls = new bytes[](2);
+        calls[0] = abi.encodeCall(locker.addPool, (config, unused));
         _initialRange(core, config);
-        locker.setInitialPool(config, unused);
+        calls[1] = abi.encodeCall(locker.setInitialPool, (config, unused));
+        locker.multicall(calls);
     }
 
-    function _config(SzrCore core, uint256 price)
+    function _config(SzrCore core, Config memory settings)
         internal
         view
         returns (Liquidity.PoolConfig memory config)
     {
+        uint256 price = settings.marketPrice;
+        uint24 fee = settings.poolFee == 0 ? 10_000 : settings.poolFee;
+        int24 spacing = settings.tickSpacing == 0 ? int24(200) : settings.tickSpacing;
         bool first = address(core.token()) < core.backingAsset();
         uint256 ratio = first
             ? FixedPointMathLib.fullMulDiv(price, 1 << 192, 1e18)
             : FixedPointMathLib.fullMulDiv(1e18, 1 << 192, price);
         config = Liquidity.PoolConfig({
             partner: core.backingAsset(),
-            feePips: 10_000,
-            tickSpacing: 200,
-            tickLower: TickMath.minUsableTick(200),
-            tickUpper: TickMath.maxUsableTick(200),
+            feePips: fee,
+            tickSpacing: spacing,
+            tickLower: TickMath.minUsableTick(spacing),
+            tickUpper: TickMath.maxUsableTick(spacing),
             initialSqrtPriceX96: SafeCastLib.toUint160(FixedPointMathLib.sqrt(ratio)),
             hooks: IHooks(address(0))
         });

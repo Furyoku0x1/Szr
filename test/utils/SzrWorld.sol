@@ -66,6 +66,7 @@ abstract contract SzrWorld is Test {
         SzrMigration migrator = _legacyMigration();
         core.launch();
         migrator.migrate(initialSupply, 0, block.timestamp);
+        core.closeMigration(); // migration never ends by filling up; the manager closes it
         _provideMarketLiquidity();
     }
 
@@ -89,7 +90,7 @@ abstract contract SzrWorld is Test {
         manager.initialize(key, uint160(1 << 96));
         backing.mint(address(hook), initialSupply * 1_000 / 1e18);
         migrator = new SzrMigration(core, oldToken, ILegacySzrHook(address(hook)));
-        core.configureMigration(address(migrator), initialSupply, 0);
+        core.configureMigration(address(migrator), initialSupply + 1, 0);
         hook.token().mint(address(this), initialSupply);
         hook.token().approve(address(migrator), initialSupply);
     }
