@@ -178,7 +178,7 @@ contract AuditFindingsTest is InitialLiquidityTest {
         config.bootstrapNAV = 1e12;
         config.launchAllocation = TOTAL;
         config.initialLiquidityTokens = INITIAL;
-        config.auction = SzrCore.AuctionConfig(8e12, 1, 20_000e18);
+        config.auction = SzrCore.AuctionConfig(8e12, 1, 200_000e18);
         DeploySzr deployment = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr"));
 
         uint256 snapshot = vm.snapshotState();

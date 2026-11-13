@@ -64,7 +64,7 @@ contract SzrForkTest is Test {
         config.bootstrapNAV = 1e12;
         config.launchAllocation = 350_000_000e18;
         config.initialLiquidityTokens = INITIAL;
-        config.auction = SzrCore.AuctionConfig(1014e9, 1, 20_000e18);
+        config.auction = SzrCore.AuctionConfig(1014e9, 1, 200_000e18);
     }
 
     /// Runs the real deploy script; genesis liquidity comes from Core, not the deployer.

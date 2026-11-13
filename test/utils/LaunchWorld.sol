@@ -61,7 +61,7 @@ abstract contract LaunchWorld is Test {
         config.bootstrapNAV = 1e12;
         config.launchAllocation = 350_000_000e18;
         config.initialLiquidityTokens = GENESIS;
-        config.auction = SzrCore.AuctionConfig(PRICE * 2, 1, 20_000e18);
+        config.auction = SzrCore.AuctionConfig(PRICE * 2, 1, 200_000e18);
         config.fundInitialLiquidity = fundGenesis;
         DeploySzr deployment = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr"));
         (core, jar, locker) = deployment.run(config);

@@ -84,7 +84,10 @@ rounding into extra release or discard unspent allowance. Credit retains sub-tok
 release balance equals cumulative scheduled release minus total auction purchases. Pricing depth
 uses the smaller of that balance and actual inventory, plus the virtual buffer; the buffer does not
 limit the quantity of released tokens available to buy.
-These numerical values are approved **testing defaults**, not final launch calibration.
+These are the launch values, confirmed on 2026-11-13. The sale buffer is 200,000 SZR: in
+90-day simulations it raised 0.2-4.3% more WETH than 20,000 because more tokens sold close to
+the market price, while a much larger buffer (5,000,000) sold well below market when demand
+was strong.
 
 ## Legacy SZR migration
 

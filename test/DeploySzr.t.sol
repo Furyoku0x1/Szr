@@ -21,6 +21,8 @@ contract DeploySzrTest is Test {
         vm.setEnv("MANAGER", vm.toString(address(0x7EA)));
         vm.setEnv("BOOTSTRAP_NAV", "1000000000000");
         vm.setEnv("INITIAL_MARKET_PRICE", "4000000000000");
+        // Pinned so the test does not pick up a real opening price from a loaded .env.
+        vm.setEnv("AUCTION_OPENING_WAD", "8000000000000");
         DeploySzr deployment = new DeploySzr();
         // A zero manager, which is what a blank .env gives, must stop the script.
         vm.setEnv("MANAGER", vm.toString(address(0)));

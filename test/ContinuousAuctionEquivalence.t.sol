@@ -46,7 +46,7 @@ contract ContinuousAuctionEquivalenceTest is Test {
     using ContinuousAuction for ContinuousAuction.State;
 
     uint256 internal constant DURATION = 2 days;
-    uint256 internal constant FULL_DEPTH = 1_000_020_000e18; // total supply plus sale buffer
+    uint256 internal constant FULL_DEPTH = 1_000_200_000e18; // total supply plus sale buffer
     OriginalCurve internal original = new OriginalCurve();
     uint256 internal entropy;
     uint256[4] internal compared; // steps of each kind that ran in both libraries and matched

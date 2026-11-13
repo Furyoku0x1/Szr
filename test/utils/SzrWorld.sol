@@ -51,7 +51,7 @@ abstract contract SzrWorld is Test {
                     address(backing),
                     uint256(1e12),
                     address(this),
-                    SzrCore.AuctionConfig(4e12, 1, 20_000e18)
+                    SzrCore.AuctionConfig(4e12, 1, 200_000e18)
                 )
             )
         );

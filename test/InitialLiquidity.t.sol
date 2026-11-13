@@ -63,7 +63,7 @@ contract InitialLiquidityTest is Test {
         config.bootstrapNAV = 1e12;
         config.launchAllocation = TOTAL;
         config.initialLiquidityTokens = INITIAL;
-        config.auction = SzrCore.AuctionConfig(8e12, 1, 20_000e18);
+        config.auction = SzrCore.AuctionConfig(8e12, 1, 200_000e18);
     }
 
     /// The pool is buy-only until someone has bought, because genesis starts as SZR only.

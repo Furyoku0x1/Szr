@@ -112,7 +112,7 @@ contract DeploySzr is Script {
             vm.envOr("AUCTION_OPENING_WAD", config.marketPrice * 2),
             // The sale never goes below where the pool starts, even while reserves are small.
             vm.envOr("AUCTION_FLOOR_WAD", config.marketPrice),
-            vm.envOr("AUCTION_BUFFER", uint256(20_000e18))
+            vm.envOr("AUCTION_BUFFER", uint256(200_000e18))
         );
         config.fundInitialLiquidity = vm.envOr("FUND_INITIAL_LIQUIDITY", true);
         config.poolFee = uint24(vm.envOr("POOL_FEE", uint256(10_000)));

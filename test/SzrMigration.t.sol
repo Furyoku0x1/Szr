@@ -38,7 +38,7 @@ contract SzrMigrationTest is Test {
                     address(backing),
                     uint256(1e12),
                     address(this),
-                    SzrCore.AuctionConfig(4e12, 1, 20_000e18)
+                    SzrCore.AuctionConfig(4e12, 1, 200_000e18)
                 )
             )
         );
@@ -302,7 +302,7 @@ contract SzrMigrationTest is Test {
                     address(backing),
                     uint256(1e12),
                     address(this),
-                    SzrCore.AuctionConfig(4e12, 1, 20_000e18)
+                    SzrCore.AuctionConfig(4e12, 1, 200_000e18)
                 )
             )
         );
@@ -431,7 +431,7 @@ contract SzrMigrationTest is Test {
         config.bootstrapNAV = 1e12;
         config.launchAllocation = ALLOCATION;
         config.initialLiquidityTokens = 0;
-        config.auction = SzrCore.AuctionConfig(8e12, 1, 20_000e18);
+        config.auction = SzrCore.AuctionConfig(8e12, 1, 200_000e18);
         DeploySzr deployment = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr"));
         (SzrCore deployed,,) = deployment.run(config);
         SzrMigration migration = SzrMigration(deployed.migration());
@@ -535,7 +535,7 @@ contract SzrMigrationTest is Test {
                     address(backing),
                     uint256(1e12),
                     address(this),
-                    SzrCore.AuctionConfig(4e12, 1, 20_000e18)
+                    SzrCore.AuctionConfig(4e12, 1, 200_000e18)
                 )
             )
         );
