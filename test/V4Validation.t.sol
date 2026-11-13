@@ -42,7 +42,7 @@ contract V4ValidationTest is SzrWorld {
         locker.addPool(config, unused);
     }
 
-    function testFullRangeSpacingAndFeeBoundsAreEnforced() public {
+    function testRangeSpacingAndFeeBoundsAreEnforced() public {
         Liquidity.PoolConfig memory config = _config();
         FeeCollector.AssetConfig memory unused;
         config.tickSpacing = 0;
@@ -53,7 +53,7 @@ contract V4ValidationTest is SzrWorld {
         vm.expectRevert(Liquidity.InvalidRange.selector);
         locker.addPool(config, unused);
         config = _config();
-        config.tickLower += config.tickSpacing;
+        config.tickLower = config.tickUpper;
         vm.expectRevert(Liquidity.InvalidRange.selector);
         locker.addPool(config, unused);
         config = _config();

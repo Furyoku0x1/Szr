@@ -245,7 +245,7 @@ contract Liquidity is ReentrancyGuard, Multicallable, IUnlockCallback {
             if (address(config.hooks).code.length == 0) revert InvalidPool();
         }
         _validateFee(config.feePips);
-        _validateRange(config, id == INITIAL_POSITION);
+        _validateRange(config);
         bool first = token < config.partner;
         PoolKey memory pool = _poolKey(config, first);
         bytes32 identity =
@@ -281,7 +281,11 @@ contract Liquidity is ReentrancyGuard, Multicallable, IUnlockCallback {
         if (fee > 100_000) revert InvalidPool();
     }
 
-    function _validateRange(PoolConfig calldata config, bool initialOnly) internal pure {
+    /// @dev Ranges are not forced onto the extreme usable ticks. v4 caps the liquidity that
+    /// may reference one tick, and at the extremes filling that cap costs dust, which would
+    /// let anyone lock the protocol out of its own range. The manager chooses wide ranges
+    /// whose ends cannot be filled cheaply.
+    function _validateRange(PoolConfig calldata config) internal pure {
         if (config.tickSpacing <= 0) revert InvalidRange();
         if (config.tickSpacing > type(int16).max) revert InvalidRange();
         if (config.tickLower >= config.tickUpper) revert InvalidRange();
@@ -289,17 +293,6 @@ contract Liquidity is ReentrancyGuard, Multicallable, IUnlockCallback {
         if (config.tickUpper > TickMath.MAX_TICK) revert InvalidRange();
         if (config.tickLower % config.tickSpacing != 0) revert InvalidRange();
         if (config.tickUpper % config.tickSpacing != 0) revert InvalidRange();
-        if (initialOnly) return;
-        _validateFullRange(config);
-    }
-
-    function _validateFullRange(PoolConfig calldata config) internal pure {
-        if (config.tickLower != TickMath.minUsableTick(config.tickSpacing)) {
-            revert InvalidRange();
-        }
-        if (config.tickUpper != TickMath.maxUsableTick(config.tickSpacing)) {
-            revert InvalidRange();
-        }
     }
 
     function _validateInitialPrice(PoolConfig calldata config, bool first) internal pure {

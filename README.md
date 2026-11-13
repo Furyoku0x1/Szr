@@ -198,11 +198,12 @@ checking the deployer's own settings.
 ## Native v4 liquidity management
 
 `Liquidity` pins one PoolManager. It owns every position directly; pool keys, ticks, salts, and
-liquidity balances are stored internally. No per-pool contract is deployed. Full-range pools can be
+liquidity balances are stored internally. No per-pool contract is deployed. Wide-range pools can be
 registered with reviewed hooks. A separate one-sided `INITIAL_POSITION()` holds the genesis
 liquidity that Core releases from its own inventory.
 
-- `addPool(config, feeConfig)`: register a full-range SZR/partner position and its fee asset.
+- `addPool(config, feeConfig)`: register a wide-range SZR/partner position and its fee asset.
+  Do not end a range on the extreme usable ticks; see "Range ends" below.
 - `registerRoute(poolKey)`: put an existing pool, such as WETH/partner, on the list of pools the
   manager may swap through.
 - `swapPrincipal(poolKey, zeroForOne, amount, minimumOut, priceLimit, deadline)`: acquire SZR or
@@ -218,7 +219,7 @@ liquidity that Core releases from its own inventory.
   deployment to turn idle WETH into SZR/partner liquidity. Each inner call keeps its own access
   check, and a failure in any step undoes the whole batch.
 
-Use ordinary pool IDs for full-range positions and `INITIAL_POSITION()` for the launch position.
+Use ordinary pool IDs for wide-range positions and `INITIAL_POSITION()` for the launch position.
 `fundInitialLiquidity(minimumUnits, deadline)` funds the configured target once, entirely from
 Core's public inventory through `SzrCore.releaseInitialLiquidity()`, which only Liquidity can call.
 Fees are collected through `collect(id)` for either position. The initial position is permanent:
@@ -238,13 +239,30 @@ be redeployed or swapped. SZR and positions can never be sent. A destination mus
 announced with `announceDestination` and becomes usable only after `DESTINATION_DELAY` (7 days);
 `revokeDestination` takes effect immediately.
 
+**Range ends.** Uniswap v4 caps how much liquidity may reference a single tick. Whoever fills
+that cap at a tick locks everyone else out of any range ending there, and at the extreme usable
+ticks filling it costs about 0.00002 of one token. A range ending there could be locked by
+anyone: the position could still be withdrawn, but nothing more could be added. `Liquidity`
+therefore accepts any aligned range, and the manager must choose ends that cannot be filled
+cheaply. The script's two positions end about 163,000 WETH per SZR on the side where SZR is
+expensive (above the sale's own price ceiling) and about 1e-13 WETH per SZR on the side where
+it is cheap. Filling the cap at any of their ends takes more than ten times all SZR in
+existence and more than a million WETH, at tick spacing 200 and at 60. The cost falls with the
+square of the tick spacing and depends on token decimals, so work it out again for every new
+pool: for a one-spacing range next to the end tick, compute both token amounts for
+`Pool.tickSpacingToMaxLiquidityPerTick(spacing)` of liquidity, as
+`testFix_ScriptRangeEndsCannotBeFilledToTheTickCap` does. The genesis range can still never be
+registered a second time as an ordinary position. If a range is ever locked, the way out
+is to register a new range and move the liquidity into it; registering in a live pool needs
+its exact current price, so send that transaction straight after reading it.
+
 **Principal only goes into, or trades through, registered pools.** Deployments and moves can
 only target positions added with `addPool`, and every swap must go through a pool in
 `poolRegistered`: one added with `addPool` or put there with `registerRoute`. There is no waiting
 period, so a newly added pool can be funded straight away.
 
-**The manager is still a trusted role.** It chooses which pools and hooks to register, how to
-allocate, and the minimum output of each trade, so a malicious manager could register a hostile
+**The manager is still a trusted role.** It chooses which pools, hooks and price ranges to
+register, how to allocate, and the minimum output of each trade, so a malicious manager could register a hostile
 pool and transfer that value away. It also sets each partner token's fee-auction
 floor, so it could price that token's fee income cheaply. Registration leaves a public record (`PoolAdded`,
 `RouteRegistered`); it is not a safeguard by itself. Floor reserves in Core and the permanent
@@ -331,7 +349,7 @@ Copy `.env.example` to `.env` and set the required chain ID, WETH, PoolManager a
 `350000000000000000000000000` (the full 1:1 migration cap in wei).
 `INITIAL_LIQUIDITY_ALLOCATION` defaults to `25000000000000000000000000`; it is only the funding
 target exposed as `initialLiquidityTarget()`. It neither increases nor reduces `migrationAllocation()`.
-The script registers full-range and empty one-sided positions in one hook-less SZR/WETH pool with
+The script registers wide-range and empty one-sided positions in one hook-less SZR/WETH pool with
 a 1% swap fee and tick spacing 200, and launches. By default
 (`FUND_INITIAL_LIQUIDITY=true`) the script then calls `fundInitialLiquidity`, so the 25M genesis
 tokens from Core's inventory are the only active supply when migration opens. The deployer needs
@@ -340,7 +358,7 @@ is still open.
 For a deliberately allocation-free local rehearsal, explicitly set `MIGRATION_ALLOCATION=0`.
 For holder-migration-only tests, set `INITIAL_LIQUIDITY_ALLOCATION=0`. WETH
 must be an ordinary 18-decimal ERC-20. The script checks chain ID and deployed asset/PoolManager code,
-binds all modules, registers the full-range and initial one-sided v4 positions, and launches once. The signer
+binds all modules, registers the wide-range and initial one-sided v4 positions, and launches once. The signer
 is manager only for setup: `MANAGER` is required, must be a different address, and takes over
 when it calls `acceptManager()`. After that the deployer has no authority anywhere.
 
@@ -373,6 +391,13 @@ These are accepted operating rules, not enforced in code.
   whole allowance migrated; check it again before deploying. Migrators who recover above the
   floor (see the rehearsal notes) can lift NAV past this price, in which case the lowest genesis
   tokens are bought and redeemed: a bounded loss to the pool position, not to holders.
+- The genesis position is finite: it runs from `INITIAL_MARKET_PRICE` up to about 163,000 WETH
+  per SZR, and its first selling price is one tick-spacing step above `INITIAL_MARKET_PRICE`
+  (about 0.000000515 WETH for the default), so the sale's absolute floor sits about 1.5% under it.
+- Anyone can raise the old hook's floor price by gifting it WETH. If that happens before
+  deployment the script stops with `InitialPriceBelowNav`; raise `INITIAL_MARKET_PRICE` and
+  run it again. After deployment it only makes the lowest genesis tokens worth buying and
+  redeeming, a loss to the pool position far smaller than the gift.
 - The genesis position must be registered before launch and funded before migration can close;
   the contracts enforce both. The script registers the pool and the genesis range in one
   transaction and funds it right after launch. If `FUND_INITIAL_LIQUIDITY=false`, or that funding
@@ -383,8 +408,9 @@ These are accepted operating rules, not enforced in code.
 - Broadcast with `--slow`, so each transaction is sent only after the previous one has
   succeeded, and check `pendingManager`, `initialLiquidityFunded` and `launched` afterwards.
 - If someone creates the SZR/WETH pool first at another price, the registration reverts and
-  nothing is left half-launched. Set `POOL_FEE` or `POOL_TICK_SPACING` (defaults 10000 and 200)
-  to deploy against a different pool instead of racing them.
+  nothing is left half-launched. Set `POOL_FEE` (default 10000) to deploy against a different
+  pool instead of racing them, and keep `POOL_TICK_SPACING` at 200: the script refuses a
+  spacing under 60, because narrow spacings make range ends cheap to fill (see "Range ends").
 - If a griefer both moves the empty genesis pool's price and leaves a little liquidity of their
   own there, restoring it needs someone to sell real SZR into that liquidity (above the genesis
   price, so at a profit). Have a migrated wallet ready to do that and call

@@ -45,6 +45,17 @@ contract DeploySzr is Script {
     error ManagerIsDeployer();
     error MissingManager();
     error InitialPriceBelowNav();
+    error UnsafeTickSpacing();
+
+    /// @dev Range ends, as distances from tick 0. v4 caps how much liquidity may reference one
+    /// tick, and at the extreme usable ticks filling that cap costs dust, which would let
+    /// anyone lock the protocol out of its own positions. FAR is the end where SZR is
+    /// expensive (about 163,000 WETH per SZR, above the sale's own ceiling): filling the cap
+    /// there takes more SZR than exists. DEEP is the end where SZR is nearly worthless (about
+    /// 1e-13 WETH per SZR): filling it takes over 100M WETH. Those figures are for tick
+    /// spacing 200 and fall with the square of the spacing, so spacings under 60 are refused.
+    int24 internal constant FAR_TICK = 120_000;
+    int24 internal constant DEEP_TICK = 300_000;
 
     function run() external returns (SzrCore core, FeeCollector jar, Liquidity locker) {
         return run(_readConfig());
@@ -165,6 +176,9 @@ contract DeploySzr is Script {
         uint24 fee = settings.poolFee == 0 ? 10_000 : settings.poolFee;
         int24 spacing = settings.tickSpacing == 0 ? int24(200) : settings.tickSpacing;
         bool first = address(core.token()) < core.backingAsset();
+        if (spacing < 60) revert UnsafeTickSpacing();
+        int24 far = FAR_TICK / spacing * spacing;
+        int24 deep = DEEP_TICK / spacing * spacing;
         uint256 ratio = first
             ? FixedPointMathLib.fullMulDiv(price, 1 << 192, 1e18)
             : FixedPointMathLib.fullMulDiv(1e18, 1 << 192, price);
@@ -172,8 +186,8 @@ contract DeploySzr is Script {
             partner: core.backingAsset(),
             feePips: fee,
             tickSpacing: spacing,
-            tickLower: TickMath.minUsableTick(spacing),
-            tickUpper: TickMath.maxUsableTick(spacing),
+            tickLower: first ? -deep : -far,
+            tickUpper: first ? far : deep,
             initialSqrtPriceX96: SafeCastLib.toUint160(FixedPointMathLib.sqrt(ratio)),
             hooks: IHooks(address(0))
         });

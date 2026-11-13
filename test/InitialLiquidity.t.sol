@@ -133,6 +133,15 @@ contract InitialLiquidityTest is Test {
         assertEq(next.auctionsOpenAt(), 0);
     }
 
+    function testDeployScriptRefusesATickSpacingWhereRangeEndsAreCheapToFill() public {
+        DeploySzr.Config memory config = _deployConfig();
+        config.poolFee = 500;
+        config.tickSpacing = 10;
+        DeploySzr deployment = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr"));
+        vm.expectRevert(DeploySzr.UnsafeTickSpacing.selector);
+        deployment.run(config);
+    }
+
     function testDeployScriptRejectsTheDeployerAsManager() public {
         DeploySzr.Config memory config = _deployConfig();
         config.manager = core.initializer();

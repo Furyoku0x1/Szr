@@ -11,6 +11,8 @@ import { MockHooks } from "v4-core/test/MockHooks.sol";
 import { PoolModifyLiquidityTest } from "v4-core/test/PoolModifyLiquidityTest.sol";
 import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
+import { Pool } from "v4-core/libraries/Pool.sol";
+import { StateLibrary } from "v4-core/libraries/StateLibrary.sol";
 import { Hooks } from "v4-core/libraries/Hooks.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
@@ -547,5 +549,44 @@ contract MetaLiquidityTest is SzrWorld {
             ""
         );
         vm.stopPrank();
+    }
+
+    /// Why ranges should not end on the extreme usable ticks: v4 caps the liquidity that may
+    /// reference one tick, and there the whole cap costs a stranger about 0.00002 WETH. This
+    /// fixture's position ends on those ticks, and afterwards it can take no more liquidity.
+    function testPoC_ExtremeTickRangesCanBeLockedOutForDust() public {
+        PoolKey memory pool = locker.key(0);
+        PoolModifyLiquidityTest provider = new PoolModifyLiquidityTest(manager);
+        address stranger = address(0x57A6);
+        backing.mint(stranger, 1e18);
+        uint256 units = locker.liquidityHeld(0);
+        locker.withdrawPrincipal(0, units / 2, 0, 0, block.timestamp);
+
+        bool wethFirst = Currency.unwrap(pool.currency0) == address(backing);
+        int24 lower = wethFirst
+            ? TickMath.maxUsableTick(pool.tickSpacing) - pool.tickSpacing
+            : TickMath.minUsableTick(pool.tickSpacing);
+        int24 end = wethFirst ? lower + pool.tickSpacing : lower;
+        (uint128 used,) = StateLibrary.getTickLiquidity(manager, pool.toId(), end);
+        uint128 room = Pool.tickSpacingToMaxLiquidityPerTick(pool.tickSpacing) - used;
+        vm.startPrank(stranger);
+        backing.approve(address(provider), type(uint256).max);
+        provider.modifyLiquidity(
+            pool,
+            IPoolManager.ModifyLiquidityParams(
+                lower, lower + pool.tickSpacing, int256(uint256(room)), 0
+            ),
+            ""
+        );
+        vm.stopPrank();
+        assertLt(1e18 - backing.balanceOf(stranger), 1e15); // the lock cost under 0.001 WETH
+
+        Liquidity.Bounds memory open =
+            Liquidity.Bounds(type(uint256).max, type(uint256).max, block.timestamp);
+        vm.expectRevert(abi.encodeWithSelector(Pool.TickLiquidityOverflow.selector, end));
+        locker.deployPrincipal(0, 1, open); // nothing can go back in
+        locker.withdrawPrincipal(0, units / 4, 0, 0, block.timestamp); // getting out still works
+        locker.collect(0);
+        _assertCash();
     }
 }

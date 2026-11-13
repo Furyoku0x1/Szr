@@ -3,11 +3,23 @@ pragma solidity 0.8.30;
 
 import { SzrCore } from "../src/SzrCore.sol";
 import { Liquidity } from "../src/Liquidity.sol";
+import { FeeCollector } from "../src/FeeCollector.sol";
 import { SzrMigration } from "../src/SzrMigration.sol";
 import { LaunchWorld } from "./utils/LaunchWorld.sol";
+import { PoolModifyLiquidityTest } from "v4-core/test/PoolModifyLiquidityTest.sol";
+import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
+import { Pool } from "v4-core/libraries/Pool.sol";
+import { StateLibrary } from "v4-core/libraries/StateLibrary.sol";
+import { TickMath } from "v4-core/libraries/TickMath.sol";
+import { SqrtPriceMath } from "v4-core/libraries/SqrtPriceMath.sol";
+import { PoolKey } from "v4-core/types/PoolKey.sol";
+import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
+import { Currency } from "v4-core/types/Currency.sol";
 
 /// @notice Edge cases around the launch sequence that the lifecycle run does not reach.
 contract LaunchEdgesTest is LaunchWorld {
+    using StateLibrary for IPoolManager;
+
     /// Migration closed before anyone migrated: 25M live tokens, no reserves at all.
     function testSaleAndLoansWorkFromZeroBacking() public {
         _world(address(0x1000));
@@ -189,5 +201,114 @@ contract LaunchEdgesTest is LaunchWorld {
         vm.prank(carol);
         core.buy(1_000_000e18, payment, block.timestamp);
         _books();
+    }
+
+    /// v4 caps the liquidity that may reference one tick, and whoever fills that cap locks
+    /// everyone else out of ranges ending there. At the extreme usable ticks that costs dust.
+    /// The script's range ends sit where it costs more SZR than exists or over a million
+    /// WETH, for the genesis position and the wide position, whichever way the tokens sort.
+    function testFix_ScriptRangeEndsCannotBeFilledToTheTickCap() public {
+        _capCosts(address(0x1000));
+    }
+
+    function testFix_ScriptRangeEndsCannotBeFilledToTheTickCapOtherOrdering() public {
+        _capCosts(address(uint160(type(uint160).max - 4096)));
+    }
+
+    function _capCosts(address asset) internal {
+        _world(asset, false);
+        Liquidity.Position memory genesis = locker.position(locker.INITIAL_POSITION());
+        Liquidity.Position memory wide = locker.position(0);
+        int24[4] memory ends =
+            [genesis.tickLower, genesis.tickUpper, wide.tickLower, wide.tickUpper];
+        // Checked at the pool's own spacing and at 60, the narrowest the script accepts.
+        for (uint256 index; index < 4; index++) {
+            _assertCostly(genesis.key, ends[index], genesis.key.tickSpacing);
+            _assertCostly(genesis.key, ends[index], 60);
+        }
+        // Someone holding 100M SZR puts nearly all of it at the genesis range's far end, and
+        // funding still goes through.
+        PoolModifyLiquidityTest provider = new PoolModifyLiquidityTest(manager);
+        bool szrFirst = Currency.unwrap(genesis.key.currency0) == address(szr);
+        int24 far = szrFirst ? genesis.tickUpper : genesis.tickLower;
+        int24 lower = szrFirst ? far : far - genesis.key.tickSpacing;
+        uint160 a = TickMath.getSqrtPriceAtTick(lower);
+        uint160 b = TickMath.getSqrtPriceAtTick(lower + genesis.key.tickSpacing);
+        uint256 perUnit = szrFirst
+            ? SqrtPriceMath.getAmount0Delta(a, b, 1e18, true)
+            : SqrtPriceMath.getAmount1Delta(a, b, 1e18, true);
+        vm.startPrank(alice);
+        migrator.migrate(100_000_000e18, 0, block.timestamp);
+        szr.approve(address(provider), type(uint256).max);
+        provider.modifyLiquidity(
+            genesis.key,
+            IPoolManager.ModifyLiquidityParams(
+                lower,
+                lower + genesis.key.tickSpacing,
+                int256(99_000_000e18 * 1e18 / perUnit),
+                0
+            ),
+            ""
+        );
+        vm.stopPrank();
+        assertLt(szr.balanceOf(alice), 2_000_000e18);
+        locker.fundInitialLiquidity(0, block.timestamp);
+        assertTrue(core.initialLiquidityReleased());
+        _books();
+    }
+
+    /// Filling the cap at `tick` means holding a one-spacing position on either side of it.
+    /// Wherever the price sits, that takes one token, the other, or a mix; so both pure costs
+    /// must be out of reach: more than ten times all SZR, and more than a million WETH.
+    function _assertCostly(PoolKey memory pool, int24 tick, int24 spacing) internal view {
+        uint128 cap = Pool.tickSpacingToMaxLiquidityPerTick(spacing);
+        bool szrFirst = Currency.unwrap(pool.currency0) == address(szr);
+        for (int24 lower = tick - spacing; lower <= tick; lower += spacing) {
+            uint160 a = TickMath.getSqrtPriceAtTick(lower);
+            uint160 b = TickMath.getSqrtPriceAtTick(lower + spacing);
+            uint256 amount0 = SqrtPriceMath.getAmount0Delta(a, b, cap, true);
+            uint256 amount1 = SqrtPriceMath.getAmount1Delta(a, b, cap, true);
+            assertGt(szrFirst ? amount0 : amount1, 10 * szr.totalSupply());
+            assertGt(szrFirst ? amount1 : amount0, 1_000_000e18);
+        }
+    }
+
+    /// The genesis range cannot be registered a second time as an ordinary position, so no
+    /// manager-controlled id can ever point at the permanent genesis liquidity.
+    function testGenesisRangeCannotBeRegisteredAsAnOrdinaryPosition() public {
+        _duplicate(address(0x1000));
+    }
+
+    function testGenesisRangeCannotBeRegisteredAsAnOrdinaryPositionOtherOrdering() public {
+        _duplicate(address(uint160(type(uint160).max - 4096)));
+    }
+
+    function _duplicate(address asset) internal {
+        _world(asset);
+        Liquidity.Position memory genesis = locker.position(locker.INITIAL_POSITION());
+        (uint160 current,,,) = manager.getSlot0(PoolIdLibrary.toId(genesis.key));
+        Liquidity.PoolConfig memory config = Liquidity.PoolConfig(
+            address(backing),
+            genesis.key.fee,
+            genesis.key.tickSpacing,
+            genesis.tickLower,
+            genesis.tickUpper,
+            current,
+            genesis.key.hooks
+        );
+        FeeCollector.AssetConfig memory unused;
+        vm.prank(team);
+        vm.expectRevert(Liquidity.DuplicatePosition.selector);
+        locker.addPool(config, unused);
+        // A different range in the same pool is its own position and holds nothing.
+        config.tickLower -= genesis.key.tickSpacing;
+        config.tickUpper += genesis.key.tickSpacing;
+        vm.prank(team);
+        uint256 id = locker.addPool(config, unused);
+        assertEq(locker.liquidityHeld(id), 0);
+        vm.prank(team);
+        vm.expectRevert();
+        locker.withdrawPrincipal(id, 1, 0, 0, block.timestamp);
+        assertGt(locker.liquidityHeld(locker.INITIAL_POSITION()), 0);
     }
 }
