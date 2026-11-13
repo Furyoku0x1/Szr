@@ -439,7 +439,7 @@ contract SzrCore is ReentrancyGuard {
         emit InventoryRecycled(amount);
     }
 
-    /// @notice Realized WETH fees: 67% reserves, 33% immutable team beneficiary.
+    /// @notice Realized WETH fees: 67% reserves, 33% team beneficiary.
     /// Rounding dust remains in reserves. Unconverted pool tokens are not backing.
     function recognizeFees(uint256 amount) external nonReentrant live {
         if (msg.sender != feeJar) revert NotFeeJar();

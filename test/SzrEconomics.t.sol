@@ -66,6 +66,54 @@ contract SzrEconomicsTest is SzrWorld {
         _assertCash();
     }
 
+    function testBeneficiaryHandoverRequiresNominationAndAcceptance() public {
+        SzrEconomics economics = core.economics();
+        vm.prank(alice);
+        vm.expectRevert(SzrEconomics.NotBeneficiary.selector);
+        economics.nominateBeneficiary(alice);
+        vm.expectRevert(SzrEconomics.ZeroAddress.selector);
+        economics.nominateBeneficiary(address(0));
+        vm.expectRevert(SzrEconomics.InvalidBeneficiary.selector);
+        economics.nominateBeneficiary(address(this));
+
+        economics.nominateBeneficiary(alice);
+        vm.prank(alice);
+        vm.expectRevert(SzrEconomics.NotBeneficiary.selector);
+        economics.cancelBeneficiaryNomination();
+        economics.cancelBeneficiaryNomination();
+        vm.prank(alice);
+        vm.expectRevert(SzrEconomics.NotNominee.selector);
+        economics.acceptBeneficiary();
+
+        // A nomination alone moves nothing: fees still reach the current beneficiary.
+        economics.nominateBeneficiary(alice);
+        backing.mint(address(economics), 2e18);
+        uint256 teamCash = backing.balanceOf(address(this));
+        economics.claimFees();
+        assertEq(backing.balanceOf(address(this)) - teamCash, 2e18);
+        vm.prank(bob);
+        vm.expectRevert(SzrEconomics.NotNominee.selector);
+        economics.acceptBeneficiary();
+
+        vm.prank(alice);
+        economics.acceptBeneficiary();
+        assertEq(economics.beneficiary(), alice);
+        assertEq(economics.pendingBeneficiary(), address(0));
+        vm.expectRevert(SzrEconomics.NotBeneficiary.selector);
+        economics.nominateBeneficiary(bob);
+
+        uint256 reserves = core.reserveCash();
+        backing.mint(address(jar), 100e18);
+        vm.prank(address(locker));
+        jar.recordFees(address(backing), 100e18);
+        uint256 aliceCash = backing.balanceOf(alice);
+        economics.claimFees();
+        assertEq(backing.balanceOf(alice) - aliceCash, 33e18);
+        assertEq(backing.balanceOf(address(this)) - teamCash, 2e18);
+        assertEq(core.reserveCash(), reserves + 67e18);
+        _assertCash();
+    }
+
     function testLoanOpeningFeeRemainsInReserves() public {
         _acquire(alice);
         uint256 reserves = core.reserveCash();
