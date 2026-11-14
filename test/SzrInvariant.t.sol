@@ -161,6 +161,12 @@ contract SzrHandler is Test {
         core.donateBacking(amount);
     }
 
+    /// WETH sent to Core by plain transfer and folded in by a bystander.
+    function absorbStray(uint256 rawAmount) external preserveNAV {
+        backing.mint(address(core), bound(rawAmount, 1, 1e18));
+        core.absorbBacking();
+    }
+
     function donateTokens(uint256 actor, uint256 rawAmount) external preserveNAV {
         address owner = actors[actor % 3];
         uint256 held = token.balanceOf(owner);
@@ -228,7 +234,8 @@ contract SzrInvariantTest is SzrWorld {
         handler = new SzrHandler(core, locker, jar, swapper);
         locker.nominateManager(address(handler));
         handler.acceptManagement();
-        bytes4[] memory selectors = new bytes4[](14);
+        bytes4[] memory selectors = new bytes4[](15);
+        selectors[14] = handler.absorbStray.selector;
         selectors[13] = handler.donateTokens.selector;
         selectors[0] = handler.acquire.selector;
         selectors[1] = handler.borrow.selector;

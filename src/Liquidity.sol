@@ -391,7 +391,8 @@ contract Liquidity is ReentrancyGuard, Multicallable, IUnlockCallback {
     function announceDestination(address destination) external nonReentrant onlyManager {
         if (destination == address(0)) revert ZeroAddress();
         if (destination == address(this)) revert InvalidModule();
-        // WETH sent straight to Core is not counted as reserves and could not be recovered.
+        // WETH sent straight to Core is not counted as reserves until someone folds it in
+        // with `absorbBacking`, and then it is a gift to holders, not a payment.
         if (destination == address(core)) revert InvalidModule();
         uint256 readyAt = block.timestamp + DESTINATION_DELAY;
         destinationReadyAt[destination] = readyAt;

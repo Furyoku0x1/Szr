@@ -101,6 +101,63 @@ contract SzrRedemptionTest is SzrWorld {
         core.donateSzr(0);
     }
 
+    function testStrayWethIsAbsorbedIntoReservesByAnyone() public {
+        uint256 reserves = core.reserveCash();
+        uint256 nav = core.NAV();
+        vm.expectRevert(SzrCore.ZeroAmount.selector);
+        core.absorbBacking();
+        backing.mint(address(core), 5e18); // a plain transfer, counted by nothing
+        assertEq(core.reserveCash(), reserves);
+        assertEq(core.NAV(), nav);
+        uint256 team = core.economics().claimableFees();
+        uint256 callerCash = backing.balanceOf(bob);
+        vm.expectEmit(true, false, false, true, address(core));
+        emit SzrCore.BackingAbsorbed(bob, 5e18);
+        vm.prank(bob);
+        assertEq(core.absorbBacking(), 5e18);
+        assertEq(core.reserveCash(), reserves + 5e18);
+        assertGt(core.NAV(), nav);
+        // A donation to holders: nothing for the team, nothing for the caller.
+        assertEq(core.economics().claimableFees(), team);
+        assertEq(backing.balanceOf(bob), callerCash);
+        vm.expectRevert(SzrCore.ZeroAmount.selector);
+        core.absorbBacking();
+        _assertCash();
+    }
+
+    function testSzrCannotBeSentWhereItWouldBeLost() public {
+        _acquire(alice);
+        Szr token = core.token();
+        assertEq(token.core(), address(core));
+        vm.startPrank(alice);
+        vm.expectRevert(Szr.InvalidRecipient.selector);
+        token.transfer(address(0), 1e18);
+        vm.expectRevert(Szr.InvalidRecipient.selector);
+        token.transfer(address(token), 1e18);
+        vm.expectRevert(Szr.InvalidRecipient.selector);
+        token.transfer(address(core), 1e18);
+        token.approve(bob, 10e18);
+        vm.stopPrank();
+        // Someone else moving a holder's tokens to those places is refused as well.
+        vm.startPrank(bob);
+        vm.expectRevert(Szr.InvalidRecipient.selector);
+        token.transferFrom(alice, address(core), 1e18);
+        vm.expectRevert(Szr.InvalidRecipient.selector);
+        token.transferFrom(alice, address(0), 1e18);
+        vm.expectRevert(Szr.InvalidRecipient.selector);
+        token.transferFrom(alice, address(token), 1e18);
+        uint256 held = token.balanceOf(bob);
+        token.transferFrom(alice, bob, 1e18); // an ordinary transfer still works
+        assertEq(token.balanceOf(bob), held + 1e18);
+        vm.stopPrank();
+        // Core still takes tokens in by pulling them itself.
+        uint256 inventory = core.unreleasedSupply();
+        vm.prank(alice);
+        core.donateSzr(1e18);
+        assertEq(core.unreleasedSupply(), inventory + 1e18);
+        _assertCash();
+    }
+
     function testRecycleRequiresLiquidityController() public {
         _acquire(alice);
         vm.prank(alice);

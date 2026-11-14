@@ -333,6 +333,26 @@ contract SzrMigrationTest is Test {
         assertFalse(fresh.launched());
     }
 
+    /// With no holders there is nobody to donate to: the call reverts and the WETH waits. It
+    /// is then absorbed for whoever holds SZR next, which is not a protection against capture.
+    function testStrayWethWaitsWhileNobodyHoldsSzr() public {
+        vm.startPrank(alice);
+        migrator.migrate(1_000e18, 0, block.timestamp);
+        core.token().approve(address(core), type(uint256).max);
+        core.redeem(1_000e18, 0);
+        vm.stopPrank();
+        assertEq(core.activeSupply(), 0);
+        backing.mint(address(core), 10e18);
+        vm.expectRevert(SzrCore.NoActiveSupply.selector);
+        core.absorbBacking();
+        vm.prank(alice);
+        migrator.migrate(1_000e18, 0, block.timestamp);
+        uint256 reserves = core.reserveCash();
+        assertEq(core.absorbBacking(), 10e18);
+        assertEq(core.reserveCash(), reserves + 10e18);
+        assertEq(backing.balanceOf(address(core)), core.reserveCash());
+    }
+
     /// Found in the final audit: fees recognised while nobody held SZR used to sit in reserves
     /// for the first dust buyer to redeem. With no holders they now go to the team.
     function testFix_FeesRecognisedWithNoHoldersCannotBeCapturedByADustBuyer() public {

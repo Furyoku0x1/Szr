@@ -9,10 +9,10 @@ adapters, factories, per-pool rewards, or weights.
 
 | Contract | Responsibility |
 | --- | --- |
-| `Szr` | Fixed 1B-supply ERC-20. No external mint function or implicit Permit2 allowance. |
+| `Szr` | Fixed 1B-supply ERC-20. No external mint function or implicit Permit2 allowance. Refuses transfers to the zero address, to itself and to Core. |
 | `SzrCore` | Single SZR/WETH auction, reserved migration inventory, WETH reserves, redemption, and loans. |
 | `SzrMigration` | Atomic 1:1 legacy SZR exchange through its canonical v4 hook, funded by recovered WETH. |
-| `SzrEconomics` | Earned liquidity-revenue claims for the immutable team beneficiary. |
+| `SzrEconomics` | Earned liquidity-revenue claims for the team beneficiary, who can hand the claim on by nomination and acceptance. |
 | `Liquidity` | Direct PoolManager calls, all v4 positions, idle acquisition assets, swaps and reallocation. |
 | `FeeCollector` | Converts non-WETH trading fees through per-asset partial-fill auctions paid in WETH. |
 | `ContinuousAuction` | Existing constant-product pricing, fill pressure, and eligible-time price decay. |
@@ -285,8 +285,11 @@ are unsupported; v4 hook data is empty. Native ETH pools are unsupported; WETH i
    token's market rate. Fees never sell below it. `FeeCollector.updateAsset(asset, config)`
    restarts an asset's auction with a new rate, buffer and floor, as its first registration
    did: at twice the given rate, falling to the new floor.
-4. Anyone can call `SzrEconomics.claimFees()` to pay the immutable team beneficiary. It pays the
+4. Anyone can call `SzrEconomics.claimFees()` to pay the team beneficiary. It pays the
    contract's whole WETH balance, so WETH sent there by mistake goes to the beneficiary too.
+   The beneficiary can hand the claim to another address with `nominateBeneficiary`; nothing
+   changes until that address calls `acceptBeneficiary`, and fees not yet claimed at that
+   point go to the new beneficiary. Nobody else can change it.
 
 Only realized liquidity revenue is split. Principal, primary-sale funding, loan repayments, and
 returned SZR are excluded. Loan opening fees and backing donations go entirely to reserves. If WETH
@@ -325,6 +328,19 @@ Launch activates no tokens and books no reserve cash. Migration brings existing 
 WETH backing into Core, with all net recovered WETH retained as reserves. A first public auction purchase instead funds its required bootstrap backing; the
 bootstrap quote is not booked as cash by itself. Direct token transfers are not automatically recorded
 as principal, fees, or backing; use the protocol's entry points.
+
+Tokens sent to the contracts by mistake:
+
+- **SZR** cannot be transferred to the zero address, to the SZR token contract, or to Core; the
+  transfer reverts with `InvalidRecipient` and the sender keeps the tokens. Core takes SZR in
+  only by pulling it (`redeem`, `donateSzr`, loan collateral, recycled fees).
+- **WETH sent straight to Core** is counted by nothing until anyone calls
+  `SzrCore.absorbBacking()`, which adds it to reserves as a donation to whoever holds SZR at
+  that moment. It cannot be returned to the sender. While nobody holds SZR the call reverts
+  and the WETH waits for the next holders.
+- Tokens sent to `Liquidity`, `FeeCollector` or `SzrMigration` (including old SZR sent to the
+  migration contract instead of calling `migrate`), and SZR sent to `SzrEconomics`, stay
+  there and cannot be recovered.
 
 ## Build and verify
 

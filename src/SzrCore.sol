@@ -116,6 +116,7 @@ contract SzrCore is ReentrancyGuard {
         address indexed buyer, uint256 tokens, uint256 payment, uint256 backing, uint256 funding
     );
     event BackingDonated(address indexed payer, uint256 amount);
+    event BackingAbsorbed(address indexed caller, uint256 amount);
     event Redeemed(address indexed owner, uint256 tokens, uint256 backing);
     event InventoryRecycled(uint256 tokens);
     event SzrDonated(address indexed donor, uint256 tokens);
@@ -397,6 +398,19 @@ contract SzrCore is ReentrancyGuard {
         _receiveBacking(msg.sender, amount);
         reserveCash += amount;
         emit BackingDonated(msg.sender, amount);
+    }
+
+    /// @notice Counts WETH that was sent here by plain transfer as reserves. Anyone may call.
+    /// @dev Every counted WETH is in `reserveCash`, so whatever the balance holds beyond it
+    /// belongs to nobody. It becomes a donation to whoever holds SZR when this is called, and
+    /// the caller chooses that moment. With no holders there is nobody to give it to, so the
+    /// call reverts and the WETH waits for the next holders.
+    function absorbBacking() external nonReentrant live returns (uint256 amount) {
+        if (activeSupply() == 0) revert NoActiveSupply();
+        amount = SafeTransferLib.balanceOf(backingAsset, address(this)) - reserveCash;
+        if (amount == 0) revert ZeroAmount();
+        reserveCash += amount;
+        emit BackingAbsorbed(msg.sender, amount);
     }
 
     /// @notice Exit an unencumbered token claim immediately at the exact current NAV ratio.

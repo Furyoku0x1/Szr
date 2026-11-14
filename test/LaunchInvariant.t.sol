@@ -107,6 +107,13 @@ contract LaunchHandler is Test {
         core.donateBacking(bound(raw, 1, 1e18));
     }
 
+    /// WETH sent to Core by plain transfer and folded in by a bystander.
+    function absorbStray(uint256 raw) external tracked {
+        if (core.activeSupply() == 0) return; // refused by design: nobody to receive it
+        backing.mint(address(core), bound(raw, 1, 1e18));
+        core.absorbBacking();
+    }
+
     function donateSzr(uint256 actor, uint256 raw) external tracked {
         address owner = actors[actor % 3];
         uint256 held = szr.balanceOf(owner);
