@@ -257,7 +257,7 @@ contract ArbitrageMarketsTest is MarketsWorld {
         vm.expectRevert(ArbitrageHook.InvalidPool.selector);
         hook.setConnector(rival, mainPool, true);
         PoolKey memory foreign = _pair(address(coin), address(usd), 3_000, address(0xF00D));
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageHook.NotTrusted.selector);
         hook.setConnector(rival, foreign, true);
         // A hookless pool is fine for anyone.
         hook.setConnector(rival, publicPool, true);

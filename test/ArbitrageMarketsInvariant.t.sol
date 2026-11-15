@@ -7,6 +7,7 @@ import { console2 } from "forge-std/console2.sol";
 import { ArbitrageWorld } from "./utils/ArbitrageWorld.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 import { PayFirstRouter } from "./utils/Routers.sol";
+import { WrappedPool, WrappedPricer } from "./utils/WrappedPool.sol";
 import { ArbitrageHook } from "../src/ArbitrageHook.sol";
 import { SzrCore } from "../src/SzrCore.sol";
 import { IHooks } from "v4-core/interfaces/IHooks.sol";
@@ -109,6 +110,7 @@ contract MarketsHandler is Test {
     PoolKey[] internal own;
     PoolKey[] internal theirs;
     PoolKey internal shared;
+    WrappedPricer internal pricer;
 
     bool public leaked;
     uint256 public teamActions;
@@ -150,12 +152,18 @@ contract MarketsHandler is Test {
 
     /// Two WETH pools and one USD pool for the hostile token, compared with each other
     /// across the public WETH/USD pool.
-    function start(PoolKey calldata publicPool) external {
+    function start(PoolKey calldata publicPool, PoolKey calldata wrapped, WrappedPricer quoter)
+        external
+    {
         shared = publicPool;
+        pricer = quoter;
         hook.addVenue(id, publicPool);
-        bytes32[] memory pair = new bytes32[](2);
+        // A pool of the hostile token on a wrapping hook leads beside the market's own.
+        hook.addVenue(id, wrapped);
+        bytes32[] memory pair = new bytes32[](3);
         pair[0] = PoolId.unwrap(theirs[0].toId());
         pair[1] = PoolId.unwrap(theirs[1].toId());
+        pair[2] = PoolId.unwrap(wrapped.toId());
         bytes32 common = PoolId.unwrap(shared.toId());
         hook.setLeaders(id, address(weth), address(coin), pair);
         hook.setLeaders(id, address(weth), address(usd), _one(common));
@@ -303,6 +311,11 @@ contract MarketsHandler is Test {
         hook.retrack(spare);
     }
 
+    /// The wrapped pool's pricer starts or stops giving bad answers.
+    function pricerMode(uint256 seed) external {
+        pricer.arm(seed % 6);
+    }
+
     function elapse(uint256 raw) external {
         skip(bound(raw, 1, 10 minutes));
     }
@@ -312,6 +325,7 @@ contract MarketsHandler is Test {
 contract ArbitrageMarketsInvariantTest is ArbitrageWorld {
     MarketsHandler internal handler;
     HostileAsset internal coin;
+    WrappedPricer internal pricer;
     address internal vault = address(0x7EA5);
     address internal desk = address(0x7EA6);
 
@@ -336,18 +350,18 @@ contract ArbitrageMarketsInvariantTest is ArbitrageWorld {
         _create(address(backing), 10_000);
         // The world's WETH/USD pool, which runs no hook and connects SZR's own pools.
         bool wethFirst = address(backing) < address(usd);
-        handler.start(
-            PoolKey(
-                Currency.wrap(wethFirst ? address(backing) : address(usd)),
-                Currency.wrap(wethFirst ? address(usd) : address(backing)),
-                3_000,
-                60,
-                IHooks(address(0))
-            )
+        PoolKey memory publicPool = PoolKey(
+            Currency.wrap(wethFirst ? address(backing) : address(usd)),
+            Currency.wrap(wethFirst ? address(usd) : address(backing)),
+            3_000,
+            60,
+            IHooks(address(0))
         );
+        handler.start(publicPool, _wrapped(), pricer);
         szr.transfer(address(handler), 2_000_000e18);
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](11);
+        bytes4[] memory selectors = new bytes4[](12);
+        selectors[11] = handler.pricerMode.selector;
         selectors[10] = handler.teamToggle.selector;
         selectors[0] = handler.szrSwap.selector;
         selectors[1] = handler.teamSwap.selector;
@@ -360,6 +374,26 @@ contract ArbitrageMarketsInvariantTest is ArbitrageWorld {
         selectors[8] = handler.teamArb.selector;
         selectors[9] = handler.teamSwap.selector;
         targetSelector(FuzzSelector(address(handler), selectors));
+    }
+
+    /// A pool of the hostile token against WETH on a wrapping hook, with its pricer.
+    function _wrapped() internal returns (PoolKey memory pool) {
+        WrappedPool wrapper = WrappedPool(address(uint160(0xBEEF << 24 | 1 << 7 | 1 << 3)));
+        deployCodeTo("WrappedPool.sol:WrappedPool", abi.encode(manager), address(wrapper));
+        pricer = new WrappedPricer(wrapper);
+        hook.setPricer(address(wrapper), address(pricer));
+        bool coinFirst = address(coin) < address(backing);
+        pool = PoolKey(
+            Currency.wrap(coinFirst ? address(coin) : address(backing)),
+            Currency.wrap(coinFirst ? address(backing) : address(coin)),
+            3_000,
+            60,
+            IHooks(address(wrapper))
+        );
+        manager.initialize(pool, uint160(1 << 96));
+        coin.mint(address(wrapper), 400_000e18);
+        backing.mint(address(wrapper), 400_000e18);
+        wrapper.seed(pool, 400_000e18, 400_000e18);
     }
 
     function _create(address partner, uint24 fee) internal {
