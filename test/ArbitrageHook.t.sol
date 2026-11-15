@@ -53,9 +53,9 @@ contract ArbitrageHookTest is ArbitrageWorld {
     /// Liquidity's own swaps are never backrun, even with a gap open.
     function testManagerSwapsAreLeftAlone() public {
         PoolKey memory pool = _addHooked(address(backing), 500);
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(pool, address(szr), 50_000e18);
-        hook.setLimits(1, 8_000_000, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 0, 1.0001e18);
         uint256 inventory = core.unreleasedSupply();
         bool zeroForOne = Currency.unwrap(pool.currency0) == address(backing);
         uint256 held = locker.heldPrincipal(address(backing));
@@ -97,13 +97,13 @@ contract ArbitrageHookTest is ArbitrageWorld {
 
     /// The triggering swap must go through whatever happens to the backrun.
     function testSwapSucceedsWhenTheBackrunCannotProfit() public {
-        hook.setLimits(1, 8_000_000, type(uint128).max, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, type(uint128).max, 1.0001e18);
         uint256 inventory = core.unreleasedSupply();
         uint256 received = usd.balanceOf(address(this));
         _trade(usdPool, address(szr), 50_000e18);
         assertGt(usd.balanceOf(address(this)), received, "swap filled");
         assertEq(core.unreleasedSupply(), inventory, "nothing retired");
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
         assertEq(core.unreleasedSupply(), inventory, "switched off");
         _assertHookEmpty();
@@ -114,20 +114,27 @@ contract ArbitrageHookTest is ArbitrageWorld {
         vm.expectRevert(ArbitrageHook.NotManager.selector);
         hook.track(0);
         vm.expectRevert(ArbitrageHook.NotManager.selector);
-        hook.untrack(_id(usdPool));
+        hook.untrack(1, _id(usdPool));
         vm.expectRevert(ArbitrageHook.NotManager.selector);
         hook.setConnector(1, mainPool, false);
         vm.expectRevert(ArbitrageHook.NotManager.selector);
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         vm.stopPrank();
         vm.expectRevert(ArbitrageHook.InvalidLimit.selector);
-        hook.setLimits(1, 8_000_000, 0, 0.99e18);
+        hook.setLimits(1, address(szr), 8_000_000, 0, 0.99e18);
         uint32 tooLittle = uint32(hook.minimumGasLimit(1) - 1);
         vm.expectRevert(ArbitrageHook.InvalidLimit.selector);
-        hook.setLimits(1, tooLittle, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), tooLittle, 0, 1.0001e18);
         vm.startPrank(alice);
         vm.expectRevert(ArbitrageHook.NotSelf.selector);
-        hook.search(_id(usdPool), true, false, alice);
+        hook.search(
+            _id(usdPool),
+            ArbitrageHook.Pool(1, 1, address(szr)),
+            address(usd),
+            true,
+            false,
+            alice
+        );
         vm.stopPrank();
         _untrack(usdPool);
         assertEq(hook.market(1).poolCount, 1);
@@ -140,7 +147,7 @@ contract ArbitrageHookTest is ArbitrageWorld {
     function testGapIsTakenBeforeTheSwapTrades() public {
         _trade(mainPool, address(backing), 600_000e18);
         uint256 snapshot = vm.snapshotState();
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         uint256 without = _buyOnUsdPool();
         vm.revertToState(snapshot);
         uint256 inventory = core.unreleasedSupply();
@@ -197,7 +204,7 @@ contract ArbitrageHookTest is ArbitrageWorld {
         PoolKey memory third = _addHooked(address(backing), 500);
         _trade(third, address(szr), 1e15);
         assertEq(hook.arb(_id(third)), 0, "third pool aligned");
-        hook.setLimits(1, 8_000_000, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 0, 1.0001e18);
         vm.recordLogs();
         _trade(usdPool, address(szr), 200_000e18);
         Vm.Log[] memory logs = vm.getRecordedLogs();
@@ -216,10 +223,10 @@ contract ArbitrageHookTest is ArbitrageWorld {
         // Two more pools on the same partner token, so all three are compared directly.
         PoolKey memory low = _addHooked(address(usd), 500);
         PoolKey memory high = _addHooked(address(usd), 100);
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(low, address(szr), 150_000e18);
         _trade(high, address(usd), 150_000e18);
-        hook.setLimits(1, 8_000_000, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 0, 1.0001e18);
         uint256 inventory = core.unreleasedSupply();
         uint256 snapshot = vm.snapshotState();
         assertFalse(_tradeWithGas(SHORT_GAS), "too little for any cycle");

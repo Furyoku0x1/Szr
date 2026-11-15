@@ -40,9 +40,9 @@ contract ArbitrageRoutersTest is ArbitrageWorld {
     /// the router, as the router's own settlement would have, and then runs as usual: the
     /// swap fills, the router gets what it is owed, and the gap is closed and retired.
     function testRouterThatPaysFirstIsCreditedAndTheGapStillCloses() public {
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         PayFirstRouter router = new PayFirstRouter(manager);
         szr.approve(address(router), type(uint256).max);
         uint256 inventory = core.unreleasedSupply();
@@ -57,9 +57,9 @@ contract ArbitrageRoutersTest is ArbitrageWorld {
     /// A router may pay part of its input before the swap and the rest after it. The hook
     /// credits the first part, then marks the token again so the rest is counted too.
     function testRouterThatPaysInTwoPartsStillSettles() public {
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         TopUpRouter router = new TopUpRouter(manager);
         szr.approve(address(router), type(uint256).max);
         uint256 inventory = core.unreleasedSupply();
@@ -74,9 +74,9 @@ contract ArbitrageRoutersTest is ArbitrageWorld {
     /// hook takes SZR out in between, so it marks the token again when it is done; without
     /// that the router's payment would be counted short by exactly the hook's profit.
     function testRouterThatSyncsEarlyAndPaysLateStillSettles() public {
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         SyncEarlyRouter router = new SyncEarlyRouter(manager);
         szr.approve(address(router), type(uint256).max);
         uint256 inventory = core.unreleasedSupply();
@@ -91,7 +91,7 @@ contract ArbitrageRoutersTest is ArbitrageWorld {
     function testMarkingSzrAsSyncedDoesNotSkipTheHook() public {
         _trade(mainPool, address(backing), 600_000e18);
         uint256 snapshot = vm.snapshotState();
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         uint256 without = _buySzr();
         vm.revertToState(snapshot);
         PresyncRouter router = new PresyncRouter(manager);
@@ -110,7 +110,7 @@ contract ArbitrageRoutersTest is ArbitrageWorld {
     function testMarkingAHostileTokenDoesNotSkipTheHook() public {
         _trade(mainPool, address(backing), 600_000e18);
         uint256 snapshot = vm.snapshotState();
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         uint256 without = _buySzr();
         vm.revertToState(snapshot);
         HostileSyncRouter router = new HostileSyncRouter(manager);
@@ -151,9 +151,9 @@ contract ArbitrageRoutersTest is ArbitrageWorld {
     /// payment to the swapper. The payer's own settlement finds nothing, so that transaction
     /// fails as a whole and nothing is lost.
     function testPaymentFromSomeoneOtherThanTheSwapperRevertsCleanly() public {
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         SplitPayer payer = new SplitPayer(manager, swapper);
         szr.transfer(address(payer), 2_000e18);
         uint256 inventory = core.unreleasedSupply();
@@ -169,9 +169,9 @@ contract ArbitrageRoutersTest is ArbitrageWorld {
     /// `arb` has no swapper to credit a waiting payment to, so a caller who pays a token
     /// in and then calls it is refused.
     function testArbRefusesACallerWithAPaymentWaiting() public {
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         SplitPayer payer = new SplitPayer(manager, swapper);
         szr.transfer(address(payer), 2_000e18);
         vm.expectRevert(ArbitrageHook.Busy.selector);

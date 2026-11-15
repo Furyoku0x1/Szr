@@ -104,7 +104,7 @@ contract ArbitrageHookForkTest is Test {
         bytes32[] memory leaders = new bytes32[](2);
         leaders[0] = PoolId.unwrap(mainPool.toId());
         leaders[1] = PoolId.unwrap(locker.key(id).toId());
-        arbitrage.setLeaders(1, address(weth), leaders);
+        arbitrage.setLeaders(1, arbitrage.token(), address(weth), leaders);
         vm.stopPrank();
         hooked = locker.key(id);
     }
@@ -256,9 +256,9 @@ contract ArbitrageHookForkTest is Test {
         // One leader in each group: the main pool for WETH, the new pool for USD.
         bytes32[] memory leader = new bytes32[](1);
         leader[0] = PoolId.unwrap(mainPool.toId());
-        arbitrage.setLeaders(1, address(weth), leader);
+        arbitrage.setLeaders(1, arbitrage.token(), address(weth), leader);
         leader[0] = PoolId.unwrap(locker.key(id).toId());
-        arbitrage.setLeaders(1, usd, leader);
+        arbitrage.setLeaders(1, arbitrage.token(), usd, leader);
         vm.stopPrank();
         pool = locker.key(id);
     }

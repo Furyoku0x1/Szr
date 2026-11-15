@@ -18,7 +18,9 @@ contract ArbitrageScriptsTest is ArbitrageWorld {
     /// The deploy script finds a salt that puts the hook at an address with only the two
     /// swap permissions, and that hook then backruns a pool created with it.
     function testScriptDeploysAtASwapHooksOnlyAddress() public {
-        DeployArbitrageHook deployment = new DeployArbitrageHook();
+        // Deployed from its artifact so that this contract does not carry the hook's code.
+        DeployArbitrageHook deployment =
+            DeployArbitrageHook(deployCode("DeployArbitrageHook.s.sol:DeployArbitrageHook"));
         vm.expectRevert(DeployArbitrageHook.MissingFactory.selector);
         deployment.run(block.chainid, locker);
         // Runtime code of the Safe singleton factory, as deployed on Robinhood Chain.
@@ -78,7 +80,11 @@ contract ArbitrageScriptsTest is ArbitrageWorld {
         assertEq(hook.market(1).gasLimit, 9_000_000);
         assertEq(hook.market(1).poolCount, 3);
         assertEq(hook.partnerOf(_id(locker.key(id))), address(eur));
-        assertEq(hook.leadersOf(1, address(eur))[0], _id(locker.key(id)), "leads its group");
+        assertEq(
+            hook.leadersOf(1, address(szr), address(eur))[0],
+            _id(locker.key(id)),
+            "leads its group"
+        );
         setup.run(plan);
         assertEq(hook.market(1).poolCount, 3, "running again changes nothing");
         // The pool it set up is searched like any other.

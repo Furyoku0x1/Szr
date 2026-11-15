@@ -26,9 +26,9 @@ contract ArbitrageGasTest is ArbitrageWorld {
     /// recorded, so the next swap does not pay for it again.
     function testUnworkableCycleCostsOnceAndNeverRevertsAFundedSwap() public {
         _fakeVenue(21_960, 1e22);
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 1e18);
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         vm.recordLogs();
         assertFalse(_swapWithGas(600_000), "too little gas for a hooked swap");
         assertEq(_failures(), 0, "nothing recorded by a failed swap");
@@ -74,7 +74,7 @@ contract ArbitrageGasTest is ArbitrageWorld {
     /// prices as many venues as it ever can, each other group two connecting pools away.
     function _fillGroups() internal returns (PoolKey memory last) {
         poolUnits = 20_000e18;
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         TestAsset partner;
         for (uint256 index; index < 6; index++) {
             partner = new TestAsset();
@@ -82,8 +82,12 @@ contract ArbitrageGasTest is ArbitrageWorld {
         }
         _addHooked(address(partner), 500);
         _addHooked(address(partner), 100);
-        assertEq(hook.market(1).groups.length, hook.MAX_GROUPS(), "every group in use");
-        assertEq(hook.leadersOf(1, address(partner)).length, hook.MAX_LEADERS(), "every slot");
+        assertEq(hook.groupsOf(1, address(szr)).length, hook.MAX_GROUPS(), "every group in use");
+        assertEq(
+            hook.leadersOf(1, address(szr), address(partner)).length,
+            hook.MAX_LEADERS(),
+            "every slot"
+        );
     }
 
     /// The gas floors assume reading and ranking the venues costs at most a fixed amount
@@ -133,26 +137,26 @@ contract ArbitrageGasTest is ArbitrageWorld {
     /// sitting beside a real gap.
     function testMoreGasNeverMakesASwapFail() public {
         uint256 snapshot = vm.snapshotState();
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         _assertMonotonic("one gap", 1e15, 9_000_000, 100_000);
         _assertMonotonic("one gap, large swap", 20_000e18, 9_000_000, 100_000);
         vm.revertToState(snapshot);
         // Two more pools on the same partner token, so all three are compared directly.
         PoolKey memory low = _addHooked(address(usd), 500);
         PoolKey memory high = _addHooked(address(usd), 100);
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(low, address(szr), 150_000e18);
         _trade(high, address(usd), 150_000e18);
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         _assertMonotonic("pools priced apart", 1e15, 9_000_000, 100_000);
         _assertMonotonic("pools priced apart, large swap", 20_000e18, 9_000_000, 100_000);
         vm.revertToState(snapshot);
         _fakeVenue(21_960, 1e22);
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         _assertMonotonic("unworkable venue beside a real gap", 1e15, 9_000_000, 100_000);
         _assertMonotonic("unworkable venue, large swap", 20_000e18, 9_000_000, 100_000);
     }
@@ -210,9 +214,9 @@ contract ArbitrageGasTest is ArbitrageWorld {
     /// which a later swap takes.
     function testSearchCutShortIsReported() public {
         _threeUnworkableLeaders();
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
-        hook.setLimits(1, uint32(hook.minimumGasLimit(1)), 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), uint32(hook.minimumGasLimit(1)), 10e18, 1.0001e18);
         uint256 inventory = core.unreleasedSupply();
         vm.recordLogs();
         _trade(usdPool, address(szr), 1e15);
@@ -231,7 +235,7 @@ contract ArbitrageGasTest is ArbitrageWorld {
     function testMoreGasNeverMakesASwapFailAtTheMostVenues() public {
         _fillGroups();
         _trade(usdPool, address(szr), 5_000e18);
-        hook.setLimits(1, uint32(hook.minimumGasLimit(1)), 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), uint32(hook.minimumGasLimit(1)), 10e18, 1.0001e18);
         _assertMonotonic("the most venues", 2_000e18, 24_000_000, 500_000);
     }
 
@@ -262,9 +266,9 @@ contract ArbitrageGasTest is ArbitrageWorld {
     /// limit, more gas must not turn a swap that went through into one that fails.
     function testMoreGasNeverFailsAPurchaseBesideThreeUnworkableVenues() public {
         _threeUnworkableLeaders();
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
-        hook.setLimits(1, uint32(hook.minimumGasLimit(1)), 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), uint32(hook.minimumGasLimit(1)), 10e18, 1.0001e18);
         bool filled;
         for (uint256 gas = 400_000; gas <= 12_000_000; gas += 100_000) {
             uint256 snapshot = vm.snapshotState();
@@ -281,9 +285,9 @@ contract ArbitrageGasTest is ArbitrageWorld {
     function testMoreGasNeverMakesATwoHopSwapFail() public {
         _addPartner(new TestAsset());
         _untrack(mainPool);
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         _assertMonotonic("two hops", 20_000e18, 9_000_000, 100_000);
     }
 
@@ -301,9 +305,9 @@ contract ArbitrageGasTest is ArbitrageWorld {
                 ""
             );
         }
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 80_000e18);
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         _assertMonotonic("dense ticks", 60_000e18, 12_000_000, 100_000);
     }
 
@@ -334,7 +338,7 @@ contract ArbitrageGasTest is ArbitrageWorld {
     function testGasLeftForTheSwapCoversFifteenTickRanges() public {
         (uint256 allowance,) = _allowances();
         _dustTicks(20);
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         vm.cool(address(manager));
         uint256 spent = gasleft();
         _trade(usdPool, address(szr), 50_000e18);
@@ -346,9 +350,9 @@ contract ArbitrageGasTest is ArbitrageWorld {
     /// more gas must still never make it fail.
     function testMoreGasNeverMakesASwapFailThroughLitteredTicks() public {
         _dustTicks(60);
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(mainPool, address(backing), 200_000e18);
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         _assertMonotonic("littered ticks", 150_000e18, 14_000_000, 100_000);
     }
 
@@ -380,10 +384,10 @@ contract ArbitrageGasTest is ArbitrageWorld {
     /// open on both, more gas must never make it fail.
     function testMoreGasNeverMakesTwoHookedSwapsFail() public {
         PoolKey memory wethPool = _addHooked(address(backing), 500);
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
         _trade(wethPool, address(backing), 50_000e18);
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         TwoHopRouter router = new TwoHopRouter(manager);
         usd.approve(address(router), type(uint256).max);
         bytes memory trade =
@@ -413,5 +417,52 @@ contract ArbitrageGasTest is ArbitrageWorld {
         fakes[1] = _id(_fakeVenueWithFee(21_960, 1e22, 200));
         fakes[2] = _id(_fakeVenueWithFee(21_960, 1e22, 300));
         _setLeaders(address(usd), fakes);
+    }
+
+    function _ranOut() internal returns (uint256 count) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 index; index < logs.length; index++) {
+            if (logs[index].topics[0] == ArbitrageHook.TryRanOut.selector) count++;
+        }
+    }
+
+    /// `gasForSwap` is what a swap must still have when the hook is reached. With that
+    /// much, and a little for the router and the pool manager before it, a swap never
+    /// fails for gas: here with a gap open and two venues that cannot be traded ranked
+    /// above it, and again at the most venues a search can price.
+    function testStatedGasIsEnoughWhateverIsOpen() public {
+        uint256 snapshot = vm.snapshotState();
+        _fakeVenueWithFee(21_960, 1e22, 100);
+        _fakeVenueWithFee(21_960, 1e22, 200);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
+        _trade(mainPool, address(backing), 200_000e18);
+        hook.setLimits(1, address(szr), uint32(hook.minimumGasLimit(1)), 10e18, 1.0001e18);
+        uint256 stated = hook.gasForSwap(1) + 150_000;
+        assertTrue(_tradeWithGas(stated, 20_000e18, true), "sale");
+        assertTrue(_tradeWithGas(stated, 20_000e18, false), "purchase");
+        vm.revertToState(snapshot);
+        PoolKey memory last = _fillGroups();
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
+        _trade(last, address(szr), 20_000e18);
+        hook.setLimits(1, address(szr), uint32(hook.minimumGasLimit(1)), 10e18, 1.0001e18);
+        stated = hook.gasForSwap(1) + 150_000;
+        assertTrue(_tradeWithGas(stated, 20_000e18, true), "sale at the most venues");
+        assertTrue(_tradeWithGas(stated, 20_000e18, false), "purchase at the most venues");
+    }
+
+    /// A try that runs out of gas is followed by the smallest size, not the next largest:
+    /// a larger trade crosses at least as many ticks. With the pool's path littered, the
+    /// gap is still closed in the same search instead of the cycle failing outright.
+    function testTryThatRunsOutGoesStraightToTheSmallestSize() public {
+        _dustTicks(150);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
+        _trade(mainPool, address(backing), 400_000e18);
+        hook.setLimits(1, address(szr), 14_000_000, 10e18, 1.0001e18);
+        uint256 inventory = core.unreleasedSupply();
+        vm.recordLogs();
+        hook.arb(_id(usdPool));
+        // Once only: every later cycle in that search starts at the smallest size.
+        assertEq(_ranOut(), 1, "a size ran out of gas, once");
+        assertGt(core.unreleasedSupply(), inventory, "and the smallest size still earned");
     }
 }

@@ -20,9 +20,11 @@ contract ArbitrageProbe is ArbitrageHook {
             uint256 bookAllowance
         )
     {
-        _enter(tracked[poolId].market);
+        active = SZR_MARKET;
+        home = token;
+        address partner = _other(keys[poolId], token);
         uint256 start = gasleft();
-        Venue[] memory prices = _book(poolId);
+        Venue[] memory prices = _book(poolId, partner);
         book = start - gasleft();
         start = gasleft();
         _best(prices, 0);

@@ -81,6 +81,9 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// quarter and an eighth of it. The estimate reads liquidity at the current price,
     /// which can be made to mislead in either direction.
     uint256 internal constant TRIES = 5;
+    /// @dev How far above the smallest profit a cycle's estimate must be to be tried, in
+    /// percent.
+    uint256 internal constant PLAN_MARGIN = 125;
     /// @dev A square-root price gap beyond this (a 16x price difference) is a broken or
     /// manipulated venue, not something to arbitrage.
     uint256 internal constant MAX_EDGE = 4e18;
@@ -98,6 +101,10 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     uint256 internal constant Q96 = 1 << 96;
     uint256 internal constant Q192 = 1 << 192;
     address internal constant UNRELEASED = address(1);
+    /// @dev Where remembered venues are kept in transient storage, four words each.
+    uint256 internal constant REMEMBER_SLOT = uint256(keccak256("ArbitrageHook.remembered"));
+    /// @dev Gas that must be left, per venue, for remembering them to be worth starting.
+    uint256 internal constant REMEMBER_GAS = 2_000;
     uint160 internal constant PERMISSION_MASK = (1 << 14) - 1;
     /// @dev The beforeSwap and afterSwap permission bits, and no others.
     uint160 internal constant SWAP_HOOKS = (1 << 7) | (1 << 6);
@@ -108,7 +115,6 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     struct Venue {
         bytes32 id;
         address partner;
-        uint64 fixedKeep;
         uint256 rate;
         uint256 keep;
     }
@@ -123,6 +129,7 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         uint256 rate;
         uint256 keep;
         uint256 depth;
+        uint256 edge;
         address[] seen;
         Route[] routes;
         uint256 known;
@@ -134,30 +141,36 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         uint192 gap;
     }
 
-    /// @dev `market` is kept when a pool is untracked; `partner` is then zero.
-    struct Tracked {
-        address partner;
-        uint64 keep;
+    /// @dev A pool on this hook. `origin` is the market it was created in and never
+    /// changes; `market` is the market searching it now, zero while it is untracked.
+    /// `home` is the token its searches count profit in, chosen when it is tracked; zero
+    /// when neither of its tokens can be one, and it is then never searched.
+    struct Pool {
+        uint32 origin;
         uint32 market;
+        address home;
     }
 
-    /// @notice One owner's pools and settings. Every pool in a market shares its `home`
-    /// token, and a search never looks outside the market of the pool that traded.
+    /// @notice One owner's pools and settings. A search never looks outside the market of
+    /// the pool that traded.
     /// @dev `gasLimit` is the gas given to each search; zero switches the market off.
-    /// `minimumProfit` is the smallest profit a cycle must return, in the home token (SZR
-    /// for SZR's market, WETH for every other).
     /// `minimumEdge` is the smallest gap worth an attempt, in square-root price terms (WAD).
-    /// `groups` are the partner tokens that have leaders. The SZR market has no stored
-    /// owner: it belongs to Liquidity's manager.
+    /// SZR's market has no stored owner: it belongs to Liquidity's manager.
     struct Market {
-        address home;
+        address owner;
         uint32 gasLimit;
         uint64 minimumEdge;
-        uint128 minimumProfit;
-        uint64 poolCount;
-        address owner;
         address recipient;
-        address[] groups;
+        uint64 poolCount;
+        address nominee;
+    }
+
+    /// @dev A token profit may be counted in. `rank` is its place in the order of
+    /// preference, from one; zero means it is not on the list. `recipient` is where the
+    /// protocol's share of profit in this token is sent.
+    struct Listing {
+        uint8 rank;
+        address recipient;
     }
 
     /// @dev The way from a venue's partner token to the focus pool's partner token: no pool
@@ -201,38 +214,58 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     address public immutable token;
     address public immutable backingAsset;
 
-    /// @notice SZR's own market, the first one. It alone has Core redemption as a venue,
-    /// and retires its profit instead of paying it out.
+    /// @notice SZR's own market, the first one. Its profit token is always SZR, it alone
+    /// has Core redemption as a venue, and it retires its profit instead of paying it out.
     uint256 public constant SZR_MARKET = 1;
-    /// @notice The share of every other market's profit that goes to `protocolRecipient`,
-    /// in percent. The rest goes to the market's own recipient. Both are paid in WETH.
+    /// @notice The share of every other market's profit that goes to the protocol, in
+    /// percent. The rest goes to the market's own recipient, in the same token.
     uint256 public constant PROTOCOL_SHARE = 30;
-    /// @notice Where the protocol's share is sent. Core by default, where it waits to be
-    /// counted as backing by `absorbBacking`. Liquidity's manager can change it.
-    address public protocolRecipient;
+    uint256 public constant MAX_PROFIT_TOKENS = 8;
+    /// @notice The tokens a market other than SZR's may count its profit in, most preferred
+    /// first. A market's owner prices their own token, so profit is only ever counted in
+    /// one of these, which Liquidity's manager chooses.
+    address[] public profitTokens;
+    mapping(address asset => Listing) public listing;
     /// @notice How many markets exist. Their ids run from one.
     uint256 public marketCount = 1;
     mapping(uint256 id => Market) internal markets;
-    /// @dev The market being searched, and its home token. Set while a search runs, so a
-    /// swap made by some other hook in the middle of a cycle cannot start a second search
-    /// inside the first.
+    /// @notice The smallest profit a cycle must return, for each token a market counts
+    /// profit in, in that token's own units.
+    mapping(uint256 market => mapping(address base => uint128)) public minimumProfit;
+    /// @dev The market being searched, and the token this search counts profit in. Set
+    /// while a search runs, so a swap made by some other hook in the middle of a cycle
+    /// cannot start a second search inside the first.
     uint256 internal transient active;
     address internal transient home;
+    /// @dev The pool whose venues' prices the search before its swap has left in transient
+    /// storage for the search after it. Nothing else can run between the two, and the
+    /// swap itself only moves that pool, so they are still right; see `_remember`.
+    bytes32 internal transient remembered;
+    /// @dev Set once a try at a cycle has used up its whole share of gas. For the rest of
+    /// that search, cycles are tried at their smallest size only.
+    bool internal transient strained;
+    /// @dev For each token a market counts profit in, the partner tokens that have leaders.
+    mapping(uint256 market => mapping(address base => address[] partners)) internal groups;
     /// @dev Each group's leaders: its deepest pools, in the owner's order. The first is
     /// the one other groups are compared against. A hookless pool can lead; it is then
     /// only ever a venue.
-    mapping(uint256 market => mapping(address partner => bytes32[] poolIds)) internal leaders;
+    mapping(
+        uint256 market => mapping(address base => mapping(address partner => bytes32[]))
+    ) internal leaders;
+    /// @dev The first leader of each group again, where a search reads it in one step.
+    mapping(uint256 market => mapping(address base => mapping(address partner => bytes32)))
+        internal heads;
     mapping(bytes32 poolId => PoolKey) internal keys;
-    /// @dev A tracked pool's market, its token other than the home token, and the fee
-    /// factor of a fixed-fee pool worked out once (zero for a dynamic-fee pool, whose fee
-    /// is read each time).
-    mapping(bytes32 poolId => Tracked) internal tracked;
+    mapping(bytes32 poolId => Pool) internal pools;
+    /// @notice Whether a market prices a pool. A hookless pool can be in several markets.
+    mapping(uint256 market => mapping(bytes32 poolId => bool)) public tracked;
     /// @dev A cycle between a focus pool and a venue that failed is not tried again until
     /// `until`, unless the gap has grown well beyond the one that failed. Keyed by the
-    /// pair and the direction, so a broken pool only sets aside its own cycles.
+    /// market, the profit token, the pair and the direction, so a broken pool only sets
+    /// aside its own cycles and one market cannot set aside another's.
     mapping(bytes32 pair => Bench) internal benched;
-    /// @dev Tokens a market can end up trading besides its home token and WETH: the partner
-    /// of every pool it ever tracked and both sides of every connecting pool it ever set.
+    /// @dev Tokens a market can end up trading: both sides of every pool it ever tracked
+    /// and of every connecting pool it ever set.
     mapping(uint256 market => mapping(address asset => bool)) internal traded;
     /// @notice The pool a market uses to convert between two partner tokens, keyed lower
     /// address first.
@@ -262,22 +295,37 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     error TooManyMarkets();
 
     event MarketOpened(uint256 indexed market, address indexed owner);
+    event OwnerNominated(uint256 indexed market, address indexed nominee);
+    event OwnerSet(uint256 indexed market, address indexed owner);
     event RecipientSet(uint256 indexed market, address recipient);
-    /// @notice A market earned `amount` WETH, of which `protocolShare` went to the protocol
-    /// and the rest to the market's recipient.
-    event ProfitPaid(uint256 indexed market, uint256 amount, uint256 protocolShare);
-    event PoolTracked(bytes32 indexed poolId, address indexed partner);
-    event PoolUntracked(bytes32 indexed poolId);
+    event ProfitTokensSet(address[] tokens, address[] recipients);
+    /// @notice A market earned `amount` of `asset`, of which `protocolShare` went to the
+    /// protocol and the rest to the market's recipient.
+    event ProfitPaid(
+        uint256 indexed market, address indexed asset, uint256 amount, uint256 protocolShare
+    );
+    event PoolTracked(uint256 indexed market, bytes32 indexed poolId);
+    event PoolUntracked(uint256 indexed market, bytes32 indexed poolId);
     event ConnectorSet(
         uint256 indexed market, address indexed lower, address indexed higher, bytes32 poolId
     );
-    event LeadersSet(uint256 indexed market, address indexed partner, bytes32[] poolIds);
+    event LeadersSet(
+        uint256 indexed market, address indexed base, address indexed partner, bytes32[] poolIds
+    );
     event LimitsSet(
-        uint256 indexed market, uint32 gasLimit, uint128 minimumProfit, uint64 minimumEdge
+        uint256 indexed market,
+        address indexed base,
+        uint32 gasLimit,
+        uint128 minimumProfit,
+        uint64 minimumEdge
     );
     /// @notice A cycle that looked profitable failed at every size tried. A venue that keeps
     /// appearing here is costing swappers gas and is a candidate for `untrack`.
     event CycleFailed(bytes32 indexed poolId, bytes32 indexed venue);
+    /// @notice One size of a cycle used up its whole share of gas. Seen often for a pair,
+    /// its cycles cost more than the hook allows, usually because of very many tick
+    /// ranges on the way.
+    event TryRanOut(bytes32 indexed poolId, bytes32 indexed venue);
     /// @notice A search ended with a cycle still to try because it ran short of gas. Seen
     /// often, it means the gas allowance is too small for the venues a search prices.
     event SearchCutShort(bytes32 indexed poolId);
@@ -315,78 +363,150 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         // prices. The edge default is about 0.02% of price beyond fees; smaller gaps cost
         // more gas than they return.
         Market storage own = markets[SZR_MARKET];
-        own.home = token;
         own.gasLimit = 8_000_000;
-        own.minimumProfit = 10e18;
         own.minimumEdge = 1.0001e18;
-        protocolRecipient = address(core);
+        minimumProfit[SZR_MARKET][token] = 10e18;
+        // WETH is the first token profit may be counted in. Core counts the protocol's
+        // share of it as backing when anyone calls `absorbBacking`.
+        profitTokens.push(backingAsset);
+        listing[backingAsset] = Listing(1, address(core));
+    }
+
+    /// @notice Replaces the list of tokens profit may be counted in, most preferred first,
+    /// each with the address the protocol's share of it is sent to. A pool keeps the token
+    /// chosen for it when it was tracked; a token taken off the list stops being paid out
+    /// at once, and its pools are not arbitraged until they are tracked again.
+    /// @dev Core can only count WETH, so any other token needs a recipient of its own.
+    /// @dev Never list a token that calls its receiver on transfer: paying it out would
+    /// run that receiver's code in the middle of a search.
+    function setProfitTokens(address[] calldata assets, address[] calldata recipients)
+        external
+        onlyOwner(SZR_MARKET)
+    {
+        if (assets.length > MAX_PROFIT_TOKENS) revert InvalidLimit();
+        if (recipients.length != assets.length) revert InvalidLimit();
+        for (uint256 index; index < profitTokens.length; index++) {
+            delete listing[profitTokens[index]];
+        }
+        delete profitTokens;
+        for (uint256 index; index < assets.length; index++) {
+            address asset = assets[index];
+            if (asset == address(0)) revert InvalidPool();
+            // SZR is counted only in its own market.
+            if (asset == token) revert InvalidPool();
+            _requireRecipient(recipients[index]);
+            if (listing[asset].rank != 0) revert InvalidPool();
+            listing[asset] = Listing(uint8(index + 1), recipients[index]);
+            profitTokens.push(asset);
+        }
+        emit ProfitTokensSet(assets, recipients);
+    }
+
+    function allProfitTokens() external view returns (address[] memory) {
+        return profitTokens;
     }
 
     /// @notice Opens a market owned by the caller. Anyone can. It starts switched off;
     /// create its pools, name leaders, then call `setLimits`.
-    /// @dev Its home token is WETH: every pool in it pairs WETH with some other token, and
-    /// every cycle starts and ends in WETH. So its profit is WETH proven on balances, with
-    /// no price to trust, and the hook never holds or sends any other token for it.
+    /// @dev Every cycle in it starts and ends in a token from `profitTokens`, so its profit
+    /// is counted on balances in a token its owner cannot price, and the hook never holds
+    /// or sends any other token for it.
     function openMarket(address recipient) external returns (uint256 id) {
-        if (recipient == address(0)) revert InvalidPool();
+        _requireRecipient(recipient);
         id = ++marketCount;
         // A pool records its market in 32 bits.
         if (id > type(uint32).max) revert TooManyMarkets();
         Market storage own = markets[id];
-        own.home = backingAsset;
         own.owner = msg.sender;
         own.recipient = recipient;
         own.minimumEdge = 1.0001e18;
         emit MarketOpened(id, msg.sender);
     }
 
-    function setRecipient(uint256 id, address recipient) external onlyOwner(id) {
+    /// @dev Anything paid to the hook itself would be stuck in it.
+    function _requireRecipient(address recipient) internal view {
         if (recipient == address(0)) revert InvalidPool();
+        if (recipient == address(this)) revert InvalidPool();
+    }
+
+    function setRecipient(uint256 id, address recipient) external onlyOwner(id) {
+        _requireRecipient(recipient);
         markets[id].recipient = recipient;
         emit RecipientSet(id, recipient);
     }
 
-    function setProtocolRecipient(address recipient) external onlyOwner(SZR_MARKET) {
-        if (recipient == address(0)) revert InvalidPool();
-        protocolRecipient = recipient;
-        emit RecipientSet(SZR_MARKET, recipient);
+    /// @notice Names the address that may take a market over. SZR's market always belongs
+    /// to Liquidity's manager.
+    function nominateOwner(uint256 id, address nominee) external onlyOwner(id) {
+        if (id == SZR_MARKET) revert InvalidPool();
+        markets[id].nominee = nominee;
+        emit OwnerNominated(id, nominee);
+    }
+
+    function acceptOwnership(uint256 id) external {
+        Market storage own = markets[id];
+        if (own.nominee == address(0)) revert NotManager();
+        if (msg.sender != own.nominee) revert NotManager();
+        own.owner = msg.sender;
+        own.nominee = address(0);
+        emit OwnerSet(id, msg.sender);
     }
 
     /// @notice Creates a pool on this hook and adds it to the caller's market. This is the
-    /// only way a pool joins a market other than SZR's, so nobody can claim a pool someone
-    /// else created, and every venue in such a market runs this hook's code and no other.
-    /// @dev The pool must pair WETH with a token other than SZR.
+    /// only way a pool on this hook joins a market other than SZR's, so nobody can claim a
+    /// pool someone else created.
     function createPool(uint256 id, PoolKey calldata pool, uint160 sqrtPriceX96)
         external
         onlyOwner(id)
     {
         if (id == SZR_MARKET) revert InvalidPool();
         if (address(pool.hooks) != address(this)) revert InvalidPool();
-        address partner = _partner(id, pool);
-        if (partner == token) revert InvalidPool();
+        // A dynamic-fee pool takes its fee from its hook, and this hook never sets one, so
+        // such a pool on this hook would trade for nothing for ever.
+        if (pool.fee >= 1e6) revert InvalidPool();
+        _requireOutside(pool);
         poolManager.initialize(pool, sqrtPriceX96);
-        _track(id, pool, partner);
+        bytes32 poolId = PoolId.unwrap(pool.toId());
+        pools[poolId] = Pool(uint32(id), uint32(id), _pick(pool));
+        _track(id, pool, poolId);
+    }
+
+    /// @notice Adds a pool that runs no hook to the caller's market, as somewhere to trade
+    /// against. Any market can add the same one; it is never searched on its own swaps.
+    function addVenue(uint256 id, PoolKey calldata pool) external onlyOwner(id) {
+        if (id == SZR_MARKET) revert InvalidPool();
+        if (address(pool.hooks) != address(0)) revert InvalidPool();
+        _requireOutside(pool);
+        _track(id, pool, PoolId.unwrap(pool.toId()));
     }
 
     /// @notice Tracks again a pool that was created in a market and then untracked.
     function retrack(bytes32 poolId) external {
-        uint256 id = tracked[poolId].market;
+        uint256 id = pools[poolId].origin;
         if (id <= SZR_MARKET) revert UnknownPool();
         if (msg.sender != _owner(id)) revert NotManager();
         PoolKey memory pool = keys[poolId];
-        _track(id, pool, _partner(id, pool));
+        pools[poolId] = Pool(uint32(id), uint32(id), _pick(pool));
+        _track(id, pool, poolId);
     }
 
-    /// @dev The token a pool pairs with the market's home token. Native ETH cannot be one.
-    function _partner(uint256 id, PoolKey memory pool) internal view returns (address partner) {
-        address base = markets[id].home;
+    /// @dev Pools of a market other than SZR's cannot hold native ETH or SZR.
+    function _requireOutside(PoolKey memory pool) internal view {
+        if (Currency.unwrap(pool.currency0) == address(0)) revert InvalidPool();
+        if (Currency.unwrap(pool.currency0) == token) revert InvalidPool();
+        if (Currency.unwrap(pool.currency1) == token) revert InvalidPool();
+    }
+
+    /// @dev The token a pool's searches count profit in: whichever of its two is on the
+    /// list, the more preferred when both are, and zero when neither is.
+    function _pick(PoolKey memory pool) internal view returns (address) {
         address lower = Currency.unwrap(pool.currency0);
         address higher = Currency.unwrap(pool.currency1);
-        partner = lower == base ? higher : lower;
-        if (partner == lower) {
-            if (higher != base) revert InvalidPool();
-        }
-        if (partner == address(0)) revert InvalidPool();
+        uint256 first = listing[lower].rank;
+        uint256 second = listing[higher].rank;
+        if (first == 0) return second == 0 ? address(0) : higher;
+        if (second == 0) return lower;
+        return first < second ? lower : higher;
     }
 
     function _owner(uint256 id) internal view returns (address) {
@@ -394,7 +514,7 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         return markets[id].owner;
     }
 
-    /// @notice A market's settings and the partner tokens that have leaders in it.
+    /// @notice A market's settings.
     function market(uint256 id) external view returns (Market memory) {
         return markets[id];
     }
@@ -402,58 +522,76 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// @notice Starts pricing the pool behind one of Liquidity's positions, in SZR's market.
     function track(uint256 id) external onlyOwner(SZR_MARKET) {
         Liquidity.Position memory entry = liquidity.position(id);
-        _track(SZR_MARKET, entry.key, entry.partner);
+        bytes32 poolId = PoolId.unwrap(entry.key.toId());
+        if (address(entry.key.hooks) == address(this)) {
+            if (entry.key.fee >= 1e6) revert InvalidPool();
+            if (pools[poolId].origin > SZR_MARKET) revert InvalidPool();
+            pools[poolId] = Pool(uint32(SZR_MARKET), uint32(SZR_MARKET), token);
+        }
+        _track(SZR_MARKET, entry.key, poolId);
     }
 
-    function _track(uint256 id, PoolKey memory pool, address partner) internal {
-        bytes32 poolId = PoolId.unwrap(pool.toId());
-        if (tracked[poolId].partner != address(0)) revert AlreadyTracked();
+    function _track(uint256 id, PoolKey memory pool, bytes32 poolId) internal {
+        if (tracked[id][poolId]) revert AlreadyTracked();
+        tracked[id][poolId] = true;
         markets[id].poolCount++;
         keys[poolId] = pool;
-        uint24 fee = pool.fee;
-        // A dynamic-fee pool takes its fee from its hook, and this hook never sets one, so
-        // such a pool on this hook would trade for nothing for ever.
-        if (fee >= 1e6) {
-            if (address(pool.hooks) == address(this)) revert InvalidPool();
-        }
-        tracked[poolId] = Tracked(partner, fee < 1e6 ? uint64(_keep(fee)) : 0, uint32(id));
-        traded[id][partner] = true;
-        emit PoolTracked(poolId, partner);
+        traded[id][Currency.unwrap(pool.currency0)] = true;
+        traded[id][Currency.unwrap(pool.currency1)] = true;
+        emit PoolTracked(id, poolId);
     }
 
-    /// @notice Stops searching a pool. A leader has to be replaced first.
-    function untrack(bytes32 poolId) external {
-        Tracked memory entry = tracked[poolId];
-        if (entry.partner == address(0)) revert UnknownPool();
-        if (msg.sender != _owner(entry.market)) revert NotManager();
-        if (_leads(entry.market, entry.partner, poolId)) revert StillLeader();
-        markets[entry.market].poolCount--;
-        tracked[poolId].partner = address(0);
-        emit PoolUntracked(poolId);
+    /// @notice Stops a market pricing a pool. A leader has to be replaced first.
+    function untrack(uint256 id, bytes32 poolId) external onlyOwner(id) {
+        if (!tracked[id][poolId]) revert UnknownPool();
+        PoolKey memory pool = keys[poolId];
+        address lower = Currency.unwrap(pool.currency0);
+        address higher = Currency.unwrap(pool.currency1);
+        // It can lead with either of its tokens as the one profit is counted in.
+        if (_leads(id, lower, higher, poolId)) revert StillLeader();
+        if (_leads(id, higher, lower, poolId)) revert StillLeader();
+        tracked[id][poolId] = false;
+        markets[id].poolCount--;
+        if (pools[poolId].market == id) pools[poolId].market = 0;
+        emit PoolUntracked(id, poolId);
     }
 
-    /// @notice Names a partner token's leaders: its deepest tracked pools, deepest first.
-    /// The first is what every other group is compared against, so it should be the pool
-    /// hardest to move. An empty list removes the group.
-    function setLeaders(uint256 id, address partner, bytes32[] calldata poolIds)
+    /// @notice Names the leaders among a market's pools that pair `base`, a token profit is
+    /// counted in, with `partner`: its deepest such pools, deepest first. The first is what
+    /// every other group is compared against, so it should be the pool hardest to move. An
+    /// empty list removes the group.
+    function setLeaders(uint256 id, address base, address partner, bytes32[] calldata poolIds)
         external
         onlyOwner(id)
     {
         if (poolIds.length > MAX_LEADERS) revert TooManyLeaders();
-        // An untracked pool has no partner, which must not pass for this one.
-        if (partner == address(0)) revert InvalidPool();
+        // The gas allowance is checked against the tokens on the list, so leaders can only
+        // be named for one of those. A group can always be emptied.
+        if (poolIds.length != 0) {
+            if (!_countable(id, base)) revert InvalidPool();
+        }
+        address lower = base < partner ? base : partner;
+        address higher = base < partner ? partner : base;
         for (uint256 index; index < poolIds.length; index++) {
-            Tracked memory entry = tracked[poolIds[index]];
-            if (entry.partner != partner) revert InvalidPool();
-            if (entry.market != id) revert InvalidPool();
+            if (!tracked[id][poolIds[index]]) revert InvalidPool();
+            PoolKey storage pool = keys[poolIds[index]];
+            if (Currency.unwrap(pool.currency0) != lower) revert InvalidPool();
+            if (Currency.unwrap(pool.currency1) != higher) revert InvalidPool();
             for (uint256 earlier; earlier < index; earlier++) {
                 if (poolIds[earlier] == poolIds[index]) revert InvalidPool();
             }
         }
-        _setGroup(markets[id].groups, partner, poolIds.length != 0);
-        leaders[id][partner] = poolIds;
+        _setGroup(groups[id][base], partner, poolIds.length != 0);
+        leaders[id][base][partner] = poolIds;
+        heads[id][base][partner] = poolIds.length == 0 ? bytes32(0) : poolIds[0];
         _requireWorkable(id, markets[id].gasLimit);
-        emit LeadersSet(id, partner, poolIds);
+        emit LeadersSet(id, base, partner, poolIds);
+    }
+
+    /// @dev Whether a market may count profit in `base`.
+    function _countable(uint256 id, address base) internal view returns (bool) {
+        if (id == SZR_MARKET) return base == token;
+        return listing[base].rank != 0;
     }
 
     /// @dev An allowance too small for the venues a search prices would leave it idle.
@@ -463,38 +601,55 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     }
 
     /// @dev Adds the partner to the list of groups, or removes it, as its leaders require.
-    function _setGroup(address[] storage groups, address partner, bool wanted) internal {
-        uint256 count = groups.length;
+    function _setGroup(address[] storage list, address partner, bool wanted) internal {
+        uint256 count = list.length;
         uint256 index;
         while (index < count) {
-            if (groups[index] == partner) break;
+            if (list[index] == partner) break;
             index++;
         }
         if (wanted) {
             if (index != count) return;
             if (count == MAX_GROUPS) revert TooManyGroups();
-            groups.push(partner);
+            list.push(partner);
             return;
         }
         if (index == count) return;
-        groups[index] = groups[count - 1];
-        groups.pop();
+        list[index] = list[count - 1];
+        list.pop();
     }
 
-    function _leads(uint256 id, address partner, bytes32 poolId) internal view returns (bool) {
-        bytes32[] storage list = leaders[id][partner];
+    function _leads(uint256 id, address base, address partner, bytes32 poolId)
+        internal
+        view
+        returns (bool)
+    {
+        bytes32[] storage list = leaders[id][base][partner];
         for (uint256 index; index < list.length; index++) {
             if (list[index] == poolId) return true;
         }
         return false;
     }
 
-    function leadersOf(uint256 id, address partner) external view returns (bytes32[] memory) {
-        return leaders[id][partner];
+    function leadersOf(uint256 id, address base, address partner)
+        external
+        view
+        returns (bytes32[] memory)
+    {
+        return leaders[id][base][partner];
     }
 
-    /// @notice Sets or clears the pool used to convert between its two tokens. It must be
-    /// on Liquidity's list of registered pools and must not contain SZR.
+    function groupsOf(uint256 id, address base) external view returns (address[] memory) {
+        return groups[id][base];
+    }
+
+    /// @notice Sets or clears the pool a market uses to convert between its two tokens.
+    /// It must not contain SZR. In SZR's market it must be on Liquidity's list of
+    /// registered pools.
+    /// @dev Anyone can open a market, so its connecting pools may run no hook but this one,
+    /// and then only as a pool of that same market. Another hook could do anything in the
+    /// middle of a cycle, and this hook's own swaps skip its searches, so trading through
+    /// another market's pool would move it without that market's search.
     function setConnector(uint256 id, PoolKey calldata pool, bool enabled)
         external
         onlyOwner(id)
@@ -502,18 +657,14 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         bytes32 poolId = PoolId.unwrap(pool.toId());
         address lower = Currency.unwrap(pool.currency0);
         address higher = Currency.unwrap(pool.currency1);
-        if (lower == markets[id].home) revert InvalidPool();
-        if (higher == markets[id].home) revert InvalidPool();
+        if (lower == token) revert InvalidPool();
+        if (higher == token) revert InvalidPool();
         if (id == SZR_MARKET) {
             if (!liquidity.poolRegistered(poolId)) revert PoolNotRegistered();
+            // Never another market's pool: trading it would skip that market's search.
+            if (pools[poolId].origin > SZR_MARKET) revert InvalidPool();
         }
-        // Anyone can open a market, so its connecting pools may not run a hook: one could
-        // do anything in the middle of a cycle, including trade in another market's pool
-        // while this hook stands aside.
-        if (id != SZR_MARKET) {
-            if (address(pool.hooks) != address(0)) revert InvalidPool();
-            if (lower == address(0)) revert InvalidPool();
-        }
+        if (id != SZR_MARKET) _requireLink(id, pool, poolId);
         // Clearing has to name the pool that is set, not just any pool on the same pair.
         if (!enabled) {
             if (connector[id][lower][higher] != poolId) revert InvalidPool();
@@ -525,9 +676,17 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         emit ConnectorSet(id, lower, higher, connector[id][lower][higher]);
     }
 
-    /// @notice `gas` zero switches the hook off; otherwise it must cover at least one cycle.
-    /// `edge` below 1.0 would chase losing cycles.
-    function setLimits(uint256 id, uint32 gas, uint128 profit, uint64 edge)
+    function _requireLink(uint256 id, PoolKey calldata pool, bytes32 poolId) internal view {
+        if (Currency.unwrap(pool.currency0) == address(0)) revert InvalidPool();
+        if (address(pool.hooks) == address(0)) return;
+        if (address(pool.hooks) != address(this)) revert InvalidPool();
+        if (pools[poolId].origin != id) revert InvalidPool();
+    }
+
+    /// @notice Sets a market's gas allowance and smallest gap, and the smallest profit for
+    /// cycles counted in `base`. `gas` zero switches the market off; otherwise it must
+    /// cover at least one cycle. `edge` below 1.0 would chase losing cycles.
+    function setLimits(uint256 id, address base, uint32 gas, uint128 profit, uint64 edge)
         external
         onlyOwner(id)
     {
@@ -536,9 +695,9 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         _requireWorkable(id, gas);
         Market storage own = markets[id];
         own.gasLimit = gas;
-        own.minimumProfit = profit;
         own.minimumEdge = edge;
-        emit LimitsSet(id, gas, profit, edge);
+        minimumProfit[id][base] = profit;
+        emit LimitsSet(id, base, gas, profit, edge);
     }
 
     /// @notice The smallest gas allowance with which a search can always start its first
@@ -553,61 +712,102 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
             * (PLAN_GAS + OVERHEAD_GAS + scan);
     }
 
-    /// @dev The most venues any search prices: the pool itself, the leaders of the largest
-    /// group, the first leader of each other group, and Core.
-    function _mostVenues(uint256 id) internal view returns (uint256) {
-        address[] storage groups = markets[id].groups;
-        uint256 count = groups.length;
+    /// @notice The gas the pool manager must still have when it calls this hook before a
+    /// swap in this market, for the swap never to fail with `InsufficientGas`, whatever
+    /// gaps are open. Set a swap's gas limit from this, not from an estimate: an estimate
+    /// made while no gap was open is far too low for a swap that meets one.
+    /// @dev Add what the router and the pool manager use before that point, and allow for
+    /// each call on the way down keeping back one 64th of the gas it is given. The two
+    /// factors here are for the two calls from the pool manager to the search.
+    /// @dev This holds as long as the gas reserved per step in this contract is no less
+    /// than those steps really cost.
+    function gasForSwap(uint256 id) external view returns (uint256) {
+        return (minimumGasLimit(id) + OVERHEAD_GAS) * 64 / 63 * 64 / 63;
+    }
+
+    /// @dev The most venues any search in a market prices, over every token it can count
+    /// profit in.
+    function _mostVenues(uint256 id) internal view returns (uint256 most) {
+        if (id == SZR_MARKET) return _venueCount(id, token);
+        most = 2;
+        for (uint256 index; index < profitTokens.length; index++) {
+            uint256 count = _venueCount(id, profitTokens[index]);
+            if (count > most) most = count;
+        }
+    }
+
+    /// @dev The pool itself, the leaders of the largest group, the first leader of each
+    /// other group, and Core.
+    function _venueCount(uint256 id, address base) internal view returns (uint256) {
+        address[] storage list = groups[id][base];
+        uint256 count = list.length;
         if (count == 0) return 2;
         uint256 most;
         for (uint256 index; index < count; index++) {
-            uint256 size = leaders[id][groups[index]].length;
+            uint256 size = leaders[id][base][list[index]].length;
             if (size > most) most = size;
         }
         return most + count + 1;
     }
 
-    /// @notice A tracked pool's token other than its market's home token; zero when the
-    /// pool is not tracked.
+    /// @notice The other token of a pool a market is searching, beside the one its profit
+    /// is counted in; zero when the pool is not tracked or is never searched.
     function partnerOf(bytes32 poolId) external view returns (address) {
-        return tracked[poolId].partner;
+        Pool memory entry = pools[poolId];
+        if (entry.market != 0) {
+            if (entry.home == address(0)) return address(0);
+            return _other(keys[poolId], entry.home);
+        }
+        if (tracked[SZR_MARKET][poolId]) return _other(keys[poolId], token);
+        return address(0);
     }
 
     /// @notice Until when the cycle between `poolId` (the pool searched) and `venue` (zero
-    /// for Core redemption) is set aside after failing. `buying` is its direction: whether
-    /// the hook buys SZR in `poolId`.
-    function benchedUntil(bytes32 poolId, bytes32 venue, bool buying)
+    /// for Core redemption) is set aside after failing, in market `id` with profit counted
+    /// in `base`. `buying` is its direction: whether the hook buys `base` in `poolId`.
+    function benchedUntil(uint256 id, address base, bytes32 poolId, bytes32 venue, bool buying)
         external
         view
         returns (uint256)
     {
-        return benched[_pair(poolId, venue, buying)].until;
+        return benched[_pair(id, base, poolId, venue, buying)].until;
     }
 
-    function _pair(bytes32 poolId, bytes32 venue, bool buying) internal pure returns (bytes32) {
-        return keccak256(abi.encode(poolId, venue, buying));
+    function _pair(uint256 id, address base, bytes32 poolId, bytes32 venue, bool buying)
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(id, base, poolId, venue, buying));
     }
 
     /// @notice Runs the same search without a swap, for gaps that opened on a hookless
     /// pool or through a change in NAV. The caller receives nothing.
     function arb(bytes32 poolId) external returns (uint256 profit) {
-        Tracked memory entry = tracked[poolId];
-        if (entry.partner == address(0)) revert UnknownPool();
+        Pool memory entry = pools[poolId];
+        uint256 id = entry.market;
+        address base = entry.home;
+        // A pool that runs no hook can only be named in SZR's market.
+        if (id == 0) {
+            if (!tracked[SZR_MARKET][poolId]) revert UnknownPool();
+            id = SZR_MARKET;
+            base = token;
+        }
+        if (base == address(0)) revert UnknownPool();
         if (active != 0) revert Busy();
-        if (markets[entry.market].gasLimit == 0) return 0;
-        _enter(entry.market);
-        profit = abi.decode(poolManager.unlock(abi.encode(poolId)), (uint256));
-        active = 0;
-    }
-
-    function _enter(uint256 id) internal {
+        if (markets[id].gasLimit == 0) return 0;
         active = id;
-        home = markets[id].home;
+        home = base;
+        if (strained) strained = false;
+        bytes memory data = abi.encode(poolId, _other(keys[poolId], base));
+        profit = abi.decode(poolManager.unlock(data), (uint256));
+        active = 0;
     }
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
-        return abi.encode(_search(abi.decode(data, (bytes32)), true, false, address(0)));
+        (bytes32 poolId, address partner) = abi.decode(data, (bytes32, address));
+        return abi.encode(_search(poolId, partner, true, false, address(0)));
     }
 
     /// @notice Closes any gap that is already open before the swap trades, so the swap
@@ -619,7 +819,7 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         bytes calldata
     ) external returns (bytes4, BeforeSwapDelta, uint24) {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
-        _run(sender, PoolId.unwrap(pool.toId()), true);
+        _run(sender, pool, true);
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
@@ -632,22 +832,43 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         bytes calldata
     ) external returns (bytes4, int128) {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
-        _run(sender, PoolId.unwrap(pool.toId()), false);
+        _run(sender, pool, false);
         return (IHooks.afterSwap.selector, 0);
     }
 
     /// @dev Liquidity's own trades are left alone: its bounds assume the price it just set.
-    function _run(address sender, bytes32 poolId, bool before) internal {
+    function _run(address sender, PoolKey calldata pool, bool before) internal {
         if (sender == address(liquidity)) return;
         if (active != 0) return;
-        Tracked memory entry = tracked[poolId];
-        if (entry.partner == address(0)) return;
+        bytes32 poolId = PoolId.unwrap(pool.toId());
+        Pool memory entry = pools[poolId];
+        if (entry.market == 0) return;
+        // Neither of its tokens is one profit may be counted in.
+        if (entry.home == address(0)) return;
+        address partner = Currency.unwrap(pool.currency0) == entry.home
+            ? Currency.unwrap(pool.currency1)
+            : Currency.unwrap(pool.currency0);
+        _guard(poolId, entry, partner, before, sender);
+    }
+
+    /// @dev Runs the search within the market's gas allowance, and decides what a search
+    /// that was undone means for the swap.
+    function _guard(
+        bytes32 poolId,
+        Pool memory entry,
+        address partner,
+        bool before,
+        address sender
+    ) internal {
+        // Whatever an earlier swap left remembered is out of date by now. Cleared here,
+        // outside the search, so that it is cleared even if the search is undone.
+        if (before) remembered = bytes32(0);
         uint256 stipend = markets[entry.market].gasLimit;
         if (stipend == 0) return;
         // Whether the search is bounded by the hook's own allowance or by the swap's gas.
         uint256 available = gasleft();
         bool capped = available - available / 64 >= stipend;
-        try this.search{ gas: stipend }(poolId, capped, before, sender) { }
+        try this.search{ gas: stipend }(poolId, entry, partner, capped, before, sender) { }
         catch (bytes memory reason) {
             // If the swap, not the hook's own allowance, was what ran short, it brought
             // too little gas either to look for a gap (no revert data) or to close the one
@@ -657,18 +878,25 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
                 if (reason.length == 0) revert InsufficientGas();
                 if (bytes4(reason) == Starved.selector) revert InsufficientGas();
             }
-            // Anything else undid the search and leaves the swap as it would have been.
+            // Anything else undid the search and leaves the swap as it would have been,
+            // including what it would have cleared.
+            remembered = bytes32(0);
             emit SearchUndone(poolId, bytes4(reason));
         }
     }
 
-    function search(bytes32 poolId, bool capped, bool before, address payer)
-        external
-        onlySelf
-        returns (uint256 profit)
-    {
-        _enter(tracked[poolId].market);
-        profit = _search(poolId, capped, before, payer);
+    function search(
+        bytes32 poolId,
+        Pool calldata entry,
+        address partner,
+        bool capped,
+        bool before,
+        address payer
+    ) external onlySelf returns (uint256 profit) {
+        active = entry.market;
+        home = entry.home;
+        if (strained) strained = false;
+        profit = _search(poolId, partner, capped, before, payer);
         active = 0;
     }
 
@@ -684,14 +912,14 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// @dev `payer` is whoever is swapping (zero for `arb`). If they have marked a token
     /// as synced with the pool manager, that is dealt with before the first cycle; see
     /// `_release`.
-    function _search(bytes32 poolId, bool capped, bool before, address payer)
+    function _search(bytes32 poolId, address partner, bool capped, bool before, address payer)
         internal
         returns (uint256 profit)
     {
         // `UNRELEASED` until the pool manager's sync slot has been dealt with.
         address resync = UNRELEASED;
         // The pool being searched is always the first entry of its book.
-        Venue[] memory book = _book(poolId);
+        Venue[] memory book = _open(poolId, partner, payer);
         uint256 next = book.length;
         uint256 floor = _floor(book.length, before);
         uint256 failures;
@@ -711,7 +939,7 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
                 // have opened a gap between it and the pools it is compared with, so look
                 // from there next.
                 if (next == book.length) break;
-                book = _book(book[next].id);
+                book = _book(book[next].id, book[next].partner);
                 next = book.length;
                 // Never lowered: before a swap it also holds back gas for the search
                 // after it, which prices the first pool's venues, not this one's.
@@ -719,13 +947,14 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
                 if (again > floor) floor = again;
                 continue;
             }
+            // A token taken off the list is no longer paid out, so nothing is tried, and
+            // no swap is failed for bringing too little gas to try it.
+            if (!_listed()) break;
             // A cycle is only started with its whole budget available, and enough beyond
             // it to look again if it fails. Before a swap that also means enough for the
-            // swap and the search after it, so no cycle here, working or not, can leave
-            // them short. Closing a gap is required until one cycle has worked or
-            // `FAILURES_COVERED` have failed: with a gap open and too little gas for that,
-            // the swap fails. After that it is not: the search stops, and keeps what it
-            // has earned and what it has learned about failures.
+            // swap and the search after it. Closing a gap is required until one cycle has
+            // worked or more than `FAILURES_COVERED` have failed: with a gap open and too
+            // little gas for that, the swap fails. After that the search just stops.
             if (gasleft() < floor) {
                 if (_required(profit, failures, before)) {
                     if (!capped) revert Starved();
@@ -737,7 +966,7 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
             uint256 gained = _attempt(book[0].id, plan);
             if (gained == 0) {
                 failures++;
-                _bench(book[0].id, plan);
+                _fail(book, plan, payer);
                 continue;
             }
             profit += gained;
@@ -745,8 +974,71 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
             _requote(book[plan.index]);
             if (plan.venue != bytes32(0)) next = plan.index;
         }
-        if (profit != 0) _retire(profit);
+        if (profit != 0) return _settle(profit, resync);
         if (resync > UNRELEASED) poolManager.sync(Currency.wrap(resync));
+        if (before) _remember(book);
+    }
+
+    /// @dev Pays out what a search earned, then marks the swapper's token again if the
+    /// search had to clear it.
+    function _settle(uint256 profit, address resync) internal returns (uint256) {
+        _retire(profit);
+        if (resync > UNRELEASED) poolManager.sync(Currency.wrap(resync));
+        return profit;
+    }
+
+    /// @dev The venues a search prices. The search after a swap takes them from what the
+    /// search before it remembered, when there is something, and reads only the pool's
+    /// own new price. `arb` always reads everything.
+    function _open(bytes32 poolId, address partner, address payer)
+        internal
+        returns (Venue[] memory book)
+    {
+        if (payer == address(0)) return _book(poolId, partner);
+        if (remembered != poolId) return _book(poolId, partner);
+        remembered = bytes32(0);
+        uint256 slot = REMEMBER_SLOT;
+        book = new Venue[](_recall(slot));
+        book[0].id = poolId;
+        book[0].partner = partner;
+        _requote(book[0]);
+        for (uint256 index = 1; index < book.length; index++) {
+            slot += 4;
+            book[index].id = bytes32(_recall(slot));
+            book[index].partner = address(uint160(_recall(slot + 1)));
+            book[index].rate = _recall(slot + 2);
+            book[index].keep = _recall(slot + 3);
+        }
+    }
+
+    /// @dev Leaves the other venues' prices for the search after the swap. Only called
+    /// when the search before it traded nothing: then no pool has moved since they were
+    /// read, the swap between the two searches moves only its own pool, and nothing else
+    /// can run in between. The first word is the number of venues, the pool included.
+    function _remember(Venue[] memory book) internal {
+        if (gasleft() < REMEMBER_GAS * book.length) return;
+        uint256 slot = REMEMBER_SLOT;
+        _keepInMind(slot, book.length);
+        for (uint256 index = 1; index < book.length; index++) {
+            slot += 4;
+            _keepInMind(slot, uint256(book[index].id));
+            _keepInMind(slot + 1, uint256(uint160(book[index].partner)));
+            _keepInMind(slot + 2, book[index].rate);
+            _keepInMind(slot + 3, book[index].keep);
+        }
+        remembered = book[0].id;
+    }
+
+    function _keepInMind(uint256 slot, uint256 value) internal {
+        assembly ("memory-safe") {
+            tstore(slot, value)
+        }
+    }
+
+    function _recall(uint256 slot) internal view returns (uint256 value) {
+        assembly ("memory-safe") {
+            value := tload(slot)
+        }
     }
 
     /// @dev The gas a cycle needs before it may start: its own budget, retiring, and pricing
@@ -795,19 +1087,33 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         returns (bool)
     {
         if (profit != 0) return false;
-        return failures < (before ? FAILURES_COVERED : 1);
+        return failures < (before ? FAILURES_COVERED + 1 : 1);
     }
 
-    function _bench(bytes32 poolId, Plan memory plan) internal {
-        benched[_pair(poolId, plan.venue, plan.buying)] =
-            Bench(uint64(block.timestamp + BENCH_TIME), uint192(plan.gap));
+    /// @dev A swap's failed cycle is set aside. `arb` sets nothing aside, so that calling
+    /// it cannot switch a pair off for swappers; its venue is passed over for the rest of
+    /// that search instead.
+    function _fail(Venue[] memory book, Plan memory plan, address payer) internal {
+        _bench(book[0].id, plan, payer != address(0));
+        if (payer == address(0)) book[plan.index].rate = 0;
+    }
+
+    function _bench(bytes32 poolId, Plan memory plan, bool aside) internal {
         emit CycleFailed(poolId, plan.venue);
+        if (!aside) return;
+        benched[_pair(active, home, poolId, plan.venue, plan.buying)] =
+            Bench(uint64(block.timestamp + BENCH_TIME), uint192(plan.gap));
     }
 
     function _traded(address asset) internal view returns (bool) {
         if (asset == home) return true;
         if (asset == backingAsset) return true;
         return traded[active][asset];
+    }
+
+    /// @dev Whether profit may be counted in this search's token.
+    function _listed() internal view returns (bool) {
+        return _countable(active, home);
     }
 
     /// @dev SZR's market retires its profit at Core. Every other market's is paid out.
@@ -818,13 +1124,18 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         core.donateSzr(profit);
     }
 
-    /// @dev Splits a market's WETH profit between the protocol and the market.
+    /// @dev Splits a market's profit between the protocol and the market, in the token it
+    /// was counted in.
     function _payOut(uint256 profit) internal {
-        uint256 share = profit * PROTOCOL_SHARE / 100;
-        Currency weth = Currency.wrap(backingAsset);
-        poolManager.take(weth, protocolRecipient, share);
-        poolManager.take(weth, markets[active].recipient, profit - share);
-        emit ProfitPaid(active, profit, share);
+        // Rounded up, so that no profit is too small for the protocol to share in.
+        uint256 share = (profit * PROTOCOL_SHARE + 99) / 100;
+        Currency asset = Currency.wrap(home);
+        poolManager.take(asset, listing[home].recipient, share);
+        // Some tokens refuse a transfer of nothing.
+        if (profit != share) {
+            poolManager.take(asset, markets[active].recipient, profit - share);
+        }
+        emit ProfitPaid(active, home, profit, share);
     }
 
     /// @dev The first try stops where the depths of the legs say their prices meet. That
@@ -833,17 +1144,26 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// So the next try closes the whole gap, and each one after goes half as far. All the
     /// tries share `PLAN_GAS`; when it runs out the cycle has failed.
     function _attempt(bytes32 poolId, Plan memory plan) internal returns (uint256) {
-        (uint160 current,,,) = poolManager.getSlot0(PoolId.wrap(poolId));
+        // The pool's price, read only if a third size is reached.
+        uint160 current;
         uint256 budget = PLAN_GAS;
+        // Once a try has run out of gas, here or earlier in this search, only the smallest
+        // size is tried: an eighth of the whole gap, which crosses the fewest ticks of the
+        // sizes that close a set share of it.
+        bool smallest = strained;
         for (uint256 number; number < TRIES; number++) {
             if (budget < ATTEMPT_GAS) break;
             if (number == 1) {
                 plan.limit = plan.full;
                 plan.spend = plan.fullSpend;
             }
+            if (number == 2) (current,,,) = poolManager.getSlot0(PoolId.wrap(poolId));
             if (number > 1) {
                 plan.limit = uint160((uint256(current) + plan.limit) / 2);
                 plan.spend = plan.spend / 2 + 1;
+            }
+            if (smallest) {
+                if (number != TRIES - 1) continue;
             }
             // No try may use more than half the budget, so one that runs out of gas leaves
             // a full share for the next size.
@@ -854,6 +1174,11 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
             } catch { }
             uint256 used = available - gasleft();
             budget = used < budget ? budget - used : 0;
+            if (used >= stipend) {
+                if (!smallest) emit TryRanOut(poolId, plan.venue);
+                smallest = true;
+                strained = true;
+            }
         }
         return 0;
     }
@@ -867,7 +1192,7 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     {
         profit = plan.buying ? _buyCycle(poolId, plan) : _sellCycle(poolId, plan);
         if (profit == 0) revert Unprofitable();
-        if (profit < markets[active].minimumProfit) revert Unprofitable();
+        if (profit < minimumProfit[active][home]) revert Unprofitable();
         emit Arbitraged(poolId, plan.venue, plan.buying, profit);
     }
 
@@ -875,9 +1200,9 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// outputs: each connecting pool supplies the token owed to the pool before it, and the
     /// venue supplies what the last one is owed. Every token but SZR must net to nothing.
     function _buyCycle(bytes32 poolId, Plan calldata plan) internal returns (uint256 profit) {
-        address asset = tracked[poolId].partner;
-        (uint256 owed, uint256 bought) =
-            _trade(keys[poolId], asset, -int256(plan.spend), plan.limit);
+        PoolKey memory own = keys[poolId];
+        address asset = _other(own, home);
+        (uint256 owed, uint256 bought) = _trade(own, asset, -int256(plan.spend), plan.limit);
         for (uint256 hop; hop < 2; hop++) {
             if (plan.links[hop] == bytes32(0)) break;
             PoolKey memory link = keys[plan.links[hop]];
@@ -895,9 +1220,9 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// @dev Sells SZR in the pool down to the price limit, then carries the proceeds forward
     /// with exact inputs until they are SZR again.
     function _sellCycle(bytes32 poolId, Plan calldata plan) internal returns (uint256 profit) {
-        address asset = tracked[poolId].partner;
-        (uint256 sold, uint256 held) =
-            _trade(keys[poolId], home, -int256(plan.spend), plan.limit);
+        PoolKey memory own = keys[poolId];
+        address asset = _other(own, home);
+        (uint256 sold, uint256 held) = _trade(own, home, -int256(plan.spend), plan.limit);
         for (uint256 hop; hop < 2; hop++) {
             if (plan.links[hop] == bytes32(0)) break;
             PoolKey memory link = keys[plan.links[hop]];
@@ -974,18 +1299,20 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// @dev The venues one search prices, read in one call to the pool manager: the pool
     /// itself first, then the other leaders of its group, then the first leader of every
     /// other group, and Core last. Connecting pools are read when used.
-    function _book(bytes32 poolId) internal view returns (Venue[] memory book) {
-        bytes32[] memory ids = _venues(poolId, tracked[poolId].partner);
-        uint256 count = ids.length;
+    function _book(bytes32 poolId, address partner)
+        internal
+        view
+        returns (Venue[] memory book)
+    {
+        (bytes32[] memory ids, address[] memory partners, uint256 count) =
+            _venues(poolId, partner);
         // Only SZR's market can redeem at Core.
         bool redeemable = active == SZR_MARKET;
         book = new Venue[](redeemable ? count + 1 : count);
         bytes32[] memory slots = new bytes32[](count);
         for (uint256 index; index < count; index++) {
-            Tracked memory entry = tracked[ids[index]];
             book[index].id = ids[index];
-            book[index].partner = entry.partner;
-            book[index].fixedKeep = entry.keep;
+            book[index].partner = partners[index];
             slots[index] = StateLibrary._getPoolStateSlot(PoolId.wrap(ids[index]));
         }
         bytes32[] memory words = poolManager.extsload(slots);
@@ -997,27 +1324,38 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         _requote(book[count]);
     }
 
+    /// @dev Which pools a search prices and the partner token of each: the pool itself,
+    /// the other leaders of its group, and the first leader of every other group.
     function _venues(bytes32 poolId, address partner)
         internal
         view
-        returns (bytes32[] memory ids)
+        returns (bytes32[] memory ids, address[] memory partners, uint256 count)
     {
-        bytes32[] memory found = new bytes32[](MAX_LEADERS + MAX_GROUPS);
-        found[0] = poolId;
-        uint256 count = 1;
-        bytes32[] storage own = leaders[active][partner];
-        address[] storage groups = markets[active].groups;
-        for (uint256 index; index < own.length; index++) {
-            if (own[index] == poolId) continue;
-            found[count++] = own[index];
+        ids = new bytes32[](MAX_LEADERS + MAX_GROUPS);
+        partners = new address[](MAX_LEADERS + MAX_GROUPS);
+        uint256 id = active;
+        address base = home;
+        ids[0] = poolId;
+        partners[0] = partner;
+        count = 1;
+        bytes32[] storage own = leaders[id][base][partner];
+        uint256 size = own.length;
+        for (uint256 index; index < size; index++) {
+            bytes32 leader = own[index];
+            if (leader == poolId) continue;
+            ids[count] = leader;
+            partners[count] = partner;
+            count++;
         }
-        for (uint256 index; index < groups.length; index++) {
-            if (groups[index] == partner) continue;
-            found[count++] = leaders[active][groups[index]][0];
-        }
-        ids = new bytes32[](count);
-        for (uint256 index; index < count; index++) {
-            ids[index] = found[index];
+        address[] storage list = groups[id][base];
+        mapping(address => bytes32) storage firsts = heads[id][base];
+        size = list.length;
+        for (uint256 index; index < size; index++) {
+            address other = list[index];
+            if (other == partner) continue;
+            ids[count] = firsts[other];
+            partners[count] = other;
+            count++;
         }
     }
 
@@ -1036,13 +1374,6 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         uint24 fee;
         uint24 levy;
         (venue.rate, fee, levy) = _unpack(word, home < venue.partner);
-        // The stored factor covers the pool's own fee only.
-        if (levy == 0) {
-            if (venue.fixedKeep != 0) {
-                venue.keep = venue.fixedKeep;
-                return;
-            }
-        }
         venue.keep = _keep(_swapFee(fee, levy));
     }
 
@@ -1060,6 +1391,7 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         focus.partner = own.partner;
         focus.rate = own.rate;
         focus.keep = own.keep;
+        focus.edge = markets[active].minimumEdge;
         focus.seen = new address[](book.length);
         focus.routes = new Route[](book.length);
         for (uint256 other; other < book.length; other++) {
@@ -1096,7 +1428,7 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         uint256 edge = buying
             ? FixedPointMathLib.fullMulDiv(target, WAD, focus.rate)
             : FixedPointMathLib.fullMulDiv(focus.rate, WAD, target);
-        if (edge < markets[active].minimumEdge) return;
+        if (edge < focus.edge) return;
         if (edge > MAX_EDGE) return;
         if (venue.id == bytes32(0)) {
             // Core only buys SZR back; it is never a place to buy it.
@@ -1129,6 +1461,11 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         bytes32 direct = _connector(from, to);
         if (direct != bytes32(0)) {
             _hop(route, 0, direct, from < to);
+            return route;
+        }
+        // Two pools that meet at WETH would pass through the token profit is counted in.
+        if (home == backingAsset) {
+            route.rate = 0;
             return route;
         }
         bytes32 near = _connector(backingAsset, to);
@@ -1204,9 +1541,12 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
             FixedPointMathLib.fullMulDiv(gap, gap, WAD), depth, WAD
         );
         if (score == 0) return;
-        if (score < markets[active].minimumProfit) return;
+        // The estimate has to clear the smallest profit with room to spare. A cycle
+        // estimated just above it mostly returns just below, and fails at every size.
+        if (score < uint256(minimumProfit[active][home]) * PLAN_MARGIN / 100) return;
         if (score <= best.score) return;
-        Bench memory bench = benched[_pair(focus.id, candidate.venue, candidate.buying)];
+        Bench memory bench =
+            benched[_pair(active, home, focus.id, candidate.venue, candidate.buying)];
         if (block.timestamp < bench.until) {
             if (gap / BENCH_ESCAPE < bench.gap) return;
         }

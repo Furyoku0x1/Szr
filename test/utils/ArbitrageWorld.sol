@@ -224,10 +224,10 @@ abstract contract ArbitrageWorld is SzrWorld {
     /// Makes a pool a leader of its partner token's group, if there is room for another.
     function _lead(PoolKey memory pool) internal {
         address partner = _partnerOf(pool);
-        bytes32[] memory current = hook.leadersOf(1, partner);
+        bytes32[] memory current = hook.leadersOf(1, address(szr), partner);
         if (current.length == hook.MAX_LEADERS()) return;
         if (current.length == 0) {
-            if (hook.market(1).groups.length == hook.MAX_GROUPS()) return;
+            if (hook.groupsOf(1, address(szr)).length == hook.MAX_GROUPS()) return;
         }
         bytes32[] memory list = new bytes32[](current.length + 1);
         for (uint256 index; index < current.length; index++) {
@@ -240,7 +240,7 @@ abstract contract ArbitrageWorld is SzrWorld {
     /// Stops a pool leading, then stops tracking it.
     function _untrack(PoolKey memory pool) internal {
         address partner = _partnerOf(pool);
-        bytes32[] memory current = hook.leadersOf(1, partner);
+        bytes32[] memory current = hook.leadersOf(1, address(szr), partner);
         bytes32[] memory list = new bytes32[](current.length);
         uint256 kept;
         for (uint256 index; index < current.length; index++) {
@@ -252,18 +252,20 @@ abstract contract ArbitrageWorld is SzrWorld {
             }
             _setLeaders(partner, list);
         }
-        hook.untrack(_id(pool));
+        hook.untrack(1, _id(pool));
     }
 
     /// Sets leaders, raising the gas allowance when the new set of venues needs more.
     function _setLeaders(address partner, bytes32[] memory list) internal {
         uint32 allowance = hook.market(1).gasLimit;
-        uint128 profit = hook.market(1).minimumProfit;
+        uint128 profit = hook.minimumProfit(1, address(szr));
         uint64 edge = hook.market(1).minimumEdge;
-        hook.setLimits(1, 0, profit, edge);
-        hook.setLeaders(1, partner, list);
+        hook.setLimits(1, address(szr), 0, profit, edge);
+        hook.setLeaders(1, address(szr), partner, list);
         if (allowance == 0) return;
         uint256 needed = hook.minimumGasLimit(1);
-        hook.setLimits(1, uint32(allowance > needed ? allowance : needed), profit, edge);
+        hook.setLimits(
+            1, address(szr), uint32(allowance > needed ? allowance : needed), profit, edge
+        );
     }
 }

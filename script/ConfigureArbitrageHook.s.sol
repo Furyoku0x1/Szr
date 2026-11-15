@@ -51,12 +51,14 @@ contract ConfigureArbitrageHook is Script {
         Liquidity liquidity = config.hook.liquidity();
         vm.startBroadcast(liquidity.manager());
         // The allowance has to cover the leaders set below, so it goes up before they are.
+        address token = config.hook.token();
         if (config.gasLimit != 0) {
             config.hook
                 .setLimits(
                     1,
+                    token,
                     config.gasLimit,
-                    config.hook.market(1).minimumProfit,
+                    config.hook.minimumProfit(1, token),
                     config.hook.market(1).minimumEdge
                 );
         }
@@ -74,11 +76,11 @@ contract ConfigureArbitrageHook is Script {
             for (uint256 place; place < poolIds.length; place++) {
                 poolIds[place] = PoolId.unwrap(liquidity.key(group.positions[place]).toId());
             }
-            config.hook.setLeaders(1, group.partner, poolIds);
+            config.hook.setLeaders(1, token, group.partner, poolIds);
         }
         vm.stopBroadcast();
         console2.log("TRACKED_POOLS", config.hook.market(1).poolCount);
-        console2.log("GROUPS", config.hook.market(1).groups.length);
+        console2.log("GROUPS", config.hook.groupsOf(1, token).length);
         console2.log("GAS_LIMIT", config.hook.market(1).gasLimit);
         console2.log("MINIMUM_GAS_LIMIT", config.hook.minimumGasLimit(1));
     }

@@ -136,21 +136,24 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
         assertGt(_failures(), 0, "failed at first");
         // SZR looks cheap in the fake venue, so the failed cycle sells in the pool searched.
         assertGt(
-            hook.benchedUntil(_id(usdPool), _id(fake), false), block.timestamp, "set aside"
+            hook.benchedUntil(1, address(szr), _id(usdPool), _id(fake), false),
+            block.timestamp,
+            "set aside"
         );
         _trade(usdPool, address(usd), 50_000e18);
         _trade(usdPool, address(szr), 50_000e18);
         assertEq(_failures(), 0, "not retried while set aside");
-        vm.warp(hook.benchedUntil(_id(usdPool), _id(fake), false));
+        vm.warp(hook.benchedUntil(1, address(szr), _id(usdPool), _id(fake), false));
         _trade(usdPool, address(usd), 50_000e18);
         assertGt(_failures(), 0, "tried again afterwards");
     }
 
-    /// Forcing one marginal cycle to fail must not switch that pair off for a real gap.
-    /// The profit floor is set just above what a small cycle returns, so it fails and its
-    /// pair is set aside; a much wider gap between the same two pools is still taken.
-    function testMarginalFailureDoesNotSuppressARealGap() public {
-        hook.setLimits(1, 8_000_000, 0, 1.0001e18);
+    /// A cycle whose estimate only just clears the smallest profit mostly returns a little
+    /// less and fails at every size, which costs the swapper gas for nothing and sets the
+    /// pair aside. With the floor set just above what a small cycle returns, that cycle is
+    /// not tried at all, and a much wider gap between the same two pools is still taken.
+    function testMarginalCycleIsNotTried() public {
+        hook.setLimits(1, address(szr), 8_000_000, 0, 1.0001e18);
         _trade(usdPool, address(szr), 1e15);
         uint256 snapshot = vm.snapshotState();
         uint256 inventory = core.unreleasedSupply();
@@ -158,15 +161,18 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
         uint256 small = core.unreleasedSupply() - inventory;
         assertGt(small, 0, "small cycle earns something");
         vm.revertToState(snapshot);
-        hook.setLimits(1, 8_000_000, uint128(small + 1), 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, uint128(small + 1), 1.0001e18);
         vm.recordLogs();
-        _trade(usdPool, address(szr), 3_000e18);
-        assertGt(_failures(), 0, "marginal cycle failed");
-        assertGt(
-            hook.benchedUntil(_id(usdPool), _id(mainPool), true), block.timestamp, "set aside"
-        );
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
         inventory = core.unreleasedSupply();
+        _trade(usdPool, address(szr), 3_000e18);
+        assertEq(_failures(), 0, "marginal cycle not tried");
+        assertEq(core.unreleasedSupply(), inventory, "and nothing retired");
+        assertEq(
+            hook.benchedUntil(1, address(szr), _id(usdPool), _id(mainPool), true),
+            0,
+            "not set aside"
+        );
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
         assertGt(core.unreleasedSupply() - inventory, small * 10, "real gap still taken");
     }
@@ -194,7 +200,7 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
     /// the estimate far too small. The whole gap is tried as well, so the cycle still runs
     /// instead of failing at every size and being set aside.
     function testInflatedLiquidityDoesNotGetARealPairSetAside() public {
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
         // Park the price at the very end of one tick range, on the side the hook's own
         // purchase will leave, then add 200,000 times the pool's liquidity in that range.
@@ -220,7 +226,7 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
             ),
             ""
         );
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         uint256 inventory = core.unreleasedSupply();
         vm.recordLogs();
         hook.arb(_id(usdPool));
@@ -242,16 +248,20 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
         _trade(pool, address(szr), 1_000e18);
         assertGt(backing.balanceOf(address(this)), held, "swap filled");
         assertGt(_failures(), 0, "cycle through Core failed and was recorded");
-        assertGt(hook.benchedUntil(_id(pool), bytes32(0), true), block.timestamp, "set aside");
+        assertGt(
+            hook.benchedUntil(1, address(szr), _id(pool), bytes32(0), true),
+            block.timestamp,
+            "set aside"
+        );
         _assertHookEmpty();
     }
 
     /// If Core refuses the donation, the whole search is undone and the swap goes ahead as
     /// if the hook were not there. Nothing is left with the hook.
     function testCoreRefusingTheDonationUndoesTheSearch() public {
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         vm.mockCallRevert(
             address(core), abi.encodeWithSelector(core.donateSzr.selector), "closed"
         );
@@ -284,7 +294,7 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
         _fakeVenueWithFee(21_960, 1e22, 200);
         _trade(mainPool, address(backing), 600_000e18);
         uint256 snapshot = vm.snapshotState();
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         uint256 without = _buySzr();
         vm.revertToState(snapshot);
         uint256 inventory = core.unreleasedSupply();
@@ -351,10 +361,10 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
     /// between the old price and the aligned one can then no longer trade and reverts, as
     /// the README says. This pins that behaviour so a change to it is noticed.
     function testPriceLimitBetweenOldAndAlignedPriceReverts() public {
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
         (uint160 stale,,,) = manager.getSlot0(usdPool.toId());
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         // A purchase of SZR moves the price the same way the hook's own purchase does.
         bool zeroForOne = Currency.unwrap(usdPool.currency0) == address(usd);
         uint160 limit = zeroForOne ? stale - stale / 200 : stale + stale / 200;
@@ -365,12 +375,12 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
 
     /// Switching the hook off switches the permissionless entry off too.
     function testArbDoesNothingWhileTheHookIsOff() public {
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
         uint256 inventory = core.unreleasedSupply();
         assertEq(hook.arb(_id(usdPool)), 0);
         assertEq(core.unreleasedSupply(), inventory, "nothing retired");
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         assertGt(hook.arb(_id(usdPool)), 0, "back on");
     }
 
@@ -378,8 +388,8 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
     /// without saying so, so it is refused.
     function testMinimumEdgeAboveTheWidestGapIsRefused() public {
         vm.expectRevert(ArbitrageHook.InvalidLimit.selector);
-        hook.setLimits(1, 8_000_000, 10e18, 4e18 + 1);
-        hook.setLimits(1, 8_000_000, 10e18, 4e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 4e18 + 1);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 4e18);
     }
 
     /// The size of a cycle is estimated from liquidity in range at the current price.
@@ -392,7 +402,7 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
         _trade(mainPool, address(backing), 200_000e18);
         bool szrFirst = Currency.unwrap(usdPool.currency0) == address(szr);
         // Park the price right at the end of a tick range, so the wall starts at once.
-        hook.setLimits(1, 0, 0, 1.0001e18);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         (, int24 tick,,) = manager.getSlot0(usdPool.toId());
         int24 edge = szrFirst ? (tick / 60 + 1) * 60 : (tick / 60 - 1) * 60;
         uint160 parkedAt = TickMath.getSqrtPriceAtTick(edge);
@@ -403,7 +413,7 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
             settings,
             ""
         );
-        hook.setLimits(1, 8_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         // The hook buys SZR here, which moves the price up when SZR is the first token
         // and down when it is the second. The wall is the tick range it would enter.
         provider.modifyLiquidity(
@@ -481,5 +491,26 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
         assertEq(meddler.refused(), meddler.swaps(), "every attempt refused");
         assertEq(eur.balanceOf(address(hook)), 0, "hook partner");
         _assertHookEmpty();
+    }
+
+    /// Anyone can call `arb`, and can stage a failure for it. It reports the failure but
+    /// sets nothing aside, so it cannot be used to switch a pair off for swappers.
+    function testArbSetsNothingAside() public {
+        PoolKey memory fake = _fakeVenue(21_960, 1e22);
+        vm.recordLogs();
+        hook.arb(_id(usdPool));
+        assertGt(_failures(), 0, "failure reported");
+        assertEq(
+            hook.benchedUntil(1, address(szr), _id(usdPool), _id(fake), false),
+            0,
+            "not set aside"
+        );
+        // A swap still sets it aside, as before.
+        _trade(usdPool, address(usd), 1e15);
+        assertGt(
+            hook.benchedUntil(1, address(szr), _id(usdPool), _id(fake), false),
+            block.timestamp,
+            "set aside by a swap"
+        );
     }
 }

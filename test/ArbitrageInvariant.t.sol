@@ -130,7 +130,7 @@ contract ArbitrageHandler is Test {
     function _begin() internal returns (Watch memory watch) {
         watch.backing = core.backingAmount();
         watch.supply = core.activeSupply();
-        watch.floor = hook.market(1).minimumProfit;
+        watch.floor = hook.minimumProfit(1, address(szr));
         vm.recordLogs();
     }
 
@@ -419,6 +419,7 @@ contract ArbitrageHandler is Test {
         uint256 gas = seed % 8 == 0 ? 0 : bound(rawGas, hook.minimumGasLimit(1), 14_000_000);
         hook.setLimits(
             1,
+            address(szr),
             uint32(gas),
             uint128(bound(rawProfit, 0, 200e18)),
             uint64(bound(rawEdge, 1e18, 1.02e18))
@@ -434,7 +435,7 @@ contract ArbitrageHandler is Test {
         }
         // A leader has to stand down before it can be untracked.
         _lead(venues[index], false);
-        hook.untrack(poolId);
+        hook.untrack(1, poolId);
     }
 
     /// The manager changes which pools lead their group.
@@ -446,7 +447,7 @@ contract ArbitrageHandler is Test {
     }
 
     function _leads(PoolKey memory pool) internal view returns (bool) {
-        bytes32[] memory current = hook.leadersOf(1, _partner(pool));
+        bytes32[] memory current = hook.leadersOf(1, address(szr), _partner(pool));
         bytes32 poolId = PoolId.unwrap(pool.toId());
         for (uint256 index; index < current.length; index++) {
             if (current[index] == poolId) return true;
@@ -459,7 +460,7 @@ contract ArbitrageHandler is Test {
         if (_leads(pool) == wanted) return;
         address partner = _partner(pool);
         bytes32 poolId = PoolId.unwrap(pool.toId());
-        bytes32[] memory current = hook.leadersOf(1, partner);
+        bytes32[] memory current = hook.leadersOf(1, address(szr), partner);
         bytes32[] memory list = new bytes32[](wanted ? current.length + 1 : current.length - 1);
         if (list.length > hook.MAX_LEADERS()) return;
         uint256 kept;
@@ -469,13 +470,15 @@ contract ArbitrageHandler is Test {
         if (wanted) list[kept] = poolId;
         // The allowance must cover the venues a search prices, which this can change.
         uint32 allowance = hook.market(1).gasLimit;
-        uint128 floor = hook.market(1).minimumProfit;
+        uint128 floor = hook.minimumProfit(1, address(szr));
         uint64 edge = hook.market(1).minimumEdge;
-        hook.setLimits(1, 0, floor, edge);
-        hook.setLeaders(1, partner, list);
+        hook.setLimits(1, address(szr), 0, floor, edge);
+        hook.setLeaders(1, address(szr), partner, list);
         if (allowance == 0) return;
         uint256 needed = hook.minimumGasLimit(1);
-        hook.setLimits(1, uint32(allowance > needed ? allowance : needed), floor, edge);
+        hook.setLimits(
+            1, address(szr), uint32(allowance > needed ? allowance : needed), floor, edge
+        );
     }
 
     function toggleLink(uint256 seed) external {
@@ -499,7 +502,7 @@ contract ArbitrageHandler is Test {
 
     /// Puts the hook back in its normal configuration.
     function restore() external {
-        hook.setLimits(1, 14_000_000, 10e18, 1.0001e18);
+        hook.setLimits(1, address(szr), 14_000_000, 10e18, 1.0001e18);
         for (uint256 index; index < venues.length; index++) {
             bytes32 poolId = PoolId.unwrap(venues[index].toId());
             if (hook.partnerOf(poolId) == address(0)) hook.track(positions[index]);
@@ -610,11 +613,11 @@ contract ArbitrageInvariantTest is ArbitrageWorld {
     /// Every group has between one and the most leaders allowed, each one a tracked pool
     /// of that group's partner token, listed once.
     function invariantGroupsAndLeadersAreConsistent() public view {
-        uint256 count = hook.market(1).groups.length;
+        uint256 count = hook.groupsOf(1, address(szr)).length;
         assertLe(count, hook.MAX_GROUPS());
         for (uint256 index; index < count; index++) {
-            address partner = hook.market(1).groups[index];
-            bytes32[] memory list = hook.leadersOf(1, partner);
+            address partner = hook.groupsOf(1, address(szr))[index];
+            bytes32[] memory list = hook.leadersOf(1, address(szr), partner);
             assertGt(list.length, 0, "group without a leader");
             assertLe(list.length, hook.MAX_LEADERS());
             for (uint256 place; place < list.length; place++) {
