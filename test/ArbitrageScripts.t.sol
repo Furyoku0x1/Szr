@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import { Vm } from "forge-std/Vm.sol";
 import { ArbitrageWorld } from "./utils/ArbitrageWorld.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 import { ArbitrageHook } from "../src/ArbitrageHook.sol";
@@ -91,5 +92,97 @@ contract ArbitrageScriptsTest is ArbitrageWorld {
         uint256 inventory = core.unreleasedSupply();
         _trade(locker.key(id), address(szr), 50_000e18);
         assertGt(core.unreleasedSupply(), inventory, "new pool backrun through its route");
+    }
+
+    function _plan() internal view returns (ConfigureArbitrageHook.Config memory plan) {
+        plan.hook = hook;
+    }
+
+    /// With no variables the script still makes ETH's share go to Core, and leaves WETH's.
+    function testSetupScriptApprovesEthForCore() public {
+        assertEq(hook.shareRecipient(address(0)), address(0), "off before");
+        new ConfigureArbitrageHook().run(_plan());
+        assertEq(hook.shareRecipient(address(0)), address(core));
+        assertEq(hook.shareRecipient(address(backing)), address(core));
+    }
+
+    /// Listed tokens send their share to the treasury, and a second run changes nothing.
+    function testSetupScriptApprovesListedTokensForTheTreasury() public {
+        ConfigureArbitrageHook setup = new ConfigureArbitrageHook();
+        ConfigureArbitrageHook.Config memory plan = _plan();
+        plan.profitTokens = new address[](2);
+        plan.profitTokens[0] = address(usd);
+        plan.profitTokens[1] = address(0xE0A);
+        plan.treasury = address(0x7EA5);
+        setup.run(plan);
+        setup.run(plan);
+        assertEq(hook.shareRecipient(address(usd)), address(0x7EA5));
+        assertEq(hook.shareRecipient(address(0xE0A)), address(0x7EA5));
+        assertEq(hook.shareRecipient(address(0)), address(core));
+        assertEq(hook.shareRecipient(address(backing)), address(core));
+    }
+
+    function testSetupScriptRefusesTokensWithoutATreasury() public {
+        ConfigureArbitrageHook setup = new ConfigureArbitrageHook();
+        ConfigureArbitrageHook.Config memory plan = _plan();
+        plan.profitTokens = new address[](1);
+        plan.profitTokens[0] = address(usd);
+        vm.expectRevert(ConfigureArbitrageHook.MissingTreasury.selector);
+        setup.run(plan);
+    }
+
+    function testSetupScriptRefusesWethAndEthInTheList() public {
+        ConfigureArbitrageHook setup = new ConfigureArbitrageHook();
+        ConfigureArbitrageHook.Config memory plan = _plan();
+        plan.treasury = address(0x7EA5);
+        plan.profitTokens = new address[](1);
+        plan.profitTokens[0] = address(backing);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ConfigureArbitrageHook.ProfitTokenRefused.selector, address(backing)
+            )
+        );
+        setup.run(plan);
+        plan.profitTokens[0] = address(0);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ConfigureArbitrageHook.ProfitTokenRefused.selector, address(0)
+            )
+        );
+        setup.run(plan);
+    }
+
+    function testSetupScriptRefusesSzrAndAHookTreasury() public {
+        ConfigureArbitrageHook setup = new ConfigureArbitrageHook();
+        ConfigureArbitrageHook.Config memory plan = _plan();
+        plan.treasury = address(0x7EA5);
+        plan.profitTokens = new address[](1);
+        plan.profitTokens[0] = hook.token();
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ConfigureArbitrageHook.ProfitTokenRefused.selector, hook.token()
+            )
+        );
+        setup.run(plan);
+        plan.profitTokens[0] = address(usd);
+        plan.treasury = address(hook);
+        vm.expectRevert(ConfigureArbitrageHook.TreasuryIsHook.selector);
+        setup.run(plan);
+    }
+
+    /// A second run finds every recipient already set and sends no setProfitToken at all.
+    function testSecondRunSetsNothing() public {
+        ConfigureArbitrageHook setup = new ConfigureArbitrageHook();
+        ConfigureArbitrageHook.Config memory plan = _plan();
+        plan.profitTokens = new address[](1);
+        plan.profitTokens[0] = address(usd);
+        plan.treasury = address(0x7EA5);
+        setup.run(plan);
+        vm.recordLogs();
+        setup.run(plan);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 index; index < logs.length; index++) {
+            assertTrue(logs[index].topics[0] != ArbitrageHook.ProfitTokenSet.selector);
+        }
     }
 }

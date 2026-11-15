@@ -8,6 +8,7 @@ import { ArbitrageWorld } from "./utils/ArbitrageWorld.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 import { WrappingAsset } from "./utils/ArbitrageNative.sol";
 import { PayFirstRouter } from "./utils/Routers.sol";
+import { DrainRouter } from "./utils/ArbitrageDrain.sol";
 import { WrappedPool, WrappedPricer } from "./utils/WrappedPool.sol";
 import { ArbitrageHook } from "../src/ArbitrageHook.sol";
 import { SzrCore } from "../src/SzrCore.sol";
@@ -102,6 +103,7 @@ contract MarketsHandler is Test {
     PoolSwapTest public swapper;
     PayFirstRouter public payFirst;
     HostileHomeRouter public hostile;
+    DrainRouter public drainer;
     TestAsset public szr;
     TestAsset public weth;
     TestAsset public usd;
@@ -111,6 +113,7 @@ contract MarketsHandler is Test {
     /// Where the protocol's share goes, per token, whenever it is approved.
     address internal vault = address(0x7EA5);
     address internal desk = address(0x7EA6);
+    bytes32 internal constant TRANSFER = keccak256("Transfer(address,address,uint256)");
     PoolKey[] internal own;
     PoolKey[] internal theirs;
     PoolKey internal shared;
@@ -118,6 +121,9 @@ contract MarketsHandler is Test {
     /// The market's native ETH pools: one on the hook and a hookless one to trade it against.
     PoolKey internal ethHooked;
     PoolKey internal ethOpen;
+    /// The market's USD/ETH pool on the hook. Its USD/WETH counterpart is the public pool,
+    /// so a gap between them is closed through the wrap link.
+    PoolKey internal usdEth;
 
     bool public leaked;
     /// Set when the market was paid in a token it had not chosen or that was not approved.
@@ -132,6 +138,16 @@ contract MarketsHandler is Test {
     uint256 public hostileFilled;
     /// Payouts of profit counted in native ETH, which leave the hook as WETH.
     uint256 public ethPayouts;
+    /// Times the hook turned WETH into ETH inside a cycle: a burn of WETH is nothing else.
+    uint256 public unwraps;
+    /// Times the hook turned ETH into WETH inside a cycle: a mint of WETH is nothing else.
+    uint256 public wraps;
+    /// Swaps through the draining router, how many were refused, and whether one that filled
+    /// did anything other than what the same swap does with nothing drained.
+    uint256 public drainSwaps;
+    uint256 public drainRefused;
+    uint256 public drainAfter;
+    bool public drainSkipped;
 
     receive() external payable { }
 
@@ -148,6 +164,7 @@ contract MarketsHandler is Test {
         manager = arbitrage.poolManager();
         payFirst = new PayFirstRouter(manager);
         hostile = new HostileHomeRouter(manager);
+        drainer = new DrainRouter(manager);
         szr = TestAsset(arbitrage.token());
         weth = TestAsset(arbitrage.backingAsset());
         usd = dollars;
@@ -170,6 +187,13 @@ contract MarketsHandler is Test {
         pair[0] = PoolId.unwrap(hooked.toId());
         pair[1] = PoolId.unwrap(open.toId());
         hook.setLeaders(id, address(0), address(coin), pair);
+    }
+
+    /// The market's USD/ETH pool, the only pool in the group of ETH under USD.
+    function createUsdEth(PoolKey calldata pool) external {
+        hook.createPool(id, pool, uint160(1 << 96));
+        usdEth = pool;
+        hook.setLeaders(id, address(usd), address(0), _one(PoolId.unwrap(pool.toId())));
     }
 
     function create(PoolKey calldata pool) external {
@@ -236,6 +260,7 @@ contract MarketsHandler is Test {
         TestAsset(input).approve(address(swapper), type(uint256).max);
         TestAsset(input).approve(address(payFirst), type(uint256).max);
         TestAsset(input).approve(address(hostile), type(uint256).max);
+        TestAsset(input).approve(address(drainer), type(uint256).max);
     }
 
     /// What one market must never change in the other: SZR's inventory and pool prices on
@@ -265,6 +290,12 @@ contract MarketsHandler is Test {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
             if (logs[index].topics[0] == ArbitrageHook.SearchUndone.selector) undoneSearches++;
+            if (logs[index].emitter == address(weth)) {
+                if (logs[index].topics[0] == TRANSFER) {
+                    if (logs[index].topics[2] == bytes32(0)) unwraps++;
+                    if (logs[index].topics[1] == bytes32(0)) wraps++;
+                }
+            }
             if (logs[index].topics[0] != ArbitrageHook.ProfitPaid.selector) continue;
             if (uint256(logs[index].topics[1]) != id) continue;
             address asset = address(uint160(uint256(logs[index].topics[2])));
@@ -337,6 +368,25 @@ contract MarketsHandler is Test {
         teamActions++;
     }
 
+    /// Trades in the market's USD/ETH pool with ETH in or USD in. The public USD/WETH pool
+    /// moves on its own, so the two drift apart and the hook closes the gap through the
+    /// wrap link, in whichever direction it opens.
+    function usdEthSwap(bool sell, uint256 raw) external {
+        uint256 amount = bound(raw, 1e15, 25_000e18);
+        address input = sell ? address(usd) : address(0);
+        if (sell) _fund(input, amount);
+        else vm.deal(address(this), address(this).balance + amount);
+        bytes32 before = _szrSide();
+        PoolSwapTest.TestSettings memory settings;
+        _watch();
+        swapper.swap{ value: sell ? 0 : amount }(
+            usdEth, _params(usdEth, input, amount), settings, ""
+        );
+        _audit();
+        if (_szrSide() != before) leaked = true;
+        teamActions++;
+    }
+
     function teamPaidFirst(uint256 seed, bool sell, uint256 raw) external {
         PoolKey memory pool = theirs[seed % theirs.length];
         address input = sell ? address(coin) : _other(pool, address(coin));
@@ -393,6 +443,80 @@ contract MarketsHandler is Test {
         if (_szrSide() != before) leaked = true;
         hostileSwaps++;
         teamActions++;
+    }
+
+    /// Borrows the pool manager's whole balance of a token for the length of a swap in one
+    /// of the market's pools, the USD/ETH pool with its wrap link included. The swap must be
+    /// refused (a gap was open before it), or fill; and if no search was undone by the
+    /// shortage, do exactly what the same swap does with nothing borrowed, which is closing
+    /// every gap it meets. A search after the swap undone by the shortage may leave a gap
+    /// that the control closes, so that comparison is skipped for it.
+    function teamDrain(uint256 seed, bool sell, uint256 raw) external {
+        bool link = seed % (theirs.length + 1) == theirs.length;
+        PoolKey memory pool = link ? usdEth : theirs[seed % theirs.length];
+        address input;
+        if (link) input = sell ? address(usd) : address(0);
+        else input = sell ? address(coin) : _other(pool, address(coin));
+        uint256 amount = bound(raw, 1e15, 25_000e18);
+        if (input == address(0)) vm.deal(address(drainer), address(drainer).balance + amount);
+        else _fund(input, amount);
+        uint256 pick = (seed / 8) % 4;
+        address drained = pick == 0 ? address(weth) : pick == 1 ? address(usd) : address(0);
+        if (pick == 3) drained = address(coin);
+        // The wrapped pool's own hook takes its input from the pool manager, which no check
+        // of this contract can stand in for, so it is left out of both runs. Draining the
+        // token a wrapped pool's hook takes is not covered: see the backlog.
+        uint256 hidden = pricer.mode();
+        pricer.arm(1);
+        uint256 snapshot = vm.snapshotState();
+        _watch();
+        bool filled = _drainSwap(pool, input, amount, drained, 0);
+        bool undone = _undoneByDrain();
+        bytes32 team = _teamSide();
+        bytes32 szrSide = _szrSide();
+        if (filled) vm.revertToState(snapshot);
+        _watch();
+        _drainSwap(pool, input, amount, drained, type(uint256).max);
+        _audit();
+        pricer.arm(hidden);
+        if (filled) {
+            if (undone) {
+                drainAfter++;
+            } else {
+                if (team != _teamSide()) drainSkipped = true;
+                if (szrSide != _szrSide()) drainSkipped = true;
+            }
+        } else {
+            drainRefused++;
+        }
+        drainSwaps++;
+        teamActions++;
+    }
+
+    /// Whether a search was undone by the shortage since `_watch`.
+    function _undoneByDrain() internal returns (bool) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 index; index < logs.length; index++) {
+            if (logs[index].topics[0] != ArbitrageHook.SearchUndone.selector) continue;
+            if (abi.decode(logs[index].data, (bytes4)) == ArbitrageHook.Drained.selector) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function _drainSwap(
+        PoolKey memory pool,
+        address input,
+        uint256 amount,
+        address drained,
+        uint256 leave
+    ) internal returns (bool filled) {
+        try drainer.trade{ gas: 30_000_000 }(pool, input, amount, drained, leave) {
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     /// The owner reorders the WETH leaders, or switches the market off and on.
@@ -479,15 +603,25 @@ contract ArbitrageMarketsInvariantTest is ArbitrageWorld {
         // Paid out as WETH, to the same place as WETH profit, so the split can be checked.
         hook.setProfitToken(address(0), vault);
         vm.deal(address(this), 2_000_000e18);
-        // The world's WETH has no `deposit()`; the real one does.
+        // The world's WETH has neither `deposit()` nor `withdraw()`; the real one has both,
+        // and sends the ETH it unwraps from its own balance.
         vm.etch(address(backing), address(new WrappingAsset()).code);
-        handler = new MarketsHandler(hook, swapper, coin, usd);
+        vm.deal(address(backing), 2_000_000e18);
+        // Deployed by name: embedding the handler's code would put this contract over the
+        // size limit.
+        handler = MarketsHandler(
+            payable(deployCode(
+                    "ArbitrageMarketsInvariant.t.sol:MarketsHandler",
+                    abi.encode(hook, swapper, coin, usd)
+                ))
+        );
         handler.addOwn(mainPool);
         handler.addOwn(usdPool);
         _create(address(backing), 3_000);
         _create(address(backing), 500);
         _create(address(usd), 3_000);
         _createEth();
+        _createUsdEth();
         // A fourth pool that leads nothing, for the owner to untrack and track again.
         _create(address(backing), 10_000);
         // The world's WETH/USD pool, which runs no hook and connects SZR's own pools.
@@ -502,7 +636,10 @@ contract ArbitrageMarketsInvariantTest is ArbitrageWorld {
         handler.start(publicPool, _wrapped(), pricer);
         szr.transfer(address(handler), 2_000_000e18);
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](17);
+        bytes4[] memory selectors = new bytes4[](20);
+        selectors[19] = handler.teamDrain.selector;
+        selectors[17] = handler.usdEthSwap.selector;
+        selectors[18] = handler.usdEthSwap.selector;
         selectors[15] = handler.ethSwap.selector;
         selectors[16] = handler.ethSwap.selector;
         selectors[14] = handler.teamSweep.selector;
@@ -534,6 +671,19 @@ contract ArbitrageMarketsInvariantTest is ArbitrageWorld {
         handler.createEth(hooked, open);
         _provideEth(hooked);
         _provideEth(open);
+    }
+
+    /// A hooked pool of USD against native ETH, beside the public USD/WETH pool.
+    function _createUsdEth() internal {
+        PoolKey memory pool = PoolKey(
+            Currency.wrap(address(0)),
+            Currency.wrap(address(usd)),
+            3_000,
+            60,
+            IHooks(address(hook))
+        );
+        handler.createUsdEth(pool);
+        _provideEth(pool);
     }
 
     function _ethPool(address hooks) internal view returns (PoolKey memory) {
@@ -600,6 +750,7 @@ contract ArbitrageMarketsInvariantTest is ArbitrageWorld {
     function invariantMarketsStayApartAndTheSplitHolds() public view {
         assertFalse(handler.leaked(), "one market changed the other");
         assertFalse(handler.paidWrongly(), "paid in a token not approved and chosen");
+        assertFalse(handler.drainSkipped(), "a borrowed balance changed what a swap did");
         assertEq(coin.balanceOf(address(hook)), 0, "hook coin");
         assertEq(coin.balanceOf(handler.treasury()), 0, "paid in the hostile token");
         _assertHookEmpty();
@@ -667,12 +818,46 @@ contract ArbitrageMarketsInvariantTest is ArbitrageWorld {
         invariantMarketsStayApartAndTheSplitHolds();
     }
 
+    /// A fixed run reaches a cycle that unwraps, so the invariant runs are known to as well:
+    /// the public pool moves WETH's price in USD, and a swap in the USD/ETH pool finds it.
+    function testWrapLinkConvertsInTheLongRun() public {
+        handler.publicSwap(true, 400_000e18);
+        handler.usdEthSwap(true, 1_000e18);
+        handler.publicSwap(false, 400_000e18);
+        handler.usdEthSwap(false, 1_000e18);
+        assertGt(handler.unwraps(), 0, "WETH unwrapped inside a cycle");
+        assertGt(handler.wraps(), 0, "ETH wrapped inside a cycle");
+        assertFalse(handler.leaked(), "leaked");
+        invariantMarketsStayApartAndTheSplitHolds();
+    }
+
+    /// The market's native ETH pools and its WETH pools pair the same token, so each is a
+    /// venue of the other. A fixed run reaches cycles that cross between them (a conversion
+    /// in each direction), as the invariant runs do, with swaps in both pools.
+    function testEtherTwinsCycleInTheLongRun() public {
+        handler.ethSwap(1, true, 25_000e18);
+        handler.teamSwap(0, true, 25_000e18);
+        handler.ethSwap(0, true, 25_000e18);
+        handler.teamSwap(1, false, 25_000e18);
+        handler.ethSwap(0, false, 25_000e18);
+        handler.teamSwap(0, false, 25_000e18);
+        assertGt(handler.unwraps(), 0, "WETH unwrapped inside a cycle");
+        assertGt(handler.wraps(), handler.ethPayouts(), "ETH wrapped inside a cycle");
+        assertFalse(handler.leaked(), "leaked");
+        invariantMarketsStayApartAndTheSplitHolds();
+    }
+
     function afterInvariant() public view {
         console2.log("open market paid, WETH", backing.balanceOf(handler.treasury()) / 1e18);
         console2.log("  protocol share, WETH", backing.balanceOf(vault) / 1e18);
         console2.log("open market paid, USD", usd.balanceOf(handler.treasury()) / 1e18);
         console2.log("  protocol share, USD", usd.balanceOf(desk) / 1e18);
         console2.log("ETH profit payouts", handler.ethPayouts());
+        console2.log("unwraps inside cycles", handler.unwraps());
+        console2.log("wraps inside cycles", handler.wraps());
+        console2.log("drained swaps", handler.drainSwaps());
+        console2.log("  of which refused", handler.drainRefused());
+        console2.log("  of which filled with a search undone", handler.drainAfter());
         console2.log("hostile swaps", handler.hostileSwaps());
         console2.log("  of which filled", handler.hostileFilled());
     }

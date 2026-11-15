@@ -190,6 +190,9 @@ contract ArbitrageGasTest is ArbitrageWorld {
         _addHooked(address(usd), 100);
         uint256 few = _noGapCost();
         assertLt(few, 420_000, "six pools, all leaders");
+        // The limit the drained-pool guard was held to, enforced from here on.
+        assertLe(few, 247_531, "six pools, no gap, gas");
+        emit log_named_uint("no-gap swap gas, six pools", few);
         poolUnits = 1_000e18;
         for (uint256 index; index < 60; index++) {
             address partner = index % 2 == 0 ? address(backing) : address(usd);
@@ -198,6 +201,17 @@ contract ArbitrageGasTest is ArbitrageWorld {
         assertEq(hook.market(1).poolCount, 66);
         uint256 many = _noGapCost();
         assertLt(many, few + few / 50, "sixty more pools tracked, same cost");
+    }
+
+    /// The stated gas allowance and what a swap that closes a gap costs, which the guarded
+    /// takes must leave where it was.
+    function testGapClosingSwapGasAndAllowance() public {
+        assertEq(hook.minimumGasLimit(1), 6_620_000, "minimum allowance");
+        uint256 spent = gasleft();
+        _trade(usdPool, address(szr), 50_000e18);
+        spent -= gasleft();
+        emit log_named_uint("gap-closing swap gas", spent);
+        emit log_named_uint("minimumGasLimit(1)", hook.minimumGasLimit(1));
     }
 
     function _noGapCost() internal returns (uint256 spent) {

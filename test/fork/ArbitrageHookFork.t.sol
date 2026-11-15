@@ -2,6 +2,7 @@
 pragma solidity 0.8.30;
 
 import { Test } from "forge-std/Test.sol";
+import { Vm } from "forge-std/Vm.sol";
 import { IERC20 } from "forge-std/interfaces/IERC20.sol";
 import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { PoolModifyLiquidityTest } from "v4-core/test/PoolModifyLiquidityTest.sol";
@@ -20,6 +21,8 @@ import { ILegacySzrHook, ILegacySzrToken } from "../../src/SzrMigration.sol";
 import { Liquidity } from "../../src/Liquidity.sol";
 import { FeeCollector } from "../../src/FeeCollector.sol";
 import { TestAsset } from "../utils/TestAsset.sol";
+import { ArbitrageProbe } from "../utils/ArbitrageProbe.sol";
+import { ConvertMeter } from "../utils/ArbitrageNative.sol";
 
 /// @notice Rehearsal of the arbitrage hook on Robinhood Chain itself: the real PoolManager,
 /// the real WETH, and the real Safe singleton factory the deploy script goes through.
@@ -243,6 +246,139 @@ contract ArbitrageHookForkTest is Test {
         assertEq(weth.balanceOf(address(arbitrage)), 0, "hook weth");
         assertEq(usd.balanceOf(address(arbitrage)), 0, "hook usd");
         emit log_named_decimal_uint("SZR retired through a triangle", retired, 18);
+    }
+
+    /// The same triangle with a USD/ETH pool as the way across, so the cycle converts
+    /// between WETH and ETH through the wrap link on the real WETH, which sends the ETH it
+    /// unwraps from its own address. A gap with the main pool above the new one makes the
+    /// hook buy SZR in the new pool and unwrap; the other way round makes it wrap.
+    function testWrapLinkConvertsOnTheLiveChain() public {
+        if (!live) return vm.skip(true);
+        (PoolKey memory pool, uint256 bought) = _ethTriangle();
+        uint256 inventory = core.unreleasedSupply();
+        vm.recordLogs();
+        uint256 start = gasleft();
+        _swap(pool, address(szr), bought / 100);
+        uint256 used = start - gasleft();
+        assertGt(core.unreleasedSupply() - inventory, 0, "gap retired, unwrapping WETH");
+        (, uint256 burns) = _conversions();
+        assertGt(burns, 0, "WETH was burned by the hook");
+        emit log_named_uint("swap closing a gap with WETH to ETH gas", used);
+        _assertHookEmpty();
+    }
+
+    function testWrapLinkWrapsOnTheLiveChain() public {
+        if (!live) return vm.skip(true);
+        (PoolKey memory pool, uint256 bought) = _ethTriangle();
+        // The gap the lifted main pool left is closed first.
+        _swap(pool, address(szr), bought / 100);
+        usd.mint(TRADER, 1_000e18);
+        vm.prank(TRADER);
+        usd.approve(address(router), type(uint256).max);
+        // USD bought in the new pool makes SZR dearer there than in the main pool, a gap the
+        // swap opens itself and the search after it closes by selling there.
+        uint256 inventory = core.unreleasedSupply();
+        vm.recordLogs();
+        uint256 start = gasleft();
+        _swap(pool, address(usd), 5e17);
+        uint256 used = start - gasleft();
+        assertGt(core.unreleasedSupply() - inventory, 0, "gap retired, wrapping ETH");
+        (uint256 mints,) = _conversions();
+        assertGt(mints, 0, "WETH was minted by the hook");
+        emit log_named_uint("swap closing a gap with ETH to WETH gas", used);
+        _assertHookEmpty();
+    }
+
+    /// WETH minted from nothing and burned during the call: the hook wrapping and unwrapping.
+    function _conversions() internal returns (uint256 mints, uint256 burns) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 index; index < logs.length; index++) {
+            if (logs[index].emitter != address(weth)) continue;
+            if (logs[index].topics[0] != keccak256("Transfer(address,address,uint256)")) {
+                continue;
+            }
+            if (logs[index].topics[1] == bytes32(0)) mints++;
+            if (logs[index].topics[2] == bytes32(0)) burns++;
+        }
+    }
+
+    /// Each conversion alone, through the real pool manager and the real WETH, as the hook
+    /// does it: take, deposit or withdraw, sync, pay in, settle. Its gas is reported, and
+    /// is far below the `PLAN_GAS / 2` a try at a cycle is given.
+    function testEachConversionOnTheLiveChain() public {
+        if (!live) return vm.skip(true);
+        _launch();
+        address probeAt = address(uint160(0xA4B2 << 24 | 1 << 7 | 1 << 6));
+        deployCodeTo("ArbitrageProbe.sol:ArbitrageProbe", abi.encode(locker), probeAt);
+        ArbitrageProbe probe = ArbitrageProbe(payable(probeAt));
+        ConvertMeter meter = new ConvertMeter{ value: 10 ether }(manager, probe, address(weth));
+        (bool ok,) = address(weth).call{ value: 10 ether }(abi.encodeWithSignature("deposit()"));
+        assertTrue(ok, "deposit");
+        weth.transfer(address(meter), 10 ether);
+        vm.cool(address(weth));
+        uint256 wrap = meter.measure(address(0), 1 ether);
+        vm.cool(address(weth));
+        uint256 unwrap = meter.measure(address(weth), 1 ether);
+        emit log_named_uint("conversion ETH to WETH gas", wrap);
+        emit log_named_uint("conversion WETH to ETH gas", unwrap);
+        (, uint256 attempt) = probe.gasAllowances();
+        assertLt(wrap, attempt / 4, "wrap");
+        assertLt(unwrap, attempt / 4, "unwrap");
+        assertEq(probeAt.balance, 0, "no ether kept");
+        assertEq(weth.balanceOf(probeAt), 0, "no WETH kept");
+    }
+
+    TestAsset internal usd;
+
+    function _assertHookEmpty() internal view {
+        assertEq(szr.balanceOf(address(arbitrage)), 0, "hook szr");
+        assertEq(weth.balanceOf(address(arbitrage)), 0, "hook weth");
+        assertEq(usd.balanceOf(address(arbitrage)), 0, "hook usd");
+        assertEq(address(arbitrage).balance, 0, "hook ether");
+    }
+
+    /// Launches, then sets up a hooked SZR/USD pool beside the main SZR/WETH pool with a
+    /// USD/ETH pool as their only connection. The main pool is lifted above the new one.
+    function _ethTriangle() internal returns (PoolKey memory pool, uint256 bought) {
+        _launch();
+        usd = new TestAsset();
+        deal(address(weth), TRADER, 20e18);
+        deal(TRADER, 100e18);
+        usd.mint(TRADER, 1_000e18);
+        vm.startPrank(TRADER);
+        weth.approve(address(router), type(uint256).max);
+        weth.approve(address(provider), type(uint256).max);
+        szr.approve(address(router), type(uint256).max);
+        szr.approve(address(provider), type(uint256).max);
+        usd.approve(address(router), type(uint256).max);
+        usd.approve(address(provider), type(uint256).max);
+        vm.stopPrank();
+        PoolKey memory route = PoolKey(
+            Currency.wrap(address(0)),
+            Currency.wrap(address(usd)),
+            3_000,
+            60,
+            IHooks(address(0))
+        );
+        manager.initialize(route, uint160(1 << 96));
+        vm.prank(TRADER);
+        provider.modifyLiquidity{ value: 10e18 }(
+            route,
+            IPoolManager.ModifyLiquidityParams(
+                TickMath.minUsableTick(60), TickMath.maxUsableTick(60), 10e18, 0
+            ),
+            ""
+        );
+        vm.prank(TEAM);
+        locker.registerRoute(route);
+        pool = _addUsdPool(address(usd), route);
+        _swap(mainPool, address(weth), 2e18);
+        bought = szr.balanceOf(TRADER);
+        (uint160 price,,,) = manager.getSlot0(pool.toId());
+        bool szrFirst = Currency.unwrap(pool.currency0) == address(szr);
+        _provide(
+            pool, szrFirst ? bought / 2 * price / (1 << 96) : bought / 2 * (1 << 96) / price
+        );
     }
 
     function _provide(PoolKey memory pool, uint256 units) internal {

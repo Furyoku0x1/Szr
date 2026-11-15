@@ -14,23 +14,19 @@ import { SzrCore } from "../../src/SzrCore.sol";
 import { SzrMigration, ILegacySzrHook, ILegacySzrToken } from "../../src/SzrMigration.sol";
 import { Liquidity } from "../../src/Liquidity.sol";
 
+interface ILegacyFees {
+    function feeRecipient() external view returns (address);
+}
+
 /// @notice Rehearsal against the live legacy SZR hook on Robinhood Chain. Skipped unless
-/// FORK_RPC_URL is set; FORK_BLOCK pins the block (the holders below were read at 112788329).
+/// FORK_RPC_URL is set; FORK_BLOCK pins the block.
 ///   FORK_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-path "test/fork/*"
 contract SzrForkTest is Test {
     address internal constant LEGACY = 0xbeD7c1660a01dbEEe225bd893ac31727a91A5773;
     uint256 internal constant INITIAL = 25_000_000e18;
-    // Real holders of the old token, impersonated on the fork to migrate it.
-    address[7] internal holders = [
-        0xA365B69A5AfCe3BD08577a9420902354365E951e,
-        0x1305869ceD9527EA23f30E116f6E8dC7AdC21122,
-        0xF27E6D330D1f61A01e17C987B07dB416434C2c85,
-        0x15579C473047Cb226159f64cD21b621B921F5637,
-        0xA2f8BC096023142e5cC50EE6168DDc709cbd5b93,
-        0x3eE67aD5Dd107e0d801c86A6A61401c74F515DC9,
-        0x77445B7a3592DBdcc8b0B03D51547C24923e2fb2
-    ];
-    address internal constant HOLDER = 0xf6be30ef5504aFd02E93dBAbe6E082177db5f644;
+    // Old SZR holders come from buying it through the live legacy pool, so the test does
+    // not depend on any address still holding it.
+    address internal constant HOLDER = address(0x401D);
     address internal constant TEAM = address(0x7EA);
 
     ILegacySzrHook internal hook;
@@ -142,6 +138,7 @@ contract SzrForkTest is Test {
         if (!live) return vm.skip(true);
         _deploy();
         address attacker = address(0xBAD);
+        _acquireOld(HOLDER, 2e18);
         deal(address(weth), attacker, 40e18);
         uint256 room = core.migrationRemaining();
         IERC20 szr = IERC20(address(core.token()));
@@ -164,12 +161,26 @@ contract SzrForkTest is Test {
         emit log_named_decimal_uint(
             "attacker WETH lost over 22 cycles", 40e18 - weth.balanceOf(attacker), 18
         );
-        _migrateAll(HOLDER); // a real holder still migrates
+        _migrateAll(HOLDER); // a holder can still migrate
+    }
+
+    /// Gives `who` real old SZR by buying it from the live hook, as a user would.
+    function _acquireOld(address who, uint256 spend) internal {
+        deal(address(weth), who, spend);
+        assertGt(_buyOld(who, spend), 0);
+    }
+
+    function _buyHolders() internal returns (address[7] memory holders) {
+        for (uint256 index; index < holders.length; index++) {
+            holders[index] = address(uint160(0x5000 + index));
+            _acquireOld(holders[index], (index + 1) * 1e18);
+        }
+        _acquireOld(HOLDER, 2e18);
     }
 
     function _migrateAll(address owner) internal returns (uint256 amount, uint256 recovered) {
         amount = old.balanceOf(owner);
-        assertGt(amount, 0, "impersonated holder no longer holds old SZR at this block");
+        assertGt(amount, 0, "nothing to migrate");
         (recovered,,) = migrator.quote(amount);
         vm.startPrank(owner);
         old.approve(address(migrator), amount);
@@ -199,24 +210,51 @@ contract SzrForkTest is Test {
         emit log_named_decimal_uint("WETH held by the hook", weth.balanceOf(address(hook)), 18);
     }
 
-    function testFullLaunchAgainstTheLiveLegacyHook() public {
-        if (!live) return vm.skip(true);
-        uint256 hookWeth = weth.balanceOf(address(hook));
-        _deploy();
+    /// The holders of the old token when the rehearsal was written (block 112788329).
+    function _realHolders() internal pure returns (address[8] memory) {
+        return [
+            0xA365B69A5AfCe3BD08577a9420902354365E951e,
+            0x1305869ceD9527EA23f30E116f6E8dC7AdC21122,
+            0xF27E6D330D1f61A01e17C987B07dB416434C2c85,
+            0x15579C473047Cb226159f64cD21b621B921F5637,
+            0xA2f8BC096023142e5cC50EE6168DDc709cbd5b93,
+            0x3eE67aD5Dd107e0d801c86A6A61401c74F515DC9,
+            0x77445B7a3592DBdcc8b0B03D51547C24923e2fb2,
+            0xf6be30ef5504aFd02E93dBAbe6E082177db5f644
+        ];
+    }
 
-        // The deploy script funded the genesis position from Core's own inventory.
-        assertTrue(locker.initialLiquidityFunded());
-        uint256 genesis = core.activeSupply();
-        assertGt(genesis, INITIAL - 1e18);
-        assertEq(core.reserveCash(), 0);
-        assertEq(core.migrationRemaining(), 350_000_000e18);
-        assertEq(old.balanceOf(deployer), 0);
-        assertEq(weth.balanceOf(address(hook)), hookWeth);
-        assertEq(core.auctionsOpenAt(), 0);
+    /// Best effort: whoever of the original holders still holds old SZR migrates at the flat
+    /// floor, as real holders do. The hook then loses exactly what the migrator pays and its
+    /// fee recipient gains nothing. Runs before any buy of the test's own.
+    function _migrateRealHolders() internal returns (uint256 migrated, uint256 recovered) {
+        address[8] memory real = _realHolders();
+        address feeTo = ILegacyFees(address(hook)).feeRecipient();
+        uint256 feesBefore = weth.balanceOf(feeTo);
+        uint256 hookBefore = weth.balanceOf(address(hook));
+        uint256 count;
+        for (uint256 index; index < real.length; index++) {
+            if (old.balanceOf(real[index]) == 0) continue;
+            (uint256 amount, uint256 backing) = _migrateAll(real[index]);
+            migrated += amount;
+            recovered += backing;
+            count++;
+        }
+        assertEq(hookBefore - weth.balanceOf(address(hook)), recovered);
+        assertEq(weth.balanceOf(feeTo), feesBefore);
+        emit log_named_uint("original holders migrated at the floor", count);
+    }
 
-        // Real holders migrate through the real hook, each at the same flat price.
-        uint256 migrated;
-        uint256 recovered;
+    /// The test's own buys left WETH in the old hook's band. A sell served from the band pays
+    /// the migrator the quoted amount and also sends the hook's protocol fee to its fee
+    /// recipient, so the hook loses exactly both.
+    function _migrateBand(address[7] memory holders)
+        internal
+        returns (uint256 migrated, uint256 recovered)
+    {
+        address feeTo = ILegacyFees(address(hook)).feeRecipient();
+        uint256 feesBefore = weth.balanceOf(feeTo);
+        uint256 hookBefore = weth.balanceOf(address(hook));
         for (uint256 index; index < holders.length; index++) {
             (uint256 amount, uint256 backing) = _migrateAll(holders[index]);
             migrated += amount;
@@ -225,10 +263,36 @@ contract SzrForkTest is Test {
         (uint256 own, uint256 ownBacking) = _migrateAll(HOLDER);
         migrated += own;
         recovered += ownBacking;
+        uint256 fees = weth.balanceOf(feeTo) - feesBefore;
+        assertGt(fees, 0);
+        assertLe(fees * 1000, recovered * 4); // measured at about 0.3%
+        assertEq(hookBefore - weth.balanceOf(address(hook)), recovered + fees);
+    }
+
+    function testFullLaunchAgainstTheLiveLegacyHook() public {
+        if (!live) return vm.skip(true);
+        _deploy();
+        // The deploy script funded the genesis position from Core's own inventory.
+        assertTrue(locker.initialLiquidityFunded());
+        uint256 genesis = core.activeSupply();
+        assertGt(genesis, INITIAL - 1e18);
+        assertEq(core.reserveCash(), 0);
+        assertEq(core.migrationRemaining(), 350_000_000e18);
+        assertEq(old.balanceOf(deployer), 0);
+        assertEq(core.auctionsOpenAt(), 0);
+
+        // Logged before the test's own buys, so it reflects the live state.
+        (uint256 migrated, uint256 recovered) = _migrateRealHolders();
+        _logFullMigrationNav(recovered, genesis + migrated);
+
+        // Synthetic holders bought through the legacy pool are served from its band.
+        address[7] memory holders = _buyHolders();
+        (uint256 bandMigrated, uint256 bandRecovered) = _migrateBand(holders);
+        migrated += bandMigrated;
+        recovered += bandRecovered;
         IERC20 szr = IERC20(address(core.token()));
-        assertEq(szr.balanceOf(HOLDER), own);
+        uint256 own = szr.balanceOf(HOLDER);
         assertEq(core.reserveCash(), recovered);
-        assertEq(hookWeth - weth.balanceOf(address(hook)), recovered);
 
         // The unbacked genesis tokens share the reserves, so NAV is below what each migrator
         // brought in.
@@ -237,13 +301,6 @@ contract SzrForkTest is Test {
         assertLt(nav, hook.quoteSellExactIn(1e18).netWethOut);
         emit log_named_decimal_uint("old SZR migrated in this rehearsal", migrated, 18);
         emit log_named_decimal_uint("NAV after those migrations", nav, 18);
-        uint256 sellable = old.totalSupply() - old.balanceOf(address(hook)) - 1;
-        emit log_named_decimal_uint(
-            "NAV if every sellable old SZR migrates",
-            (recovered + hook.quoteSellExactIn(sellable).netWethOut) * 1e18
-                / (genesis + migrated + sellable),
-            18
-        );
 
         // Redemption pays real WETH at NAV while migration is still open.
         vm.startPrank(HOLDER);
@@ -259,6 +316,20 @@ contract SzrForkTest is Test {
 
         // The genesis price stays above NAV even after everyone has migrated.
         assertGt(_config().marketPrice, nav);
+        _scriptRefusesLowPrice();
+    }
+
+    function _logFullMigrationNav(uint256 recovered, uint256 supply) internal {
+        uint256 sellable = old.totalSupply() - old.balanceOf(address(hook)) - 1;
+        emit log_named_decimal_uint(
+            "NAV if every sellable old SZR migrates",
+            (recovered + hook.quoteSellExactIn(sellable).netWethOut) * 1e18
+                / (supply + sellable),
+            18
+        );
+    }
+
+    function _scriptRefusesLowPrice() internal {
         // The script refuses a genesis price below the highest NAV migration could reach.
         // Last, because a reverted script run leaves its broadcast open.
         DeploySzr.Config memory low = _config();

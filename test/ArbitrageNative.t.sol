@@ -336,21 +336,21 @@ contract ArbitrageNativeTest is MarketsWorld {
         _assertClean();
     }
 
-    /// A market counting in WETH takes a hookless WETH/ETH pool as a venue and a hookless
-    /// TEAM/ETH pool as the way across to it.
-    function testWethMarketUsesHooklessEthPools() public {
+    /// A market counting in WETH takes a hookless WETH/USD pool as a venue and a hookless
+    /// TEAM/USD pool as the way across to it. (A pool of WETH and ETH is never searched.)
+    function testWethMarketUsesHooklessPools() public {
         id = wethMarket;
-        PoolKey memory venue = _make(address(0), address(backing), 3_000, address(0));
-        PoolKey memory cross = _make(address(0), address(coin), 3_000, address(0));
+        PoolKey memory venue = _make(address(usd), address(backing), 500, address(0));
+        PoolKey memory cross = _make(address(usd), address(coin), 100, address(0));
         _venue(venue);
         vm.prank(team);
         hook.setConnector(id, cross, true);
-        _lead(address(backing), address(0), _list(_id(venue)));
+        _lead(address(backing), address(usd), _list(_id(venue)));
         _in(venue, address(backing), 50_000e18);
         uint256 before = backing.balanceOf(treasury);
         vm.recordLogs();
         _in(first, address(coin), 1_000e18);
-        assertGt(_cycles(), 0, "closed through the ETH pools");
+        assertGt(_cycles(), 0, "closed through the hookless pools");
         assertGt(backing.balanceOf(treasury), before, "paid in WETH");
         _assertClean();
     }
@@ -414,16 +414,16 @@ contract ArbitrageNativeTest is MarketsWorld {
         assertEq(hook.leadersOf(id, address(0), address(coin))[0], _id(asBase));
         assertEq(hook.groupsOf(id, address(0))[0], address(coin));
         id = wethMarket;
-        PoolKey memory asPartner = _make(address(0), address(backing), 3_000, address(0));
+        PoolKey memory asPartner = _make(address(0), address(usd), 3_000, address(0));
         _venue(asPartner);
-        _lead(address(backing), address(0), _list(_id(asPartner)));
-        assertEq(hook.leadersOf(id, address(backing), address(0))[0], _id(asPartner));
-        address[] memory groups = hook.groupsOf(id, address(backing));
+        _lead(address(usd), address(0), _list(_id(asPartner)));
+        assertEq(hook.leadersOf(id, address(usd), address(0))[0], _id(asPartner));
+        address[] memory groups = hook.groupsOf(id, address(usd));
         assertEq(groups[groups.length - 1], address(0));
         // A pool of the wrong pair is refused whichever side is zero.
         vm.prank(team);
         vm.expectRevert(ArbitrageHook.InvalidPool.selector);
-        hook.setLeaders(id, address(backing), address(0), _list(_id(first)));
+        hook.setLeaders(id, address(usd), address(0), _list(_id(first)));
     }
 
     /// Paying the profit out costs less than the gas a search holds back for retiring, with
