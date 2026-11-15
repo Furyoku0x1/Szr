@@ -25,6 +25,22 @@ import { TestAsset } from "../utils/TestAsset.sol";
 /// the real WETH, and the real Safe singleton factory the deploy script goes through.
 /// Skipped unless FORK_RPC_URL is set.
 ///   FORK_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-path "test/fork/*"
+/// @dev Does what the hook does with ETH profit once it holds it: wraps it and sends the
+/// WETH to two recipients. Returns the gas that took.
+contract PayoutSim {
+    function pay(address asset, address first, address second, uint256 profit, uint256 share)
+        external
+        returns (uint256 used)
+    {
+        uint256 start = gasleft();
+        (bool ok,) = asset.call{ value: profit }(abi.encodeWithSignature("deposit()"));
+        require(ok, "deposit");
+        IERC20(asset).transfer(first, share);
+        IERC20(asset).transfer(second, profit - share);
+        used = start - gasleft();
+    }
+}
+
 contract ArbitrageHookForkTest is Test {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -123,6 +139,32 @@ contract ArbitrageHookForkTest is Test {
             settings,
             ""
         );
+    }
+
+    /// The native ETH payout wraps the profit and sends the WETH on, which relies on the
+    /// real token minting one for one, and must fit in the gas a search holds back for it.
+    /// The real token is a proxy, so its first call costs more than a plain contract's.
+    /// @dev The measurement covers the wrap and the two transfers only. It leaves out the
+    /// pool manager's `take`, the hook's `receive`, `_requireSettled` and the event, which
+    /// the local `testEthPayoutFitsInTheRetireReserve` measures with the whole payout. The
+    /// 250,000 is `RETIRE_GAS`.
+    function testRealWethMintsOneForOneOnDeposit() public {
+        if (!live) return vm.skip(true);
+        _launch();
+        address asset = arbitrage.backingAsset();
+        PayoutSim sim = new PayoutSim();
+        vm.deal(address(sim), 3 ether);
+        address protocol = address(0xC01D1);
+        address owner = address(0xC01D2);
+        vm.cool(asset);
+        vm.cool(protocol);
+        vm.cool(owner);
+        uint256 used = sim.pay(asset, protocol, owner, 3 ether, 1 ether);
+        emit log_named_uint("ETH payout gas (wrap and two transfers)", used);
+        assertLt(used, 250_000, "under RETIRE_GAS");
+        assertEq(IERC20(asset).balanceOf(protocol), 1 ether, "protocol share");
+        assertEq(IERC20(asset).balanceOf(owner), 2 ether, "market share");
+        assertEq(address(sim).balance, 0, "ether taken");
     }
 
     function testHookDeploysAndBackrunsOnTheLiveChain() public {

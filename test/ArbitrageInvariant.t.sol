@@ -172,6 +172,7 @@ contract ArbitrageHandler is Test {
     }
 
     function _checkEmpty() internal {
+        if (address(hook).balance != 0) hookHeld = true;
         for (uint256 index; index < assets.length; index++) {
             address asset = assets[index];
             if (TestAsset(asset).balanceOf(address(hook)) != stray[asset]) hookHeld = true;
@@ -298,6 +299,13 @@ contract ArbitrageHandler is Test {
         if (hook.partnerOf(poolId) == address(0)) return;
         Watch memory watch = _begin();
         hook.arb(poolId);
+        _end(watch);
+    }
+
+    /// Anyone can sweep SZR's market.
+    function hookSweep() external {
+        Watch memory watch = _begin();
+        hook.sweep(1, address(szr));
         _end(watch);
     }
 
@@ -573,7 +581,8 @@ contract ArbitrageInvariantTest is ArbitrageWorld {
     }
 
     function _target() internal virtual {
-        bytes4[] memory selectors = new bytes4[](21);
+        bytes4[] memory selectors = new bytes4[](22);
+        selectors[21] = handler.hookSweep.selector;
         selectors[20] = handler.toggleLeader.selector;
         selectors[18] = handler.paidFirst.selector;
         selectors[19] = handler.presynced.selector;

@@ -15,6 +15,7 @@ import { BalanceDelta } from "v4-core/types/BalanceDelta.sol";
 
 interface IArbitrageOwner {
     function setRecipient(uint256 id, address recipient) external;
+    function sweep(uint256 id, address base) external returns (uint256);
 }
 
 /// @dev Stands in for one of Uniswap's aggregator hooks. Each pool on it wraps a
@@ -31,7 +32,10 @@ contract WrappedPool {
     /// 1: trade `target` in the middle of the swap. 2: call the arbitrage hook as a
     /// market's owner. 3: fill an exact-output swap one unit short. 4: pay in one unit
     /// less than it reports. 5: credit the arbitrage hook with one unit of the output.
+    /// 6: call the hook's `sweep`, keeping the selector it reverted with in `seen`.
     uint256 public mode;
+    /// 7: pay an output of native ETH with `settle{ value }`, without syncing first.
+    bytes4 public seen;
     PoolKey public target;
     address public arbitrage;
     uint256 public market;
@@ -39,6 +43,8 @@ contract WrappedPool {
     constructor(IPoolManager poolManager) {
         manager = poolManager;
     }
+
+    receive() external payable { }
 
     function seed(PoolKey calldata pool, uint256 first, uint256 second) external {
         reserves[PoolId.unwrap(pool.toId())] = [first, second];
@@ -71,10 +77,14 @@ contract WrappedPool {
             if (!exactInput) sent = given - 1;
         }
         Currency output = params.zeroForOne ? pool.currency1 : pool.currency0;
-        manager.sync(output);
-        TestAsset(Currency.unwrap(output))
-            .transfer(address(manager), mode == 4 ? sent - 1 : sent);
-        manager.settle();
+        if (mode == 7) {
+            manager.settle{ value: sent }();
+        } else {
+            manager.sync(output);
+            TestAsset(Currency.unwrap(output))
+                .transfer(address(manager), mode == 4 ? sent - 1 : sent);
+            manager.settle();
+        }
         if (mode == 5) {
             manager.sync(output);
             TestAsset(Currency.unwrap(output)).transfer(address(manager), 1);
@@ -117,6 +127,12 @@ contract WrappedPool {
             manager.take(target.currency1, address(this), uint128(delta.amount1()));
         }
         if (mode == 2) IArbitrageOwner(arbitrage).setRecipient(market, address(this));
+        if (mode == 6) {
+            try IArbitrageOwner(arbitrage).sweep(market, address(0)) { }
+            catch (bytes memory reason) {
+                seen = bytes4(reason);
+            }
+        }
     }
 }
 

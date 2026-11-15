@@ -6,6 +6,7 @@ import { Vm } from "forge-std/Vm.sol";
 import { console2 } from "forge-std/console2.sol";
 import { ArbitrageWorld } from "./utils/ArbitrageWorld.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
+import { WrappingAsset } from "./utils/ArbitrageNative.sol";
 import { PayFirstRouter } from "./utils/Routers.sol";
 import { WrappedPool, WrappedPricer } from "./utils/WrappedPool.sol";
 import { ArbitrageHook } from "../src/ArbitrageHook.sol";
@@ -107,15 +108,32 @@ contract MarketsHandler is Test {
     HostileAsset public coin;
     uint256 public id;
     address public treasury = address(0x7EA4);
+    /// Where the protocol's share goes, per token, whenever it is approved.
+    address internal vault = address(0x7EA5);
+    address internal desk = address(0x7EA6);
     PoolKey[] internal own;
     PoolKey[] internal theirs;
     PoolKey internal shared;
     WrappedPricer internal pricer;
+    /// The market's native ETH pools: one on the hook and a hookless one to trade it against.
+    PoolKey internal ethHooked;
+    PoolKey internal ethOpen;
 
     bool public leaked;
+    /// Set when the market was paid in a token it had not chosen or that was not approved.
+    bool public paidWrongly;
+    /// Searches undone by a misbehaving balance. Counted here because auditing reads the
+    /// recorded logs, which empties them for anyone else.
+    uint256 public undoneSearches;
+    /// Liquidity's manager, who approves tokens.
+    address internal admin;
     uint256 public teamActions;
     uint256 public hostileSwaps;
     uint256 public hostileFilled;
+    /// Payouts of profit counted in native ETH, which leave the hook as WETH.
+    uint256 public ethPayouts;
+
+    receive() external payable { }
 
     constructor(
         ArbitrageHook arbitrage,
@@ -123,6 +141,7 @@ contract MarketsHandler is Test {
         HostileAsset asset,
         TestAsset dollars
     ) {
+        admin = msg.sender;
         hook = arbitrage;
         swapper = swaps;
         core = arbitrage.core();
@@ -134,6 +153,23 @@ contract MarketsHandler is Test {
         usd = dollars;
         coin = asset;
         id = arbitrage.openMarket(treasury);
+        address[] memory chosen = new address[](3);
+        chosen[0] = address(weth);
+        chosen[1] = address(usd);
+        chosen[2] = address(0);
+        arbitrage.setTokens(id, chosen);
+    }
+
+    /// The market's native ETH pools, led together by the hostile token's group of ETH.
+    function createEth(PoolKey calldata hooked, PoolKey calldata open) external {
+        hook.createPool(id, hooked, uint160(1 << 96));
+        hook.addVenue(id, open);
+        ethHooked = hooked;
+        ethOpen = open;
+        bytes32[] memory pair = new bytes32[](2);
+        pair[0] = PoolId.unwrap(hooked.toId());
+        pair[1] = PoolId.unwrap(open.toId());
+        hook.setLeaders(id, address(0), address(coin), pair);
     }
 
     function create(PoolKey calldata pool) external {
@@ -174,6 +210,7 @@ contract MarketsHandler is Test {
         uint32 gas = uint32(hook.minimumGasLimit(id));
         hook.setLimits(id, address(weth), gas, 1e15, 1.0001e18);
         hook.setLimits(id, address(usd), gas, 1e15, 1.0001e18);
+        hook.setLimits(id, address(0), gas, 1e15, 1.0001e18);
     }
 
     function _other(PoolKey memory pool, address asset) internal pure returns (address) {
@@ -218,6 +255,33 @@ contract MarketsHandler is Test {
         );
     }
 
+    function _watch() internal {
+        vm.recordLogs();
+    }
+
+    /// Nothing changes the market's tokens during a swap, so the lists read now are the
+    /// ones the payout saw.
+    function _audit() internal {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 index; index < logs.length; index++) {
+            if (logs[index].topics[0] == ArbitrageHook.SearchUndone.selector) undoneSearches++;
+            if (logs[index].topics[0] != ArbitrageHook.ProfitPaid.selector) continue;
+            if (uint256(logs[index].topics[1]) != id) continue;
+            address asset = address(uint160(uint256(logs[index].topics[2])));
+            if (asset == address(0)) ethPayouts++;
+            if (hook.shareRecipient(asset) == address(0)) paidWrongly = true;
+            if (!_chosen(asset)) paidWrongly = true;
+        }
+    }
+
+    function _chosen(address asset) internal view returns (bool) {
+        address[] memory list = hook.tokensOf(id);
+        for (uint256 index; index < list.length; index++) {
+            if (list[index] == asset) return true;
+        }
+        return false;
+    }
+
     function szrSwap(bool sell, uint256 raw) external {
         PoolKey memory pool = own[1];
         address input = sell ? address(szr) : _other(pool, address(szr));
@@ -249,7 +313,26 @@ contract MarketsHandler is Test {
         _fund(input, amount);
         bytes32 before = _szrSide();
         PoolSwapTest.TestSettings memory settings;
+        _watch();
         swapper.swap(pool, _params(pool, input, amount), settings, "");
+        _audit();
+        if (_szrSide() != before) leaked = true;
+        teamActions++;
+    }
+
+    /// Trades in the market's native ETH pools, with ETH in or the hostile token in.
+    function ethSwap(uint256 seed, bool sell, uint256 raw) external {
+        PoolKey memory pool = seed % 2 == 0 ? ethHooked : ethOpen;
+        uint256 amount = bound(raw, 1e15, 25_000e18);
+        if (sell) _fund(address(coin), amount);
+        else vm.deal(address(this), address(this).balance + amount);
+        bytes32 before = _szrSide();
+        PoolSwapTest.TestSettings memory settings;
+        _watch();
+        swapper.swap{ value: sell ? 0 : amount }(
+            pool, _params(pool, sell ? address(coin) : address(0), amount), settings, ""
+        );
+        _audit();
         if (_szrSide() != before) leaked = true;
         teamActions++;
     }
@@ -260,7 +343,9 @@ contract MarketsHandler is Test {
         uint256 amount = bound(raw, 1e15, 25_000e18);
         _fund(input, amount);
         bytes32 before = _szrSide();
+        _watch();
         payFirst.trade(pool, input, amount);
+        _audit();
         if (_szrSide() != before) leaked = true;
         teamActions++;
     }
@@ -269,8 +354,25 @@ contract MarketsHandler is Test {
         bytes32 poolId = PoolId.unwrap(theirs[seed % theirs.length].toId());
         // `arb` refuses a pool that is not tracked.
         if (!hook.tracked(id, poolId)) return;
+        // `arb` also refuses a pool whose token the market has dropped.
+        if (hook.partnerOf(poolId) == address(0)) return;
         bytes32 before = _szrSide();
+        _watch();
         hook.arb(poolId);
+        _audit();
+        if (_szrSide() != before) leaked = true;
+        teamActions++;
+    }
+
+    /// Anyone sweeps the market for one of its profit tokens. Like `arb`, it must not
+    /// reach SZR's market.
+    function teamSweep(uint256 seed) external {
+        address base = seed % 3 == 0 ? address(weth) : address(usd);
+        if (seed % 3 == 2) base = address(0);
+        bytes32 before = _szrSide();
+        _watch();
+        hook.sweep(id, base);
+        _audit();
         if (_szrSide() != before) leaked = true;
         teamActions++;
     }
@@ -282,10 +384,12 @@ contract MarketsHandler is Test {
         uint256 amount = bound(raw, 1e15, 25_000e18);
         _fund(address(coin), amount);
         bytes32 before = _szrSide();
+        _watch();
         try hostile.trade{ gas: 12_000_000 }(pool, coin, amount, bound(mode, 1, 3)) {
             hostileFilled++;
         } catch { }
         coin.arm(0);
+        _audit();
         if (_szrSide() != before) leaked = true;
         hostileSwaps++;
         teamActions++;
@@ -296,7 +400,8 @@ contract MarketsHandler is Test {
         bytes32[] memory list = hook.leadersOf(id, address(weth), address(coin));
         if (seed % 2 == 0) {
             (list[0], list[1]) = (list[1], list[0]);
-            hook.setLeaders(id, address(weth), address(coin), list);
+            // Refused while WETH is not both approved and chosen.
+            try hook.setLeaders(id, address(weth), address(coin), list) { } catch { }
             return;
         }
         ArbitrageHook.Market memory settings = hook.market(id);
@@ -309,6 +414,42 @@ contract MarketsHandler is Test {
         bytes32 spare = PoolId.unwrap(theirs[3].toId());
         if (hook.tracked(id, spare)) return hook.untrack(id, spare);
         hook.retrack(spare);
+    }
+
+    /// The owner reorders or drops the tokens the market counts profit in. A choice that
+    /// needs more gas than the allowance is refused, which is what the hook promises.
+    function teamTokens(uint256 seed) external {
+        address[] memory list;
+        uint256 pick = seed % 5;
+        if (pick == 4) {
+            list = new address[](0);
+        } else if (pick > 1) {
+            list = new address[](1);
+            list[0] = pick == 2 ? address(weth) : address(usd);
+        } else {
+            list = new address[](2);
+            list[0] = pick == 0 ? address(weth) : address(usd);
+            list[1] = pick == 0 ? address(usd) : address(weth);
+        }
+        address[] memory withEth = new address[](list.length + 1);
+        for (uint256 index; index < list.length; index++) {
+            withEth[index] = list[index];
+        }
+        try hook.setTokens(id, withEth) { } catch { }
+    }
+
+    /// Liquidity's manager takes a token off, or approves it again with its old recipient.
+    function approval(uint256 seed) external {
+        uint256 pick = seed % 3;
+        address asset = pick == 0 ? address(weth) : pick == 1 ? address(usd) : address(0);
+        address recipient = hook.shareRecipient(asset);
+        if (recipient != address(0)) {
+            vm.prank(admin);
+            hook.setProfitToken(asset, address(0));
+            return;
+        }
+        vm.prank(admin);
+        hook.setProfitToken(asset, asset == address(usd) ? desk : vault);
     }
 
     /// The wrapped pool's pricer starts or stops giving bad answers.
@@ -333,19 +474,20 @@ contract ArbitrageMarketsInvariantTest is ArbitrageWorld {
         super.setUp();
         coin = new HostileAsset();
         _approve(coin);
-        address[] memory assets = new address[](2);
-        address[] memory recipients = new address[](2);
-        assets[0] = address(backing);
-        assets[1] = address(usd);
-        recipients[0] = vault;
-        recipients[1] = desk;
-        hook.setProfitTokens(assets, recipients);
+        hook.setProfitToken(address(backing), vault);
+        hook.setProfitToken(address(usd), desk);
+        // Paid out as WETH, to the same place as WETH profit, so the split can be checked.
+        hook.setProfitToken(address(0), vault);
+        vm.deal(address(this), 2_000_000e18);
+        // The world's WETH has no `deposit()`; the real one does.
+        vm.etch(address(backing), address(new WrappingAsset()).code);
         handler = new MarketsHandler(hook, swapper, coin, usd);
         handler.addOwn(mainPool);
         handler.addOwn(usdPool);
         _create(address(backing), 3_000);
         _create(address(backing), 500);
         _create(address(usd), 3_000);
+        _createEth();
         // A fourth pool that leads nothing, for the owner to untrack and track again.
         _create(address(backing), 10_000);
         // The world's WETH/USD pool, which runs no hook and connects SZR's own pools.
@@ -360,7 +502,12 @@ contract ArbitrageMarketsInvariantTest is ArbitrageWorld {
         handler.start(publicPool, _wrapped(), pricer);
         szr.transfer(address(handler), 2_000_000e18);
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](12);
+        bytes4[] memory selectors = new bytes4[](17);
+        selectors[15] = handler.ethSwap.selector;
+        selectors[16] = handler.ethSwap.selector;
+        selectors[14] = handler.teamSweep.selector;
+        selectors[12] = handler.teamTokens.selector;
+        selectors[13] = handler.approval.selector;
         selectors[11] = handler.pricerMode.selector;
         selectors[10] = handler.teamToggle.selector;
         selectors[0] = handler.szrSwap.selector;
@@ -376,9 +523,39 @@ contract ArbitrageMarketsInvariantTest is ArbitrageWorld {
         targetSelector(FuzzSelector(address(handler), selectors));
     }
 
+    receive() external payable { }
+
+    /// A hooked and a hookless pool of the hostile token against native ETH.
+    function _createEth() internal {
+        PoolKey memory hooked = _ethPool(address(hook));
+        PoolKey memory open = _ethPool(address(0));
+        open.fee = 500;
+        manager.initialize(open, uint160(1 << 96));
+        handler.createEth(hooked, open);
+        _provideEth(hooked);
+        _provideEth(open);
+    }
+
+    function _ethPool(address hooks) internal view returns (PoolKey memory) {
+        return PoolKey(
+            Currency.wrap(address(0)), Currency.wrap(address(coin)), 3_000, 60, IHooks(hooks)
+        );
+    }
+
+    function _provideEth(PoolKey memory pool) internal {
+        provider.modifyLiquidity{ value: 500_000e18 }(
+            pool,
+            IPoolManager.ModifyLiquidityParams(
+                TickMath.minUsableTick(60), TickMath.maxUsableTick(60), 400_000e18, 0
+            ),
+            ""
+        );
+    }
+
     /// A pool of the hostile token against WETH on a wrapping hook, with its pricer.
     function _wrapped() internal returns (PoolKey memory pool) {
-        WrappedPool wrapper = WrappedPool(address(uint160(0xBEEF << 24 | 1 << 7 | 1 << 3)));
+        WrappedPool wrapper =
+            WrappedPool(payable(address(uint160(0xBEEF << 24 | 1 << 7 | 1 << 3))));
         deployCodeTo("WrappedPool.sol:WrappedPool", abi.encode(manager), address(wrapper));
         pricer = new WrappedPricer(wrapper);
         hook.setPricer(address(wrapper), address(pricer));
@@ -422,6 +599,7 @@ contract ArbitrageMarketsInvariantTest is ArbitrageWorld {
     /// token is never paid out, and the split holds in each token profit is counted in.
     function invariantMarketsStayApartAndTheSplitHolds() public view {
         assertFalse(handler.leaked(), "one market changed the other");
+        assertFalse(handler.paidWrongly(), "paid in a token not approved and chosen");
         assertEq(coin.balanceOf(address(hook)), 0, "hook coin");
         assertEq(coin.balanceOf(handler.treasury()), 0, "paid in the hostile token");
         _assertHookEmpty();
@@ -459,15 +637,9 @@ contract ArbitrageMarketsInvariantTest is ArbitrageWorld {
             handler.teamTune(1);
             handler.teamSwap(0, true, 25_000e18);
             handler.teamTune(1);
-            vm.recordLogs();
+            uint256 earlier = handler.undoneSearches();
             handler.teamHostile(0, 1_000e18, mode);
-            Vm.Log[] memory logs = vm.getRecordedLogs();
-            bool undone;
-            for (uint256 index; index < logs.length; index++) {
-                if (logs[index].topics[0] == ArbitrageHook.SearchUndone.selector) {
-                    undone = true;
-                }
-            }
+            bool undone = handler.undoneSearches() > earlier;
             // A balance that burns all the gas it is given fails its own swap instead.
             if (mode == 3) undone = handler.hostileFilled() == 2;
             assertTrue(undone, "the misbehaving balance was reached");
@@ -476,11 +648,31 @@ contract ArbitrageMarketsInvariantTest is ArbitrageWorld {
         }
     }
 
+    /// A fixed run of handler calls pays ETH profit out, so the invariant runs are known to
+    /// reach that path; and taking ETH off and approving it again keeps it working.
+    function testEthPayoutsHappen() public {
+        handler.ethSwap(1, true, 25_000e18);
+        handler.ethSwap(0, true, 1_000e18);
+        assertGt(handler.ethPayouts(), 0, "ETH profit paid");
+        uint256 paid = handler.ethPayouts();
+        handler.approval(2);
+        handler.ethSwap(1, true, 25_000e18);
+        handler.ethSwap(0, true, 1_000e18);
+        assertEq(handler.ethPayouts(), paid, "nothing paid while ETH is off");
+        handler.approval(2);
+        handler.ethSwap(1, true, 25_000e18);
+        handler.ethSwap(0, true, 1_000e18);
+        assertGt(handler.ethPayouts(), paid, "paid again once approved");
+        assertFalse(handler.paidWrongly(), "paid wrongly");
+        invariantMarketsStayApartAndTheSplitHolds();
+    }
+
     function afterInvariant() public view {
         console2.log("open market paid, WETH", backing.balanceOf(handler.treasury()) / 1e18);
         console2.log("  protocol share, WETH", backing.balanceOf(vault) / 1e18);
         console2.log("open market paid, USD", usd.balanceOf(handler.treasury()) / 1e18);
         console2.log("  protocol share, USD", usd.balanceOf(desk) / 1e18);
+        console2.log("ETH profit payouts", handler.ethPayouts());
         console2.log("hostile swaps", handler.hostileSwaps());
         console2.log("  of which filled", handler.hostileFilled());
     }

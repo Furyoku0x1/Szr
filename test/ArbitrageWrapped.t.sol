@@ -27,7 +27,7 @@ contract ArbitrageWrappedTest is MarketsWorld {
     function setUp() public override {
         super.setUp();
         // The beforeSwap permission and the one that lets it return a delta.
-        wrapper = WrappedPool(address(uint160(0xBEEF << 24 | 1 << 7 | 1 << 3)));
+        wrapper = WrappedPool(payable(address(uint160(0xBEEF << 24 | 1 << 7 | 1 << 3))));
         deployCodeTo("WrappedPool.sol:WrappedPool", abi.encode(manager), address(wrapper));
         pricer = new WrappedPricer(wrapper);
         hook.setPricer(address(wrapper), address(pricer));

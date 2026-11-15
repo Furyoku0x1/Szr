@@ -103,7 +103,7 @@ contract ArbitrageGasTest is ArbitrageWorld {
         vm.cool(address(hook));
         vm.cool(address(core));
         (uint256 book, uint256 best, uint256 venues, uint256 allowance, uint256 bookAllowance) =
-            ArbitrageProbe(address(hook)).scanCost(_id(last));
+            ArbitrageProbe(payable(address(hook))).scanCost(_id(last));
         // The pool, two more leaders of its group, seven other groups, and Core.
         assertEq(venues, 11, "the most venues");
         assertLt(book, bookAllowance * venues, "reading prices within its allowance");
@@ -121,7 +121,7 @@ contract ArbitrageGasTest is ArbitrageWorld {
         vm.cool(address(hook));
         vm.cool(address(core));
         (uint256 book, uint256 best, uint256 venues, uint256 allowance, uint256 bookAllowance) =
-            ArbitrageProbe(address(hook)).scanCost(_id(fourth));
+            ArbitrageProbe(payable(address(hook))).scanCost(_id(fourth));
         // The pool, its group's three leaders, seven other groups, and Core.
         assertEq(venues, 12, "the most venues");
         assertLt(book, bookAllowance * venues, "reading prices within its allowance");
@@ -313,7 +313,7 @@ contract ArbitrageGasTest is ArbitrageWorld {
 
     function _allowances() internal returns (uint256 swap, uint256 attempt) {
         deployCodeTo("ArbitrageProbe.sol:ArbitrageProbe", abi.encode(locker), address(hook));
-        return ArbitrageProbe(address(hook)).gasAllowances();
+        return ArbitrageProbe(payable(address(hook))).gasAllowances();
     }
 
     /// Dust liquidity in `count` narrow ranges either side of the price, which costs next to

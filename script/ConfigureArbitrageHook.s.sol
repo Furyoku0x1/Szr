@@ -88,7 +88,7 @@ contract ConfigureArbitrageHook is Script {
     /// @dev Connecting pools are given as five parallel lists, one entry per pool. One
     /// group's leaders can be given per run, as its partner token and its position ids.
     function _readConfig() internal view returns (Config memory config) {
-        config.hook = ArbitrageHook(vm.envAddress("ARBITRAGE_HOOK"));
+        config.hook = ArbitrageHook(payable(vm.envAddress("ARBITRAGE_HOOK")));
         address partner = vm.envOr("LEADER_PARTNER", address(0));
         if (partner != address(0)) {
             config.groups = new Group[](1);

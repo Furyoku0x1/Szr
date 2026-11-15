@@ -35,6 +35,22 @@ contract ArbitrageProbe is ArbitrageHook {
         active = 0;
     }
 
+    /// The gas `_payOut` uses for native ETH profit in `market`, and the gas a search holds
+    /// back for retiring. The pool manager must be unlocked and this hook must already be
+    /// owed `profit` in ETH.
+    function payoutCost(uint256 market, uint256 profit)
+        external
+        returns (uint256 used, uint256 reserved)
+    {
+        active = market;
+        home = address(0);
+        uint256 start = gasleft();
+        _payOut(profit);
+        used = start - gasleft();
+        reserved = RETIRE_GAS;
+        active = 0;
+    }
+
     /// What the hook leaves for the user's own swap, and the most one try at a cycle may use.
     function gasAllowances() external pure returns (uint256 swap, uint256 attempt) {
         return (SWAP_GAS, PLAN_GAS / 2);

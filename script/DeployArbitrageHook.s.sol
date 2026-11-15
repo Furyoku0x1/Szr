@@ -37,7 +37,7 @@ contract DeployArbitrageHook is Script {
         bytes memory initcode =
             abi.encodePacked(type(ArbitrageHook).creationCode, abi.encode(liquidity));
         (bytes32 salt, address predicted) = mine(keccak256(initcode));
-        hook = ArbitrageHook(predicted);
+        hook = ArbitrageHook(payable(predicted));
         if (predicted.code.length == 0) {
             vm.broadcast();
             (bool deployed,) = FACTORY.call(abi.encodePacked(salt, initcode));

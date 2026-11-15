@@ -37,16 +37,15 @@ abstract contract MarketsWorld is ArbitrageWorld {
         super.setUp();
         coin = new TestAsset();
         _approve(coin);
-        address[] memory assets = new address[](2);
-        address[] memory recipients = new address[](2);
-        assets[0] = address(backing);
-        assets[1] = address(usd);
-        recipients[0] = address(core);
-        recipients[1] = desk;
-        hook.setProfitTokens(assets, recipients);
+        hook.setProfitToken(address(usd), desk);
         publicPool = _pair(address(backing), address(usd), 3_000, address(0));
-        vm.prank(team);
+        vm.startPrank(team);
         id = hook.openMarket(treasury);
+        address[] memory chosen = new address[](2);
+        chosen[0] = address(backing);
+        chosen[1] = address(usd);
+        hook.setTokens(id, chosen);
+        vm.stopPrank();
         first = _create(address(backing), address(coin), 3_000);
         second = _create(address(backing), address(coin), 500);
         _lead(address(backing), address(coin), _list(_id(first), _id(second)));
@@ -206,7 +205,7 @@ contract ArbitrageMarketsTest is MarketsWorld {
         vm.expectRevert(ArbitrageHook.NotManager.selector);
         hook.untrack(1, _id(usdPool));
         vm.expectRevert(ArbitrageHook.NotManager.selector);
-        hook.setProfitTokens(new address[](0), new address[](0));
+        hook.setProfitToken(address(usd), desk);
         // A pool of one market cannot lead in another.
         vm.expectRevert(ArbitrageHook.InvalidPool.selector);
         hook.setLeaders(id, address(szr), address(usd), _list(_id(usdPool)));
@@ -351,36 +350,13 @@ contract ArbitrageProfitTokensTest is MarketsWorld {
         dollars = _create(address(usd), address(coin), 3_000);
     }
 
-    /// Only Liquidity's manager sets the list, and SZR, a repeat or a missing recipient is
-    /// refused.
-    function testProfitTokenListRules() public {
-        assertEq(hook.allProfitTokens().length, 2);
-        (uint8 rank, address recipient) = hook.listing(address(usd));
-        assertEq(rank, 2);
-        assertEq(recipient, desk);
-        address[] memory assets = new address[](2);
-        address[] memory recipients = new address[](2);
-        assets[0] = address(backing);
-        recipients[0] = address(core);
-        recipients[1] = desk;
-        assets[1] = address(szr);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
-        hook.setProfitTokens(assets, recipients);
-        assets[1] = address(backing);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
-        hook.setProfitTokens(assets, recipients);
-        assets[1] = address(usd);
-        recipients[1] = address(0);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
-        hook.setProfitTokens(assets, recipients);
-        vm.expectRevert(ArbitrageHook.InvalidLimit.selector);
-        hook.setProfitTokens(assets, new address[](1));
-        vm.expectRevert(ArbitrageHook.InvalidLimit.selector);
-        hook.setProfitTokens(new address[](9), new address[](9));
-        // Replacing the list drops what was on it before.
-        hook.setProfitTokens(new address[](0), new address[](0));
-        (rank,) = hook.listing(address(backing));
-        assertEq(rank, 0);
+    /// A token is approved with the recipient of the protocol's share, and taking it off
+    /// clears that.
+    function testProfitTokenApproval() public {
+        assertEq(hook.shareRecipient(address(backing)), address(core));
+        assertEq(hook.shareRecipient(address(usd)), desk);
+        hook.setProfitToken(address(usd), address(0));
+        assertEq(hook.shareRecipient(address(usd)), address(0));
     }
 
     /// A pool with no WETH counts its profit in whichever of its tokens is on the list,
@@ -464,14 +440,12 @@ contract ArbitrageProfitTokensTest is MarketsWorld {
         _trade(odd, address(coin), 50_000e18);
         assertEq(_cycles(), 0, "no cycle");
         assertEq(other.balanceOf(treasury), 0, "nothing paid");
-        address[] memory assets = new address[](2);
-        address[] memory recipients = new address[](2);
-        assets[0] = address(backing);
-        assets[1] = address(other);
-        recipients[0] = address(core);
-        recipients[1] = desk;
-        hook.setProfitTokens(assets, recipients);
+        hook.setProfitToken(address(other), desk);
+        address[] memory chosen = new address[](2);
+        chosen[0] = address(backing);
+        chosen[1] = address(other);
         vm.startPrank(team);
+        hook.setTokens(id, chosen);
         hook.untrack(id, _id(odd));
         hook.retrack(_id(odd));
         hook.untrack(id, _id(twin));
@@ -490,11 +464,7 @@ contract ArbitrageProfitTokensTest is MarketsWorld {
         PoolKey memory cheap = _create(address(usd), address(coin), 500);
         _lead(address(usd), address(coin), _list(_id(dollars), _id(cheap)));
         _limits(address(usd), 1e15);
-        address[] memory assets = new address[](1);
-        address[] memory recipients = new address[](1);
-        assets[0] = address(backing);
-        recipients[0] = address(core);
-        hook.setProfitTokens(assets, recipients);
+        hook.setProfitToken(address(usd), address(0));
         vm.recordLogs();
         _trade(dollars, address(coin), 50_000e18);
         assertEq(_cycles(), 0, "no cycle");
@@ -509,11 +479,7 @@ contract ArbitrageProfitTokensTest is MarketsWorld {
         PoolKey memory cheap = _create(address(usd), address(coin), 500);
         _lead(address(usd), address(coin), _list(_id(dollars), _id(cheap)));
         _limits(address(usd), 1e15);
-        address[] memory assets = new address[](1);
-        address[] memory recipients = new address[](1);
-        assets[0] = address(backing);
-        recipients[0] = address(core);
-        hook.setProfitTokens(assets, recipients);
+        hook.setProfitToken(address(usd), address(0));
         _trade(dollars, address(coin), 50_000e18);
         bool zeroForOne = Currency.unwrap(dollars.currency0) == address(coin);
         PoolSwapTest.TestSettings memory settings;
@@ -532,21 +498,7 @@ contract ArbitrageProfitTokensTest is MarketsWorld {
 
     /// Rules on what can be named, each refused on its own account.
     function testNamingRules() public {
-        PoolKey memory native = PoolKey(
-            Currency.wrap(address(0)),
-            Currency.wrap(address(coin)),
-            3_000,
-            60,
-            IHooks(address(hook))
-        );
         vm.startPrank(team);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
-        hook.createPool(id, native, uint160(1 << 96));
-        native.hooks = IHooks(address(0));
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
-        hook.addVenue(id, native);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
-        hook.setConnector(id, native, true);
         // Leaders can only be named for a token profit may be counted in.
         vm.expectRevert(ArbitrageHook.InvalidPool.selector);
         hook.setLeaders(id, address(coin), address(usd), _list(_id(dollars)));
@@ -561,15 +513,10 @@ contract ArbitrageProfitTokensTest is MarketsWorld {
         hook.createPool(1, _pair(address(coin), address(usd), 500, address(hook)), 1 << 96);
         vm.expectRevert(ArbitrageHook.InvalidPool.selector);
         hook.addVenue(1, publicPool);
-        address[] memory assets = new address[](1);
-        address[] memory recipients = new address[](1);
-        recipients[0] = desk;
         vm.expectRevert(ArbitrageHook.InvalidPool.selector);
-        hook.setProfitTokens(assets, recipients);
-        assets[0] = address(usd);
-        recipients[0] = address(hook);
+        hook.setProfitToken(address(szr), desk);
         vm.expectRevert(ArbitrageHook.InvalidPool.selector);
-        hook.setProfitTokens(assets, recipients);
+        hook.setProfitToken(address(usd), address(hook));
     }
 
     /// Each token has its own smallest profit, in its own units.
@@ -655,5 +602,53 @@ contract ArbitrageMarketScriptTest is MarketsWorld {
         plan.market = opened;
         setup.run(plan);
         assertEq(hook.market(opened).poolCount, 3);
+    }
+
+    /// Choosing again a token whose groups are still set needs a larger allowance than the
+    /// market has: the script makes room first, so the market is not refused.
+    function testScriptMakesRoomBeforeChoosingTokens() public {
+        address owner = address(0xA7);
+        TestAsset other = new TestAsset();
+        _approve(other);
+        OpenArbitrageMarket.Config memory plan;
+        plan.hook = hook;
+        plan.owner = owner;
+        plan.recipient = address(0xA8);
+        plan.tokens = new address[](2);
+        plan.tokens[0] = address(backing);
+        plan.tokens[1] = address(usd);
+        plan.pools = new PoolKey[](3);
+        plan.prices = new uint160[](3);
+        bytes32[] memory leaders = new bytes32[](3);
+        uint24[3] memory fees = [uint24(3_000), 500, 10_000];
+        for (uint256 index; index < 3; index++) {
+            plan.pools[index] = _pair(address(usd), address(other), fees[index], address(hook));
+            plan.prices[index] = uint160(1 << 96);
+            leaders[index] = _id(plan.pools[index]);
+        }
+        plan.groups = new OpenArbitrageMarket.Group[](1);
+        plan.groups[0] = OpenArbitrageMarket.Group(address(usd), address(other), leaders);
+        plan.limits = new OpenArbitrageMarket.Limit[](1);
+        plan.limits[0] = OpenArbitrageMarket.Limit(address(usd), 1e15);
+        OpenArbitrageMarket setup = new OpenArbitrageMarket();
+        uint256 opened = setup.run(plan);
+        // The owner drops USD and trims the allowance to what WETH alone needs.
+        address[] memory weth = new address[](1);
+        weth[0] = address(backing);
+        vm.startPrank(owner);
+        hook.setTokens(opened, weth);
+        hook.setLimits(
+            opened, address(usd), uint32(hook.minimumGasLimit(opened)), 1e15, 1.0001e18
+        );
+        vm.stopPrank();
+        // The same plan again chooses USD, whose three leaders need more than that.
+        OpenArbitrageMarket.Config memory again;
+        again.hook = hook;
+        again.owner = owner;
+        again.market = opened;
+        again.tokens = plan.tokens;
+        setup.run(again);
+        assertEq(hook.tokensOf(opened).length, 2);
+        assertEq(hook.tokensOf(opened)[1], address(usd));
     }
 }

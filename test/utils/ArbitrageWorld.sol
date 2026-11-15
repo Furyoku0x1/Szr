@@ -37,7 +37,7 @@ abstract contract ArbitrageWorld is SzrWorld {
         super.setUp();
         szr = TestAsset(address(core.token()));
         // Only the beforeSwap and afterSwap permission bits are set in the address.
-        hook = ArbitrageHook(address(uint160(0xA4B1 << 24 | 1 << 7 | 1 << 6)));
+        hook = ArbitrageHook(payable(address(uint160(0xA4B1 << 24 | 1 << 7 | 1 << 6))));
         deployCodeTo("ArbitrageHook.sol:ArbitrageHook", abi.encode(locker), address(hook));
         provider = new PoolModifyLiquidityTest(manager);
         _approve(backing);
@@ -143,6 +143,7 @@ abstract contract ArbitrageWorld is SzrWorld {
         assertEq(szr.balanceOf(address(hook)), 0, "hook szr");
         assertEq(usd.balanceOf(address(hook)), 0, "hook usd");
         assertEq(backing.balanceOf(address(hook)), 0, "hook weth");
+        assertEq(address(hook).balance, 0, "hook ether");
         _assertCash();
     }
 

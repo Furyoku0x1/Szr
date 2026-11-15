@@ -127,14 +127,7 @@ contract ArbitrageHookTest is ArbitrageWorld {
         hook.setLimits(1, address(szr), tooLittle, 0, 1.0001e18);
         vm.startPrank(alice);
         vm.expectRevert(ArbitrageHook.NotSelf.selector);
-        hook.search(
-            _id(usdPool),
-            ArbitrageHook.Pool(1, 1, address(szr)),
-            address(usd),
-            true,
-            false,
-            alice
-        );
+        hook.search(_id(usdPool), 1, address(szr), address(usd), true, false, alice);
         vm.stopPrank();
         _untrack(usdPool);
         assertEq(hook.market(1).poolCount, 1);
