@@ -235,7 +235,7 @@ contract ArbitrageHookTest is ArbitrageWorld {
 
     uint256 internal constant SHORT_GAS = 300_000;
 
-    uint256 internal constant PARTIAL_GAS = 4_600_000;
+    uint256 internal constant PARTIAL_GAS = 4_700_000;
 
     /// The pool manager wraps a hook's error, so look for its selector inside the data.
     function _shortGasError() internal returns (bool found) {

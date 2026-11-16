@@ -354,8 +354,8 @@ contract ArbitrageEtherTest is EtherWorld {
         _venue(venue);
         _lead(address(usd), address(coin), _list(_id(hooked), _id(venue)));
         _limits(address(usd), 1e15);
-        assertEq(hook.minimumGasLimit(id), 6_620_000, "allowance");
-        assertEq(hook.gasForSwap(id), 6_893_745, "gas for a swap");
+        assertEq(hook.minimumGasLimit(id), 6_660_000, "allowance");
+        assertEq(hook.gasForSwap(id), 6_945_346, "gas for a swap");
         emit log_named_uint("usd market gasForSwap", hook.gasForSwap(id));
         _in(hooked, address(usd), 1e18);
         _in(hooked, address(usd), 1e15);

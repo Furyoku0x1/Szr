@@ -121,7 +121,9 @@ contract ArbitrageAggregatorForkTest is Test {
         arbitrage.setPricer(AGGREGATOR, address(pricer));
         vm.stopPrank();
         (uint160 outsideRoot,,,,) = pricer.price(wrapped);
-        hooked = PoolKey(wrapped.currency0, wrapped.currency1, 3_000, 60, arbitrage);
+        hooked = PoolKey(
+            wrapped.currency0, wrapped.currency1, 3_000, 60, IHooks(address(arbitrage))
+        );
         vm.startPrank(OWNER);
         id = arbitrage.openMarket(TREASURY);
         address[] memory chosen = new address[](1);

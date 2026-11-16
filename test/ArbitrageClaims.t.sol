@@ -172,8 +172,17 @@ contract ArbitrageClaimsTest is MarketsWorld {
     }
 
     /// Core cannot redeem a claim, so a failing send to it undoes the search instead.
+    /// `setProfitToken` now refuses Core for a token that is not ETH or WETH, which Core could
+    /// never use, so the recipient is stored directly (`shareRecipient` is slot 0) to keep
+    /// the payout's Core branch covered.
     function testBlockedCoreRecipientUndoesTheSearch() public {
+        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
         hook.setProfitToken(address(ink), address(core));
+        vm.store(
+            address(hook),
+            keccak256(abi.encode(address(ink), uint256(0))),
+            bytes32(uint256(uint160(address(core))))
+        );
         ink.setBlocked(address(core), true);
         vm.recordLogs();
         _trade(inkPool, address(coin), 50_000e18);

@@ -23,22 +23,40 @@ contract ArbitrageSizingEligibleTest is SizingWorld {
         ArbitrageProbe probe = _probeInHook();
         ArbitrageHook.Plan memory plan;
         plan.venue = _id(venue);
-        assertTrue(probe.sizeable(plan), "added as a wrapped pool, which gives a range");
+        assertTrue(
+            probe.sizeableAsking(plan, 20_000), "added as a wrapped pool, which gives a range"
+        );
         hook.setPricer(wrapped, address(0));
-        assertFalse(probe.sizeable(plan), "once its pricer is taken away");
+        assertFalse(probe.sizeableAsking(plan, 20_000), "once its pricer is taken away");
         hook.setPricer(wrapped, wrappedPricer);
         vm.store(address(hook), _wrappersSlot(plan.venue), bytes32(0));
-        assertFalse(probe.sizeable(plan), "added before its hook had a pricer");
+        assertFalse(probe.sizeableAsking(plan, 20_000), "added before its hook had a pricer");
         ArbitrageHook.Plan memory link;
         link.links[1] = plan.venue;
-        assertFalse(probe.sizeable(link), "as a connecting pool too");
+        assertFalse(probe.sizeableAsking(link, 20_000), "as a connecting pool too");
         plan.venue = _id(usdPool);
-        assertTrue(probe.sizeable(plan), "a plain pool is walked");
+        assertTrue(probe.sizeableAsking(plan, 20_000), "a plain pool is walked");
         plan.venue = bytes32(0);
-        assertTrue(probe.sizeable(plan), "and so is Core");
+        assertTrue(probe.sizeableAsking(plan, 20_000), "and so is Core");
         // With the pricer taken away the pool is not wrapped by either test.
         hook.setPricer(wrapped, address(0));
         link.venue = bytes32(0);
-        assertTrue(probe.sizeable(link), "once its hook has no pricer");
+        assertTrue(probe.sizeableAsking(link, 20_000), "once its hook has no pricer");
+    }
+
+    /// `wrappers` is global but `asking` is one market's. A search of a market that uses no
+    /// pricer (SZR's, say, while another market added a pool its own hook has a pricer for)
+    /// trades that pool as wrapped, with no price limit, and cannot ask its pricer: the walk
+    /// must not read it as a plain pool.
+    function testWrappedPoolIsNotWalkedWhereNoPricerIsAsked() public {
+        PoolKey memory venue = _wrappedVenue(75_000);
+        ArbitrageProbe probe = _probeInHook();
+        ArbitrageHook.Plan memory plan;
+        plan.venue = _id(venue);
+        assertTrue(probe.sizeableAsking(plan, 20_000), "asked in its own market");
+        assertFalse(probe.sizeable(plan), "not where no pricer is asked");
+        ArbitrageHook.Plan memory link;
+        link.links[0] = plan.venue;
+        assertFalse(probe.sizeable(link), "as a connecting pool too");
     }
 }

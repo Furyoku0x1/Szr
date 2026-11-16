@@ -207,7 +207,7 @@ contract ArbitrageGasTest is ArbitrageWorld {
     /// The stated gas allowance and what a swap that closes a gap costs, which the guarded
     /// takes must leave where it was.
     function testGapClosingSwapGasAndAllowance() public {
-        assertEq(hook.minimumGasLimit(1), 6_620_000, "minimum allowance");
+        assertEq(hook.minimumGasLimit(1), 6_660_000, "minimum allowance");
         uint256 spent = gasleft();
         _trade(usdPool, address(szr), 50_000e18);
         spent -= gasleft();

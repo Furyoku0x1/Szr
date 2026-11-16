@@ -75,7 +75,7 @@ contract ArbitrageProbe is ArbitrageHook {
         Venue[] memory prices = _book(poolId, partner);
         book = start - gasleft();
         start = gasleft();
-        _best(prices, 0);
+        _best(prices);
         best = start - gasleft();
         venues = prices.length;
         allowance = SCAN_GAS_PER_VENUE;
@@ -159,11 +159,43 @@ contract ArbitrageProbe is ArbitrageHook {
     bool public sizingCut;
     bool public sizingReverted;
 
+    /// While set, `_size` is skipped and leaves nothing of the budget, so a failed cycle runs
+    /// no try: what is left is what a failed cycle costs beyond its budget.
+    bool public skipTries;
+
+    function setSkipTries(bool skip) external {
+        skipTries = skip;
+    }
+
+    /// The gas a failed cycle at a swap's search costs beyond the budget its tries share:
+    /// dealing with the sync slot, reading the legs' hooks (`_sizeable`), and setting the pair
+    /// aside. `skipTries` must be set so that no try runs. The pool manager must be unlocked.
+    function failedCycleCost(
+        uint256 market,
+        address base,
+        bytes32 poolId,
+        Plan calldata plan,
+        address payer
+    ) external returns (uint256 used) {
+        active = market;
+        home = base;
+        _begin(market);
+        Venue[] memory book = new Venue[](plan.index + 1);
+        book[0].id = poolId;
+        uint256 start = gasleft();
+        _release(payer);
+        if (_attempt(poolId, plan) != 0) revert();
+        _fail(book, plan, payer);
+        used = start - gasleft();
+        active = 0;
+    }
+
     function _size(bytes32 poolId, Plan memory plan, uint256 budget)
         internal
         override
         returns (uint256 left, bool declined)
     {
+        if (skipTries) return (0, false);
         Plan memory before = abi.decode(abi.encode(plan), (Plan));
         (left, declined) = super._size(poolId, plan, budget);
         if (sizingCalls++ != 0) return (left, declined);
@@ -289,6 +321,14 @@ contract ArbitrageProbe is ArbitrageHook {
     /// Whether the walk could read every leg of `plan`.
     function sizeable(Plan memory plan) external view returns (bool) {
         return _sizeable(plan);
+    }
+
+    /// Whether the walk could read every leg of `plan` in a search whose market's pricers get
+    /// `gas` each; `sizeable` is the search of a market that uses no pricer.
+    function sizeableAsking(Plan memory plan, uint256 gas) external returns (bool readable) {
+        asking = gas;
+        readable = _sizeable(plan);
+        asking = 0;
     }
 
     /// The first walk's input as `_size` saw it, for `coldSteps`.
