@@ -5,6 +5,7 @@ import { Vm } from "forge-std/Vm.sol";
 import { ArbitrageWorld } from "./utils/ArbitrageWorld.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 import { ArbitrageProbe } from "./utils/ArbitrageProbe.sol";
+import { TryMeter } from "./utils/ArbitrageSizing.sol";
 import { TwoHopRouter } from "./utils/Routers.sol";
 import { ArbitrageHook } from "../src/ArbitrageHook.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
@@ -223,25 +224,53 @@ contract ArbitrageGasTest is ArbitrageWorld {
     }
 
     /// When the hook's own gas allowance runs out with a cycle still to try, it says so
-    /// instead of going quiet. Here the smallest allowance is spent on three venues that
-    /// cannot be traded, one more than it must cover, leaving too little for the real gap,
-    /// which a later swap takes.
+    /// instead of going quiet. Here the costly venues (`_costlyLeaders`) rank ahead of the
+    /// real gap, so their failed cycles are tried first and use up the smallest allowance.
+    /// `SearchCutShort` is emitted before anything is earned, and the same swap's second
+    /// search then takes the gap.
     function testSearchCutShortIsReported() public {
-        _threeUnworkableLeaders();
+        _costlyLeaders();
+        (uint256 cut, uint256 earnedBefore, uint256 earnedAfter) = _cutShortOnASmallSwap();
+        assertGt(cut, 0, "cut short and reported");
+        assertEq(earnedBefore, 0, "nothing earned before it was cut short");
+        assertGt(earnedAfter, 0, "the gap was taken after it");
+        assertGt(core.unreleasedSupply(), inventoryBefore, "and the profit retired");
+    }
+
+    /// The control for the test above: the same swaps with no costly venues report nothing,
+    /// so it is the venues that use up the allowance.
+    function testNothingIsCutShortWithoutCostlyLeaders() public {
+        (uint256 cut,,) = _cutShortOnASmallSwap();
+        assertEq(cut, 0, "nothing to cut short");
+    }
+
+    uint256 internal inventoryBefore;
+
+    /// Opens a gap with the market off, then makes a small swap at the smallest allowance.
+    /// Returns how many `SearchCutShort` events it emitted and how many cycles were earned
+    /// before the first of them (all of them if there was none) and after it.
+    function _cutShortOnASmallSwap()
+        internal
+        returns (uint256 cut, uint256 first, uint256 last)
+    {
+        // Without the walk. The costly cycles fail for any size, but each would spend up to
+        // the walk's gas on top, which changes how many fit in a search and not what is
+        // being pinned: that being cut short is reported.
+        _declineSizing();
         hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
         hook.setLimits(1, address(szr), uint32(hook.minimumGasLimit(1)), 10e18, 1.0001e18);
-        uint256 inventory = core.unreleasedSupply();
+        inventoryBefore = core.unreleasedSupply();
         vm.recordLogs();
         _trade(usdPool, address(szr), 1e15);
         Vm.Log[] memory logs = vm.getRecordedLogs();
-        uint256 reported;
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] == ArbitrageHook.SearchCutShort.selector) reported++;
+            bytes32 topic = logs[index].topics[0];
+            if (topic == ArbitrageHook.SearchCutShort.selector) cut++;
+            if (topic != ArbitrageHook.Arbitraged.selector) continue;
+            if (cut == 0) first++;
+            else last++;
         }
-        assertGt(reported, 0, "cut short and reported");
-        _trade(usdPool, address(szr), 1e15);
-        assertGt(core.unreleasedSupply(), inventory, "real gap taken afterwards");
     }
 
     /// The same property with every group and leader slot in use, a realistic swap size,
@@ -381,17 +410,60 @@ contract ArbitrageGasTest is ArbitrageWorld {
         uint256 quiet = gasleft();
         _trade(usdPool, address(szr), 1e15);
         quiet -= gasleft();
+        ArbitrageProbe probe = _probeInHook();
+        uint256 snapshot = vm.snapshotState();
+        // The cycle as the search runs it: the walk's size, found by the walk.
         vm.recordLogs();
+        vm.startStateDiffRecording();
         uint256 busy = gasleft();
         _trade(usdPool, address(szr), 20_000e18);
         busy -= gasleft();
+        Vm.AccountAccess[] memory accesses = vm.stopAndReturnStateDiff();
         Vm.Log[] memory logs = vm.getRecordedLogs();
         uint256 cycles;
         for (uint256 index; index < logs.length; index++) {
             if (logs[index].topics[0] == ArbitrageHook.Arbitraged.selector) cycles++;
         }
         assertEq(cycles, 1, "one cycle");
-        assertLt(busy - quiet, allowance, "one cycle and its overheads fit in one try");
+        (bytes32 poolId, ArbitrageHook.Plan memory plan) = _firstTry(accesses);
+        uint256 walk = probe.sizingGas();
+        vm.revertToState(snapshot);
+        // The same state with the market off, so the gap is open and nothing else runs,
+        // then the try alone, cold, with the stipend a try gets.
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
+        _trade(usdPool, address(szr), 20_000e18);
+        vm.cool(address(manager));
+        vm.cool(address(hook));
+        vm.cool(address(core));
+        TryMeter meter = new TryMeter(manager, probe);
+        (uint256 attempt, bytes4 reason) = meter.measure(1, address(szr), poolId, plan);
+        emit log_named_uint("whole swap beyond a quiet one (information only)", busy - quiet);
+        emit log_named_uint("walk gas", walk);
+        emit log_named_uint("try gas", attempt);
+        assertEq(reason, bytes4(0), "the try filled");
+        assertLt(attempt, allowance, "one cycle fits in one try");
+        (,, uint256 budget) = probe.sizingLimits();
+        assertLt(walk + attempt, budget, "and the walk leaves the first try its full share");
+    }
+
+    /// The pool and plan of the first call to `execute` in a recorded swap.
+    function _firstTry(Vm.AccountAccess[] memory accesses)
+        internal
+        view
+        returns (bytes32 poolId, ArbitrageHook.Plan memory plan)
+    {
+        for (uint256 index; index < accesses.length; index++) {
+            bytes memory data = accesses[index].data;
+            if (accesses[index].account != address(hook)) continue;
+            if (data.length < 4) continue;
+            if (bytes4(data) != ArbitrageHook.execute.selector) continue;
+            bytes memory body = new bytes(data.length - 4);
+            for (uint256 j; j < body.length; j++) {
+                body[j] = data[j + 4];
+            }
+            return abi.decode(body, (bytes32, ArbitrageHook.Plan));
+        }
+        revert("no try");
     }
 
     /// One transaction that swaps through two hooked pools runs four searches. With gaps
@@ -433,6 +505,74 @@ contract ArbitrageGasTest is ArbitrageWorld {
         _setLeaders(address(usd), fakes);
     }
 
+    /// Any value from 4 to 8 works. By 12 a try runs out of gas with a full share, which
+    /// limits the rest of the search to eighths, and it spends too little to be cut short.
+    uint256 internal constant COSTLY_RANGES = 6;
+    int24 internal constant COSTLY_AWAY = 2_400;
+    uint256 internal constant COSTLY_UNITS = 1e24;
+
+    /// Venues whose cycles fail dear even with a price limit on every leg: the three leaders
+    /// of the searched pool's group, and the first leader of six other groups, each
+    /// reached through two connecting pools. Each is priced so SZR looks cheap there (2400
+    /// ticks, a wider gap than the real one, so they rank ahead of it), with its depth at the
+    /// edge of its price, and then only dust, one tiny
+    /// range per 60 ticks, beyond. A cycle's venue leg crosses every dust tick inside the
+    /// limit, which is dear, and still cannot fill, so the cycle fails (`Incomplete`) after
+    /// the crossings. Such a cycle cannot profit at any size: only the edge range is deep,
+    /// and sizing it exactly gives a few wei, below the smallest profit, so it fails
+    /// whatever size is tried. A cycle's tries share a budget of `PLAN_GAS`, and a failed cycle is
+    /// not tried again until it is no longer benched, so it takes more than the group's
+    /// three to use up the allowance.
+    function _costlyLeaders() internal {
+        uint24[3] memory fees = [uint24(100), 200, 300];
+        bytes32[] memory fakes = new bytes32[](3);
+        for (uint256 index; index < 3; index++) {
+            fakes[index] = _id(_costlyVenue(address(usd), fees[index]));
+        }
+        _setLeaders(address(usd), fakes);
+        for (uint256 index; index < 6; index++) {
+            TestAsset partner = new TestAsset();
+            _addPartner(partner);
+            bytes32[] memory only = new bytes32[](1);
+            only[0] = _id(_costlyVenue(address(partner), 100));
+            _setLeaders(address(partner), only);
+        }
+    }
+
+    /// A tracked SZR pool of `partner` priced with SZR cheap, deep only at the edge of its
+    /// price, and with dust ranges beyond it in the way a cycle that buys SZR moves.
+    function _costlyVenue(address partner, uint24 fee) internal returns (PoolKey memory fake) {
+        fake = _register(partner, fee, uint160(1 << 96));
+        bool szrFirst = Currency.unwrap(fake.currency0) == address(szr);
+        int24 tick = szrFirst ? -COSTLY_AWAY : COSTLY_AWAY;
+        PoolSwapTest.TestSettings memory settings;
+        swapper.swap(
+            fake,
+            IPoolManager.SwapParams(szrFirst, -1e30, TickMath.getSqrtPriceAtTick(tick)),
+            settings,
+            ""
+        );
+        for (uint256 step; step < COSTLY_RANGES; step++) {
+            int24 lower = szrFirst
+                ? tick + int24(uint24(step)) * 60
+                : tick - int24(uint24(step) + 1) * 60;
+            provider.modifyLiquidity(
+                fake, IPoolManager.ModifyLiquidityParams(lower, lower + 60, 1e12, 0), ""
+            );
+        }
+        // The edge range that makes the pool look deep.
+        provider.modifyLiquidity(
+            fake,
+            IPoolManager.ModifyLiquidityParams(
+                szrFirst ? tick - 60 : tick,
+                szrFirst ? tick : tick + 60,
+                int256(COSTLY_UNITS),
+                0
+            ),
+            ""
+        );
+    }
+
     function _ranOut() internal returns (uint256 count) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
@@ -464,10 +604,49 @@ contract ArbitrageGasTest is ArbitrageWorld {
         assertTrue(_tradeWithGas(stated, 20_000e18, false), "purchase at the most venues");
     }
 
+    /// The sizing walk's gas comes out of a cycle's budget, not out of the first try's
+    /// stipend, and the ran-out flag applies only to a try that had a full share
+    /// (`whole / 2`). So after the walk's gas, the first try must still be able to have one.
+    function testFirstTryKeepsAFullShareAfterTheWalk() public {
+        (uint256 sizing,, uint256 plan) = _probeInHook().sizingLimits();
+        assertGe(plan - sizing, plan / 2, "a full share is left after the walk");
+    }
+
+    /// The walk fits the gas it is given where it is hungriest. Dust at every tick of the
+    /// focus pool and a wide gap make it follow as many boundaries as it can afford; at
+    /// `SIZING_GAS` it stops for gas a step or two short of its cap, keeping what it found.
+    /// Measured inside the real search, from the budget `_attempt` charges for it. The cap
+    /// itself is pinned on a two-leg scenario in `ArbitrageSizingDeclineTest`.
+    function testSizingWalkInDustFitsItsGas() public {
+        _dustTicks(150);
+        hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
+        _trade(mainPool, address(backing), 400_000e18);
+        hook.setLimits(1, address(szr), 14_000_000, 10e18, 1.0001e18);
+        ArbitrageProbe probe = _probeInHook();
+        (uint256 gas, uint256 cap, uint256 plan) = probe.sizingLimits();
+        // A real swap reads all of this for the first time.
+        vm.cool(address(manager));
+        vm.cool(address(hook));
+        vm.cool(address(core));
+        hook.arb(_id(usdPool));
+        assertGt(probe.sizingCalls(), 0, "a cycle was sized");
+        emit log_named_uint("walk gas", probe.sizingGas());
+        emit log_named_uint("walk steps", probe.sizingSteps());
+        assertFalse(probe.sizingDeclined(), "the walk did not fail");
+        assertTrue(probe.sizingUsed(), "the first try used the walk's size");
+        assertGe(probe.sizingSteps(), 1, "and it followed a boundary");
+        assertLe(probe.sizingSteps(), cap, "no more than its cap");
+        assertLe(probe.sizingGas(), gas, "and the walk used no more than it was given");
+        assertGe(plan - probe.sizingGas(), plan / 2, "the first try keeps a full share");
+    }
+
     /// A try that runs out of gas is followed by the smallest size, not the next largest:
     /// a larger trade crosses at least as many ticks. With the pool's path littered, the
     /// gap is still closed in the same search instead of the cycle failing outright.
     function testTryThatRunsOutGoesStraightToTheSmallestSize() public {
+        // Without the sizing walk, whose size can keep the first try inside its stipend;
+        // this pins what happens when a try at the estimate's size runs out.
+        _declineSizing();
         _dustTicks(150);
         hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(mainPool, address(backing), 400_000e18);

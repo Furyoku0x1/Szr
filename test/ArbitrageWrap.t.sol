@@ -105,7 +105,14 @@ abstract contract WrapWorld is MarketsWorld {
         internal
         returns (uint256 bought, uint256 sold, uint256 wraps, uint256 unwraps)
     {
-        Vm.Log[] memory logs = vm.getRecordedLogs();
+        return _tallyOf(vm.getRecordedLogs());
+    }
+
+    function _tallyOf(Vm.Log[] memory logs)
+        internal
+        view
+        returns (uint256 bought, uint256 sold, uint256 wraps, uint256 unwraps)
+    {
         for (uint256 index; index < logs.length; index++) {
             if (logs[index].topics[0] == ArbitrageHook.Arbitraged.selector) {
                 (bool buying,) = abi.decode(logs[index].data, (bool, uint256));
@@ -306,7 +313,12 @@ contract ArbitrageWrapTest is WrapWorld {
         uint256 inventory = core.unreleasedSupply();
         vm.recordLogs();
         uint256 profit = hook.arb(_id(usdPool));
-        (uint256 bought,,, uint256 unwraps) = _tally();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 index; index < logs.length; index++) {
+            if (logs[index].topics[0] != ArbitrageHook.CycleFailed.selector) continue;
+            assertTrue(logs[index].topics[2] != bytes32(0), "a try at Core failed");
+        }
+        (uint256 bought,,, uint256 unwraps) = _tallyOf(logs);
         assertGt(profit, 0, "profit");
         assertGt(bought, 0, "bought in the SZR/USD pool");
         assertGt(unwraps, 0, "WETH unwrapped to repay the ETH pool");

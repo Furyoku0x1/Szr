@@ -5,6 +5,7 @@ import { Vm } from "forge-std/Vm.sol";
 import { SzrWorld } from "./SzrWorld.sol";
 import { TestAsset } from "./TestAsset.sol";
 import { ArbitrageHook } from "../../src/ArbitrageHook.sol";
+import { ArbitrageProbe } from "./ArbitrageProbe.sol";
 import { Liquidity } from "../../src/Liquidity.sol";
 import { FeeCollector } from "../../src/FeeCollector.sol";
 import { IHooks } from "v4-core/interfaces/IHooks.sol";
@@ -32,6 +33,22 @@ abstract contract ArbitrageWorld is SzrWorld {
     PoolModifyLiquidityTest internal provider;
     /// Liquidity given to each new hooked pool.
     uint256 internal poolUnits = 1_000_000e18;
+
+    /// The probe's code in the hook's place, with the hook's storage and settings kept.
+    /// Building it at the hook's own address would run its constructor over them.
+    function _probeInHook() internal returns (ArbitrageProbe) {
+        address probeAt = address(uint160(0xA4B3 << 24 | 1 << 7 | 1 << 6));
+        deployCodeTo("ArbitrageProbe.sol:ArbitrageProbe", abi.encode(locker), probeAt);
+        vm.etch(address(hook), probeAt.code);
+        return ArbitrageProbe(payable(address(hook)));
+    }
+
+    /// Switches the sizing walk off from here on, so the first try at a cycle uses the
+    /// plan's estimate as it did before the walk. For pins on what the other sizes, the
+    /// try budget and the legs' price limits do, which the walk's size would hide.
+    function _declineSizing() internal {
+        _probeInHook().setDeclineSizing(true);
+    }
 
     function setUp() public virtual override {
         super.setUp();

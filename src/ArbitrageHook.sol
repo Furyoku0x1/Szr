@@ -9,18 +9,31 @@ import { IHooks } from "v4-core/interfaces/IHooks.sol";
 import { StateLibrary } from "v4-core/libraries/StateLibrary.sol";
 import { TransientStateLibrary } from "v4-core/libraries/TransientStateLibrary.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
+import { TickBitmap } from "v4-core/libraries/TickBitmap.sol";
+import { BitMath } from "v4-core/libraries/BitMath.sol";
+import { SqrtPriceMath } from "v4-core/libraries/SqrtPriceMath.sol";
+import { SwapMath } from "v4-core/libraries/SwapMath.sol";
+import { LiquidityMath } from "v4-core/libraries/LiquidityMath.sol";
+import { ProtocolFeeLibrary } from "v4-core/libraries/ProtocolFeeLibrary.sol";
+import { FullMath } from "v4-core/libraries/FullMath.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
-import { Currency } from "v4-core/types/Currency.sol";
+import { Currency, CurrencyLibrary } from "v4-core/types/Currency.sol";
 import { BalanceDelta } from "v4-core/types/BalanceDelta.sol";
 import { BeforeSwapDelta, BeforeSwapDeltaLibrary } from "v4-core/types/BeforeSwapDelta.sol";
 import { SzrCore } from "./SzrCore.sol";
 import { Liquidity } from "./Liquidity.sol";
 import { IVenuePricer } from "./interfaces/IVenuePricer.sol";
 
-/// @dev Only the WETH call the ETH payout needs.
+/// @dev Only the WETH calls the ETH payout and the wrap link need.
 interface IWrapped {
     function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+
+/// @dev Read raw by `_funded`, so a failed read can be told from a shortage.
+interface IERC20Balance {
+    function balanceOf(address account) external view returns (uint256);
 }
 
 /// @notice One hook shared by every pool created with it. Around each swap it closes
@@ -48,15 +61,32 @@ interface IWrapped {
 /// Core's `redeem` is a sell-only venue paying NAV in WETH, in SZR's market only. v4 flash
 /// accounting funds every cycle, so the hook holds no balance between transactions; profit
 /// goes to `donateSzr` in SZR's market and is paid out in the other markets.
+/// @dev In a market that counts in ETH or WETH, a cycle can also cross between the two
+/// through the wrap link, a one-for-one deposit or withdraw of WETH, and a venue can be a
+/// pool on the other ether token. The search reads the groups under both tokens, and a
+/// cycle that ends on a venue holding the twin converts at the end so it still ends in the
+/// token counted.
 /// @dev A failed or unprofitable attempt reverts inside a caught self-call and does not fail
 /// the swap that triggered it. Running out of gas is the exception: a swap sent with too
 /// little gas for any cycle reverts as a whole, so gas estimates include the cycles. Once a
-/// cycle has succeeded the search holds gas back and stops early instead.
+/// cycle has succeeded the search holds gas back and stops early instead. The other
+/// exception is a pool manager short of a token the hook must take before a swap: whoever
+/// controls the current unlock can borrow its whole balance, so the swap reverts with
+/// `Drained` rather than letting that skip a gap. After a swap a shortage is not proof of a
+/// drain (the swapper's own input may be owed and not yet paid), so that search is undone
+/// and the swap goes on. The drain rule has a known limit. Any debit left unpaid earlier in
+/// the same unlock (a multi-hop route, two swaps settled together at the end, an
+/// exact-output route, adding liquidity and then swapping) can make the pool manager look
+/// short before a later swap. Such a swap must pay first or be split. In that state more
+/// gas can fail a swap that less gas passes, because a search with more gas reaches a
+/// further cycle that meets the shortage. So "more gas never makes a swap fail" holds when
+/// nothing earlier in the unlock is unpaid.
 /// v4 skips hook callbacks for the hook's own swaps.
 contract ArbitrageHook is IHooks, IUnlockCallback {
     using StateLibrary for IPoolManager;
     using TransientStateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
+    using CurrencyLibrary for Currency;
 
     /// @notice Pools are grouped by their partner token. A search does not price every pool:
     /// it prices the leaders of the searched pool's own group, the first leader of every
@@ -99,6 +129,30 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// quarter and an eighth of it. The estimate reads liquidity at the current price,
     /// which can be made to mislead in either direction.
     uint256 internal constant TRIES = 5;
+    /// @dev The most boundary events (a tick crossed, or an empty word passed) one sizing
+    /// walk follows, across all its legs together. Reaching it stops the walk where it is,
+    /// which under-trades. See `size`.
+    uint256 internal constant SIZING_STEPS = 8;
+    /// @dev The gas the sizing walk is given. It lets every measured route reach
+    /// `SIZING_STEPS` except dust at every tick, which stops for gas a step or two short (see
+    /// `docs/specs/hook-exact-sizing.md`). The walk stops when it cannot afford another step
+    /// (see `SIZING_STEP_GAS`), so a walk that would need more returns the size it has found
+    /// so far instead of running out.
+    uint256 internal constant SIZING_GAS = 240_000;
+    /// @dev What one more step of the walk may cost per leg, and what is held back for the
+    /// answer after the last one. Measured at about 20k for a step with two legs and 28k to 33k
+    /// with three, and rounded up. The walk stops before a step it cannot afford.
+    uint256 internal constant SIZING_STEP_GAS = 12_000;
+    uint256 internal constant SIZING_TAIL_GAS = 5_000;
+    /// @dev What `_size` charges beyond the gas the walk's call is given: encoding the call,
+    /// making it, decoding the answer and working out the gas. Measured at about 5.4k warm, and
+    /// rounded up for cold reads. It is held back from the cap on the walk's gas, so that even
+    /// a walk that spends all it is given leaves the first try a full share.
+    uint256 internal constant SIZING_CALL_GAS = 10_000;
+    /// @dev Every size the walk answers is held back by this share of the whole cycle input
+    /// plus a few wei, so that every leg really fills whatever rounding the crossings left.
+    uint256 internal constant SIZING_SHAVE = 1_000_000;
+    uint256 internal constant SIZING_WEI = 16;
     /// @dev How far above the smallest profit a cycle's estimate must be to be tried, in
     /// percent.
     uint256 internal constant PLAN_MARGIN = 125;
@@ -116,6 +170,9 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     uint256 internal constant MIN_CYCLE_KEEP = 1e12;
     uint256 internal constant MAX_DEPTH = 1 << 160;
     uint256 internal constant WAD = 1e18;
+    /// @dev A reserved link id for converting between ETH and WETH one for one. It is no
+    /// pool: it has rate `Q96`, keep `WAD` and depth `MAX_DEPTH`, and reads no storage.
+    bytes32 internal constant WRAP = bytes32(uint256(1));
     uint256 internal constant Q96 = 1 << 96;
     uint256 internal constant Q192 = 1 << 192;
     address internal constant UNRELEASED = address(1);
@@ -132,7 +189,8 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// every place a price is asked for: once per venue when the venues are read; five
     /// times per venue when they are ranked (its own liquidity, and the price and
     /// liquidity of up to two connecting pools on the way to it); and twice after a
-    /// cycle, for the two pools it moved.
+    /// cycle, for the two pools it moved. The sizing walk asks once per wrapped leg of the
+    /// cycle too, inside gas that `_sizingGas` caps at half of what the cycle's tries share.
     uint256 internal constant ASK_UNIT = 4_000;
     uint8 internal constant ASK_DEFAULT = 5;
     uint256 internal constant ASK_OVERHEAD = 16_000;
@@ -142,12 +200,15 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
 
     /// @dev One place SZR trades, read once per search: its partner token, its square-root
     /// price in partner per SZR (Q96), and the square root of the share of a trade its fee
-    /// leaves (WAD). The last entry of a book is Core redemption, with a zero `id`.
+    /// leaves (WAD). The last entry of a book is Core redemption, with a zero `id`. `twins`
+    /// is used by a book's first entry only: the place of the first venue that holds the
+    /// other ether token than the one the search counts in (read last), or zero for none.
     struct Venue {
         bytes32 id;
         address partner;
         uint256 rate;
         uint256 keep;
+        uint256 twins;
     }
 
     /// @dev The venue a search is centred on. `depth` is the SZR it takes to move that
@@ -215,10 +276,11 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     }
 
     /// @dev The way from a venue's partner token to the focus pool's partner token: no pool
-    /// when they are the same, one connecting pool, or two that meet at WETH. `links[0]`
-    /// is the pool nearest the focus pool. `rate` and `keep` are the pools' combined; a zero
-    /// `rate` means there is no way across. `depth` is the connecting pools' combined depth,
-    /// read once a cycle needs it.
+    /// when they are the same, one connecting pool, or two that meet at WETH. A link may be
+    /// `WRAP`, the free conversion between ETH and WETH, alone or beside one connecting pool.
+    /// `links[0]` is the pool nearest the focus pool. `rate` and `keep` are the pools'
+    /// combined; a zero `rate` means there is no way across. `depth` is the connecting
+    /// pools' combined depth, read once a cycle needs it.
     struct Route {
         bytes32[2] links;
         uint256[2] rates;
@@ -247,6 +309,51 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         uint256 fullSpend;
         bool buying;
         uint256 score;
+    }
+
+    /// @dev One leg of a cycle as the sizing walk sees it, in the order value flows. `id` is
+    /// zero for Core redemption, which has no state. `rate` is the leg's marginal rate at
+    /// size zero as a Q96 square root, fee included, and `depth` its depth in input units;
+    /// `rateIn` and `depthIn` are the same for all the legs before it, and `flowIn` the most
+    /// they can ever supply. `reach` is the gross
+    /// input that takes the leg to `target`, the price of tick `next`, and `beyond` the
+    /// liquidity past it. `limit` is the price the real trade is given as its limit (zero for
+    /// none, as for Core), and `edge` marks a `target` that is that limit or the end of the
+    /// tick range: the end of the leg. `broken` marks a boundary that could not be read.
+    struct Leg {
+        bytes32 id;
+        bool zeroForOne;
+        bool initialized;
+        bool edge;
+        bool broken;
+        bool wrapped;
+        int24 spacing;
+        int24 tick;
+        int24 next;
+        uint24 fee;
+        uint128 liquidity;
+        uint128 beyond;
+        uint160 price;
+        uint160 target;
+        uint160 limit;
+        uint256 keep;
+        uint256 rate;
+        uint256 depth;
+        uint256 rateIn;
+        uint256 depthIn;
+        uint256 flowIn;
+        uint256 reach;
+    }
+
+    /// @dev What a sizing walk has found so far: the cycle input, the input of the focus
+    /// pool, and the profit it is expected to make. `stopped` is set when it stopped short
+    /// of the optimum, at its cap on boundary events or for want of gas.
+    struct Walk {
+        uint256 total;
+        uint256 focusIn;
+        int256 predicted;
+        uint256 steps;
+        bool stopped;
     }
 
     IPoolManager public immutable poolManager;
@@ -345,8 +452,10 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     error Incomplete();
     error Unprofitable();
     error Unsettled();
+    error Unsizable();
     error Starved();
     error InsufficientGas();
+    error Drained();
     error TooManyMarkets();
     error NotTrusted();
 
@@ -364,6 +473,9 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     event ProfitPaid(
         uint256 indexed market, address indexed asset, uint256 amount, uint256 protocolShare
     );
+    /// @notice The protocol's share of `asset` could not be sent and is held for `recipient`
+    /// as a claim with the pool manager.
+    event ShareHeld(address indexed asset, address indexed recipient, uint256 amount);
     event PoolTracked(uint256 indexed market, bytes32 indexed poolId);
     event PoolUntracked(uint256 indexed market, bytes32 indexed poolId);
     event ConnectorSet(
@@ -379,12 +491,15 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         uint128 minimumProfit,
         uint64 minimumEdge
     );
-    /// @notice A cycle that looked profitable failed at every size tried. A venue that keeps
-    /// appearing here is costing swappers gas and is a candidate for `untrack`.
+    /// @notice A cycle that looked profitable failed at every size tried, or was declined:
+    /// no size was tried because the sizing walk showed that none could clear the smallest
+    /// profit. A venue that keeps appearing here is costing swappers gas and is a candidate
+    /// for `untrack`.
     event CycleFailed(bytes32 indexed poolId, bytes32 indexed venue);
-    /// @notice One size of a cycle used up its whole share of gas. Seen often for a pair,
-    /// its cycles cost more than the hook allows, usually because of very many tick
-    /// ranges on the way.
+    /// @notice One size of a cycle used up its whole share of gas: a try that was given half
+    /// the cycle's budget and spent all but a sixteenth of it. A try on the budget left over
+    /// from earlier tries is never reported. Seen often for a pair, its cycles cost more than
+    /// the hook allows, usually because of very many tick ranges on the way.
     event TryRanOut(bytes32 indexed poolId, bytes32 indexed venue);
     /// @notice A search ended with a cycle still to try because it ran short of gas. Seen
     /// often, it means the gas allowance is too small for the venues a search prices.
@@ -443,7 +558,9 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// can be its recipient. ETH and WETH are approved separately, and taking WETH off does
     /// not stop ETH profit, which is still paid as WETH.
     /// @dev Never approve a token that calls its receiver on transfer: paying it out would
-    /// run that receiver's code in the middle of a search.
+    /// run that receiver's code in the middle of a search. Never approve a token whose
+    /// balances can fall on their own (rebasing, fee on transfer): the pool manager would
+    /// look drained, and swaps that close a gap in it would fail.
     function setProfitToken(address asset, address recipient) external onlyOwner(SZR_MARKET) {
         // SZR is counted only in its own market.
         if (asset == token) revert InvalidPool();
@@ -600,6 +717,11 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     {
         address lower = Currency.unwrap(pool.currency0);
         address higher = Currency.unwrap(pool.currency1);
+        // A pool of ETH and WETH is pointless beside the wrap link, and its partner would
+        // be an ether token while profit is counted in the other.
+        if (_isEther(lower)) {
+            if (_isEther(higher)) return (address(0), false);
+        }
         uint256 first = rankIn[id][lower];
         uint256 second = rankIn[id][higher];
         if (first == 0) return second == 0 ? (address(0), false) : (higher, true);
@@ -711,6 +833,9 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         // be named for one of those. A group can always be emptied.
         if (poolIds.length != 0) {
             if (!_countable(id, base)) revert InvalidPool();
+            if (_isEther(base)) {
+                if (_isEther(partner)) revert InvalidPool();
+            }
         }
         address lower = base < partner ? base : partner;
         address higher = base < partner ? partner : base;
@@ -920,17 +1045,31 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     }
 
     /// @dev The pool itself, the leaders of the largest group, the first leader of each
-    /// other group, and Core.
+    /// other group, and Core. For an ether token the twin's groups are read as well, whether
+    /// or not the market chooses the twin, so the count is never below what `_venues` reads.
     function _venueCount(uint256 id, address base) internal view returns (uint256) {
-        address[] storage list = groups[id][base];
-        uint256 count = list.length;
-        if (count == 0) return 2;
-        uint256 most;
-        for (uint256 index; index < count; index++) {
-            uint256 size = leaders[id][base][list[index]].length;
-            if (size > most) most = size;
+        (uint256 most, uint256 count) = _extent(id, base);
+        if (_isEther(base)) {
+            (uint256 more, uint256 many) = _extent(id, _twin(base));
+            most += more;
+            count += many;
         }
+        if (count == 0) return 2;
         return most + count + 1;
+    }
+
+    /// @dev The size of the largest group under `base`, and how many groups it has.
+    function _extent(uint256 id, address base)
+        internal
+        view
+        returns (uint256 most, uint256 count)
+    {
+        address[] storage list = groups[id][base];
+        count = list.length;
+        for (uint256 index; index < count; index++) {
+            uint256 length = leaders[id][base][list[index]].length;
+            if (length > most) most = length;
+        }
     }
 
     /// @notice The other token of a pool a market is searching, beside the one its profit
@@ -1084,7 +1223,13 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     }
 
     /// @dev Runs the search within the market's gas allowance, and decides what a search
-    /// that was undone means for the swap.
+    /// that was undone means for the swap. A swap fails in two cases only: it brought too
+    /// little gas to look for or close a gap (`InsufficientGas`), or the pool manager is
+    /// short of a token the hook had to take before the swap (`Drained`). After a swap
+    /// the same shortage only undoes the search: routers pay after swapping, so the
+    /// swapper's own input can be owed and missing, and failing then would punish an honest
+    /// swap. Anything else leaves the swap as it would have been. WETH is trusted not to
+    /// revert with the `Drained` selector, which would fail every swap before it.
     function _guard(
         bytes32 poolId,
         Pool memory entry,
@@ -1104,6 +1249,17 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
             poolId, entry.market, entry.home, partner, capped, before, sender
         ) { }
         catch (bytes memory reason) {
+            // Before a swap the swapper's own input is not yet owed, so a shortage is read
+            // as a drain and fails the swap whether or not the search was capped. That
+            // reading is wrong when something earlier in the same unlock is still unpaid:
+            // the pool manager can look short without a drain, and a search with more gas
+            // can reach a further cycle that meets it, so more gas can fail a swap that
+            // less gas passes. This is accepted; such a swap must pay first or be split.
+            // After a swap, the search is undone like any other and the next swap, `arb`
+            // or `sweep` closes the gap.
+            if (before) {
+                if (bytes4(reason) == Drained.selector) revert Drained();
+            }
             // If the swap, not the hook's own allowance, was what ran short, it brought
             // too little gas either to look for a gap (no revert data) or to close the one
             // that is open. It fails as a whole, so that gas estimates include the hook and
@@ -1114,6 +1270,10 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
             }
             // Anything else undid the search and leaves the swap as it would have been,
             // including what it would have cleared.
+            // Defensive: an undone search after a swap leaves its pool remembered, because
+            // the clear in `_open` is undone with it. Nothing reads that today, since each
+            // swap's search before it clears the slot first. Kept so a later reader of the
+            // slot cannot find venues from a search that did not complete. No test reaches it.
             remembered = bytes32(0);
             emit SearchUndone(poolId, bytes4(reason));
         }
@@ -1212,8 +1372,11 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
             }
             profit += gained;
             _requote(book[0]);
-            _requote(book[plan.index]);
-            if (plan.venue != bytes32(0)) next = plan.index;
+            _requoteAt(book, plan.index);
+            // A venue on the twin is no longer a pool of this search's token.
+            if (plan.venue != bytes32(0)) {
+                if (!_onTwin(book, plan.index)) next = plan.index;
+            }
         }
         if (profit != 0) return _settle(profit, resync);
         _resync(resync);
@@ -1248,10 +1411,13 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         if (remembered != poolId) return _book(poolId, partner);
         remembered = bytes32(0);
         uint256 slot = REMEMBER_SLOT;
-        book = new Venue[](_recall(slot));
-        book[0].id = poolId;
-        book[0].partner = partner;
-        _requote(book[0]);
+        uint256 head = _recall(slot);
+        book = new Venue[](uint128(head));
+        Venue memory focus = book[0];
+        focus.id = poolId;
+        focus.partner = partner;
+        focus.twins = head >> 128;
+        _requote(focus);
         for (uint256 index = 1; index < book.length; index++) {
             slot += 4;
             book[index].id = bytes32(_recall(slot));
@@ -1264,11 +1430,13 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// @dev Leaves the other venues' prices for the search after the swap. Only called
     /// when the search before it traded nothing: then no pool has moved since they were
     /// read, the swap between the two searches moves only its own pool, and nothing else
-    /// can run in between. The first word is the number of venues, the pool included.
+    /// can run in between. The first word is the number of venues, the pool included, with
+    /// the place of the first venue on the twin above it (twins are read last).
     function _remember(Venue[] memory book) internal {
         if (gasleft() < REMEMBER_GAS * book.length) return;
         uint256 slot = REMEMBER_SLOT;
-        _keepInMind(slot, book.length);
+        Venue memory focus = book[0];
+        _keepInMind(slot, book.length | focus.twins << 128);
         for (uint256 index = 1; index < book.length; index++) {
             slot += 4;
             _keepInMind(slot, uint256(book[index].id));
@@ -1276,7 +1444,7 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
             _keepInMind(slot + 2, book[index].rate);
             _keepInMind(slot + 3, book[index].keep);
         }
-        remembered = book[0].id;
+        remembered = focus.id;
     }
 
     function _keepInMind(uint256 slot, uint256 value) internal {
@@ -1325,7 +1493,9 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// balance. Its mark survives unless a cycle redeems through Core, which uses the slot
     /// for WETH and leaves it empty, or the market uses wrapped pools (see
     /// `_clear`). A router that marked such a token for an earlier hop and settles it after
-    /// this swap then has its transaction revert; nothing is lost.
+    /// this swap then has its transaction revert; nothing is lost. The same goes for a cycle
+    /// that unwraps WETH, which clears the slot to settle ETH (see `_convert`), in every
+    /// market: an untraded token's mark is lost, a traded one is marked again afterwards.
     function _release(address payer) internal returns (address resync) {
         address synced = Currency.unwrap(poolManager.getSyncedCurrency());
         if (synced == address(0)) return address(0);
@@ -1391,13 +1561,18 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// @dev SZR's market retires its profit at Core. Every other market's is paid out.
     function _retire(uint256 profit) internal {
         if (active != SZR_MARKET) return _payOut(profit);
-        poolManager.take(Currency.wrap(token), address(this), profit);
+        _take(Currency.wrap(token), address(this), profit);
         _requireSettled(token);
         core.donateSzr(profit);
     }
 
     /// @dev Splits a market's profit between the protocol and the market, in the token it
-    /// was counted in.
+    /// was counted in. If the protocol's recipient cannot receive the token (a blocklist, for
+    /// instance), its share is minted as a pool-manager claim instead, so one recipient cannot
+    /// stop every market counting in that token. The recipient redeems a claim by calling
+    /// `unlock` on the pool manager and, inside it, `burn` then `take`, or by transferring
+    /// the claim to something that can. The market's own share has no such fallback, and
+    /// neither does a share owed to Core, which could never redeem the claim.
     function _payOut(uint256 profit) internal {
         // Rounded up, so that no profit is too small for the protocol to share in.
         uint256 share = (profit * PROTOCOL_SHARE + 99) / 100;
@@ -1405,7 +1580,20 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
             _payNative(profit, share);
         } else {
             Currency asset = Currency.wrap(home);
-            poolManager.take(asset, shareRecipient[home], share);
+            address protocol = shareRecipient[home];
+            // Checked for the whole profit before the try below, so that a drain is never
+            // turned into a claim.
+            _funded(asset, profit);
+            if (protocol == address(core)) {
+                // Core cannot redeem a claim, so one minted to it would be stuck.
+                poolManager.take(asset, protocol, share);
+            } else {
+                try poolManager.take(asset, protocol, share) { }
+                catch {
+                    poolManager.mint(protocol, asset.toId(), share);
+                    emit ShareHeld(home, protocol, share);
+                }
+            }
             // Some tokens refuse a transfer of nothing.
             if (profit != share) {
                 poolManager.take(asset, markets[active].recipient, profit - share);
@@ -1416,9 +1604,11 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     }
 
     /// @dev Native ETH profit leaves only as WETH, so no recipient's code runs in the middle
-    /// of a search.
+    /// of a search. Unlike `_payOut` it has no claim fallback: the ETH is already taken by the
+    /// hook, so none can be minted. WETH has no blocklist in its current implementation, but
+    /// it is an upgradeable proxy, so that is not a promise.
     function _payNative(uint256 profit, uint256 share) internal {
-        poolManager.take(Currency.wrap(address(0)), address(this), profit);
+        _take(Currency.wrap(address(0)), address(this), profit);
         // A failed wrap is a named error: an empty revert would be read as too little gas.
         try IWrapped(backingAsset).deposit{ value: profit }() { }
         catch {
@@ -1432,18 +1622,96 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         }
     }
 
-    /// @dev The hook takes ETH profit from the pool manager and wraps it at once. Anyone can
-    /// have the pool manager send ETH here from their own unlock; that ETH is theirs to
-    /// lose, and nothing reads the hook's balance.
+    /// @dev The hook takes ETH from the pool manager and wraps it at once, and WETH sends
+    /// it ETH when it unwraps. Anyone can have the pool manager send ETH here from their
+    /// own unlock; that ETH is theirs to lose, and nothing reads the hook's balance.
     receive() external payable {
-        if (msg.sender != address(poolManager)) revert NotPoolManager();
+        if (msg.sender == address(poolManager)) return;
+        if (msg.sender != backingAsset) revert NotPoolManager();
     }
 
-    /// @dev The first try stops where the depths of the legs say their prices meet. That
-    /// assumes the liquidity read at the current price is what the trade will meet, which
-    /// is wrong when a leg crosses into a different range and can be made wrong on purpose.
-    /// So the next try closes the whole gap, and each one after goes half as far. All the
-    /// tries share `PLAN_GAS`; when it runs out the cycle has failed.
+    function _isEther(address asset) internal view returns (bool) {
+        if (asset == address(0)) return true;
+        return asset == backingAsset;
+    }
+
+    function _twin(address asset) internal view returns (address) {
+        return asset == address(0) ? backingAsset : address(0);
+    }
+
+    /// @dev Turns `amount` of ether token `from`, taken out of the pool manager, into the
+    /// same amount of its twin and pays that in. The slot is cleared before ETH is settled
+    /// because the pool manager refuses ETH while it holds a token, and anyone can mark one.
+    /// It runs inside a cycle, where `_attempt` catches a failed wrap or unwrap whatever its
+    /// shape.
+    function _convert(address from, uint256 amount) internal {
+        _take(Currency.wrap(from), address(this), amount);
+        if (from == address(0)) {
+            IWrapped(backingAsset).deposit{ value: amount }();
+            poolManager.sync(Currency.wrap(backingAsset));
+            SafeTransferLib.safeTransfer(backingAsset, address(poolManager), amount);
+            if (poolManager.settle() != amount) revert InvalidDelta();
+            return;
+        }
+        IWrapped(backingAsset).withdraw(amount);
+        poolManager.sync(Currency.wrap(address(0)));
+        if (poolManager.settle{ value: amount }() != amount) revert InvalidDelta();
+    }
+
+    /// @dev The takes a cycle makes go through here, so that a pool manager short of the
+    /// token is reported as `Drained` and not as a failed cycle. `_payOut` is the exception:
+    /// it checks `_funded` once for the whole profit and then calls `poolManager.take`
+    /// directly. Whether `Drained` fails the swap depends on when the search runs: before a
+    /// swap it does, and after a swap it only undoes that search (see `_guard`). Only the
+    /// controller of the current unlock can cause a shortage, by taking the balance out and
+    /// repaying it at the end. Each take is of something the hook already holds a credit
+    /// for, so an honest pool manager always has it. Only the profit token, SZR, ETH and
+    /// WETH are ever asked about.
+    function _take(Currency asset, address to, uint256 amount) internal {
+        _funded(asset, amount);
+        poolManager.take(asset, to, amount);
+    }
+
+    function _funded(Currency asset, uint256 amount) internal view {
+        address id = Currency.unwrap(asset);
+        uint256 held;
+        if (id == address(0)) {
+            held = address(poolManager).balance;
+        } else {
+            // A failed read must not look like a shortage: it reverts empty, which reads as
+            // too little gas.
+            (bool ok, bytes memory data) =
+                id.staticcall(abi.encodeCall(IERC20Balance.balanceOf, (address(poolManager))));
+            if (!ok) revert();
+            if (data.length < 32) revert();
+            held = abi.decode(data, (uint256));
+        }
+        if (held < amount) revert Drained();
+    }
+
+    /// @dev Re-raises `Drained` from a failed try. Only the first four bytes of what the
+    /// try returned are read, since a leg could make the payload large. Both searches
+    /// re-raise it; `_guard` then fails the swap only for the search before it. Must be called
+    /// straight after the catch, before anything else overwrites the return data.
+    function _raiseDrained() internal pure {
+        bytes32 word;
+        assembly ("memory-safe") {
+            if gt(returndatasize(), 3) {
+                let ptr := mload(0x40)
+                returndatacopy(ptr, 0, 4)
+                word := mload(ptr)
+            }
+        }
+        if (bytes4(word) == Drained.selector) revert Drained();
+    }
+
+    /// @dev The first try is sized by `size`, which walks the legs' ticks, when the cycle is
+    /// one it can read and the search is not strained; otherwise it stops where the depths of
+    /// the legs say their prices meet. That assumes the liquidity read at the current price
+    /// is what the trade will meet, which is wrong when a leg crosses into a different range
+    /// and can be made wrong on purpose. So the next try closes the whole gap, and each one
+    /// after goes half as far. All the tries and the walk share `PLAN_GAS`; when it runs out
+    /// the cycle has failed.
     function _attempt(bytes32 poolId, Plan memory plan) internal returns (uint256) {
         // The pool's price, read only if a third size is reached.
         uint160 current;
@@ -1453,6 +1721,15 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         // size is tried: an eighth of the whole gap, which crosses the fewest ticks of the
         // sizes that close a set share of it.
         bool smallest = strained;
+        if (!smallest) {
+            if (_sizeable(plan)) {
+                bool declined;
+                (budget, declined) = _size(poolId, plan, budget);
+                // The walk found the best size there is and it cannot earn enough: no
+                // tries, and the cycle fails as one whose tries all failed.
+                if (declined) return 0;
+            }
+        }
         for (uint256 number; number < TRIES; number++) {
             if (budget < ATTEMPT_GAS) break;
             if (number == 1) {
@@ -1473,16 +1750,45 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
             uint256 available = gasleft();
             try this.execute{ gas: stipend }(poolId, plan) returns (uint256 profit) {
                 return profit;
-            } catch { }
+            } catch {
+                _raiseDrained();
+            }
             uint256 used = available - gasleft();
             budget = used < budget ? budget - used : 0;
-            if (used >= stipend) {
+            // Running out of gas below `execute`, in the pool manager or a pool's hook, leaves
+            // each frame above it the 1/64 that a call holds back, so `used` falls short of
+            // `stipend`. Four levels of that is a sixteenth; a try that left less unused than
+            // that is counted as having run out, but only if it had a full share. A try on
+            // what the others left over is cut short by the budget, not by the cycle, and
+            // its cycle has no budget left for another size anyway.
+            if (stipend != whole / 2) continue;
+            if (used >= stipend - stipend / 16) {
                 if (!smallest) emit TryRanOut(poolId, plan.venue);
                 smallest = true;
                 strained = true;
             }
         }
         return 0;
+    }
+
+    /// @dev The first try's size, from `size`. Its gas comes out of the budget, not out of
+    /// the try's stipend, so the first try still gets a full share. If the walk fails or
+    /// runs out of gas the first try keeps the estimate.
+    function _size(bytes32 poolId, Plan memory plan, uint256 budget)
+        internal
+        virtual
+        returns (uint256, bool declined)
+    {
+        uint256 available = gasleft();
+        try this.size{ gas: _sizingGas(plan) }(poolId, plan) returns (
+            uint160 limit, uint256 spend, bool decline
+        ) {
+            plan.limit = limit;
+            plan.spend = spend;
+            declined = decline;
+        } catch { }
+        uint256 used = available - gasleft();
+        return (used < budget ? budget - used : 0, declined);
     }
 
     /// @notice One whole cycle. It either nets at least `minimumProfit` SZR with no other
@@ -1523,20 +1829,47 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// @dev Buys SZR in the pool up to the price limit, then works backwards with exact
     /// outputs: each connecting pool supplies the token owed to the pool before it, and the
     /// venue supplies what the last one is owed. Every token but SZR must net to nothing.
+    /// A wrap link only switches the token owed to its twin: the conversion waits until the
+    /// later legs have supplied that twin, so no take is ever of something the hook does
+    /// not yet hold.
     function _buyCycle(bytes32 poolId, Plan calldata plan) internal returns (uint256 profit) {
         PoolKey memory own = keys[poolId];
-        address asset = _other(own, home);
+        address base = home;
+        address asset = _other(own, base);
         (uint256 owed, uint256 bought) = _trade(own, asset, -int256(plan.spend), plan.limit);
+        // The ether token to convert once it is held, and how much; `UNRELEASED` for none.
+        address later = UNRELEASED;
+        uint256 amount;
         for (uint256 hop; hop < 2; hop++) {
             if (plan.links[hop] == bytes32(0)) break;
+            if (plan.links[hop] == WRAP) {
+                later = _twin(asset);
+                amount = owed;
+                asset = later;
+                continue;
+            }
             PoolKey memory link = keys[plan.links[hop]];
-            owed = _exactOutput(link, asset, owed);
-            _requireSettled(asset);
+            owed = _exactOutput(link, asset, owed, plan.gap);
+            // The converted token is checked once it has been.
+            if (asset != later) _requireSettled(asset);
             asset = _other(link, asset);
         }
-        uint256 sold = plan.venue == bytes32(0)
-            ? _redeem(owed)
-            : _exactOutput(keys[plan.venue], asset, owed);
+        uint256 sold;
+        // What Core returned beyond `owed`, when it has to wait for the conversion.
+        uint256 excess;
+        if (plan.venue == bytes32(0)) {
+            (sold, excess) = _redeem(owed, bought, later != UNRELEASED);
+        } else {
+            sold = _exactOutput(keys[plan.venue], asset, owed, plan.gap);
+        }
+        _outOfHome(plan.venue, sold, bought, base);
+        if (later != UNRELEASED) {
+            _convert(later, amount);
+            // Only now is Core's extra WETH a credit, as the debt has been paid in WETH.
+            if (excess != 0) poolManager.clear(Currency.wrap(backingAsset), excess);
+            _requireSettled(later);
+            _requireSettled(_twin(later));
+        }
         _requireSettled(asset);
         profit = bought - sold;
     }
@@ -1545,18 +1878,62 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// with exact inputs until they are SZR again.
     function _sellCycle(bytes32 poolId, Plan calldata plan) internal returns (uint256 profit) {
         PoolKey memory own = keys[poolId];
-        address asset = _other(own, home);
-        (uint256 sold, uint256 held) = _trade(own, home, -int256(plan.spend), plan.limit);
+        address base = home;
+        address asset = _other(own, base);
+        (uint256 sold, uint256 held) = _trade(own, base, -int256(plan.spend), plan.limit);
         for (uint256 hop; hop < 2; hop++) {
             if (plan.links[hop] == bytes32(0)) break;
-            PoolKey memory link = keys[plan.links[hop]];
-            held = _exactInput(link, asset, held);
+            address next;
+            if (plan.links[hop] == WRAP) {
+                _convert(asset, held);
+                next = _twin(asset);
+            } else {
+                PoolKey memory link = keys[plan.links[hop]];
+                held = _exactInput(link, asset, held, plan.gap);
+                next = _other(link, asset);
+            }
             _requireSettled(asset);
-            asset = _other(link, asset);
+            asset = next;
         }
-        uint256 bought = _exactInput(keys[plan.venue], asset, held);
+        uint256 bought = _exactInput(keys[plan.venue], asset, held, plan.gap);
         _requireSettled(asset);
+        _intoHome(plan.venue, bought, base);
         profit = bought - sold;
+    }
+
+    /// @dev Whether a venue's pool holds the twin of this search's ether token. It shares
+    /// the partner token with the pool searched, so the test is that it does not hold the
+    /// search's profit token.
+    function _holdsTwin(bytes32 venue, address base) internal view returns (bool) {
+        if (!_isEther(base)) return false;
+        if (venue == bytes32(0)) return false;
+        PoolKey storage pool = keys[venue];
+        if (Currency.unwrap(pool.currency0) == base) return false;
+        return Currency.unwrap(pool.currency1) != base;
+    }
+
+    /// @dev A sell cycle's venue paid the twin: it becomes the token the search counts in.
+    function _intoHome(bytes32 venue, uint256 amount, address base) internal {
+        if (!_holdsTwin(venue, base)) return;
+        address twin = _twin(base);
+        _convert(twin, amount);
+        // Defensive: `amount` is what the venue paid and exactly that is converted, so the
+        // twin is always settled here. Kept so a change to the conversion cannot leave it
+        // owed unnoticed. No test reaches it.
+        _requireSettled(twin);
+    }
+
+    /// @dev A buy cycle's venue was paid in the twin: exactly that much of the token the
+    /// search counts in, which the hook holds from the pool it bought in, becomes the twin.
+    /// The take is of what the hook is owed only if it bought more than that.
+    function _outOfHome(bytes32 venue, uint256 sold, uint256 bought, address base) internal {
+        if (!_holdsTwin(venue, base)) return;
+        if (sold >= bought) revert Unprofitable();
+        _convert(base, sold);
+        // Defensive: `sold` is what the venue was paid in the twin and exactly that is
+        // converted, so the twin is always settled here. Kept so a change to the conversion
+        // cannot leave it owed unnoticed. No test reaches it.
+        _requireSettled(_twin(base));
     }
 
     function _other(PoolKey memory pool, address asset) internal pure returns (address) {
@@ -1565,33 +1942,77 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     }
 
     /// @dev Redeems just enough SZR at NAV to cover the WETH owed. Rounding can return a
-    /// few wei more than owed; that excess is given up to the pool manager.
-    function _redeem(uint256 owed) internal returns (uint256 amount) {
+    /// few wei more than owed; that excess is given up to the pool manager. When the debt is
+    /// in ETH (`wrapped`) the WETH delta is all of `received` until the conversion, so the
+    /// excess is returned for `_buyCycle` to give up then, and exactly that is cleared: any
+    /// other credit left to the hook still fails the cycle.
+    /// It reverts before the take if that is not less than the SZR the cycle bought, so the
+    /// hook never takes SZR it is not owed.
+    function _redeem(uint256 owed, uint256 bought, bool wrapped)
+        internal
+        returns (uint256 amount, uint256 excess)
+    {
         amount = FixedPointMathLib.fullMulDivUp(owed, core.activeSupply(), core.backingAmount());
-        poolManager.take(Currency.wrap(token), address(this), amount);
+        if (amount >= bought) revert Unprofitable();
+        _take(Currency.wrap(token), address(this), amount);
         uint256 received = core.redeem(amount, owed);
         poolManager.sync(Currency.wrap(backingAsset));
         SafeTransferLib.safeTransfer(backingAsset, address(poolManager), received);
         if (poolManager.settle() != received) revert InvalidDelta();
-        if (received != owed) poolManager.clear(Currency.wrap(backingAsset), received - owed);
+        excess = received - owed;
+        if (wrapped) return (amount, excess);
+        if (excess != 0) poolManager.clear(Currency.wrap(backingAsset), excess);
     }
 
-    function _exactInput(PoolKey memory pool, address input, uint256 amount)
+    function _exactInput(PoolKey memory pool, address input, uint256 amount, uint256 gap)
         internal
         returns (uint256 received)
     {
         uint256 spent;
-        (spent, received) = _trade(pool, input, -int256(amount), 0);
+        (spent, received) = _trade(pool, input, -int256(amount), _legLimit(pool, input, gap));
         if (spent != amount) revert Incomplete();
     }
 
-    function _exactOutput(PoolKey memory pool, address output, uint256 amount)
+    function _exactOutput(PoolKey memory pool, address output, uint256 amount, uint256 gap)
         internal
         returns (uint256 spent)
     {
         uint256 received;
-        (spent, received) = _trade(pool, _other(pool, output), int256(amount), 0);
+        address input = _other(pool, output);
+        (spent, received) = _trade(pool, input, int256(amount), _legLimit(pool, input, gap));
         if (received != amount) revert Incomplete();
+    }
+
+    /// @dev The price limit for a venue or connecting leg that is a plain pool: its
+    /// square-root price moved against the trade by `(1 + gap)²`, `gap` being the cycle's
+    /// square-root gap. A leg that has moved that far has moved its price about twice the
+    /// whole cycle's gap, so the optimum never reaches it. Without a limit a leg that cannot
+    /// fill walks every empty bitmap word to the extreme price first, whatever the try's size.
+    /// A wrapped pool ignores price limits, so it keeps none (zero).
+    function _legLimit(PoolKey memory pool, address input, uint256 gap)
+        internal
+        view
+        returns (uint160)
+    {
+        if (pricers[address(pool.hooks)] != address(0)) return 0;
+        (uint160 price,,,) = poolManager.getSlot0(pool.toId());
+        return _limitFrom(price, Currency.unwrap(pool.currency0) == input, gap);
+    }
+
+    /// @dev `price` moved against a trade by `(1 + gap)²`, inside `TickMath`'s range.
+    function _limitFrom(uint160 price, bool zeroForOne, uint256 gap)
+        internal
+        pure
+        returns (uint160)
+    {
+        uint256 wide = WAD + gap;
+        uint256 factor = FixedPointMathLib.fullMulDiv(wide, wide, WAD);
+        if (zeroForOne) {
+            uint256 low = FixedPointMathLib.fullMulDiv(price, WAD, factor);
+            return low > TickMath.MIN_SQRT_PRICE ? uint160(low) : TickMath.MIN_SQRT_PRICE + 1;
+        }
+        uint256 high = FixedPointMathLib.fullMulDiv(price, factor, WAD);
+        return high < TickMath.MAX_SQRT_PRICE ? uint160(high) : TickMath.MAX_SQRT_PRICE - 1;
     }
 
     /// @dev `amount` follows v4: negative is an exact input, positive an exact output.
@@ -1622,7 +2043,8 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
 
     /// @dev The venues one search prices, read in one call to the pool manager: the pool
     /// itself first, then the other leaders of its group, then the first leader of every
-    /// other group, and Core last. Connecting pools are read when used.
+    /// other group, and Core last. Connecting pools are read when used. When the search
+    /// counts in an ether token, the same from the twin's lists follows the others.
     function _book(bytes32 poolId, address partner)
         internal
         view
@@ -1630,8 +2052,17 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     {
         (bytes32[] memory ids, address[] memory partners, uint256 count) =
             _venues(poolId, partner);
-        // Only SZR's market can redeem at Core.
+        uint256 split = count;
+        // Only SZR's market can redeem at Core. It is never one that counts in an ether
+        // token, so it skips that check, which reads no storage.
         bool redeemable = active == SZR_MARKET;
+        address base = home;
+        if (!redeemable) {
+            if (_isEther(base)) {
+                (ids, partners) = _grow(ids, partners, count);
+                count = _twinVenues(ids, partners, count, partner);
+            }
+        }
         book = new Venue[](redeemable ? count + 1 : count);
         bytes32[] memory slots = new bytes32[](count);
         for (uint256 index; index < count; index++) {
@@ -1641,9 +2072,16 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         }
         bytes32[] memory words = poolManager.extsload(slots);
         bool wraps = asking != 0;
-        for (uint256 index; index < count; index++) {
+        for (uint256 index; index < split; index++) {
             if (wraps) words[index] = _wrapped(ids[index], words[index]);
-            _price(book[index], words[index]);
+            _price(book[index], words[index], base);
+        }
+        // Venues from the twin's lists come last. A pool and its twin's pool differ in the
+        // ether token that sets which way their price runs.
+        if (split < count) book[0].twins = split;
+        for (uint256 index = split; index < count; index++) {
+            if (wraps) words[index] = _wrapped(ids[index], words[index]);
+            _price(book[index], words[index], _twin(base));
         }
         // A wrapped pool keeps no price of its own and ignores a price limit, so a search
         // is never centred on one.
@@ -1670,8 +2108,8 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         partners[0] = partner;
         count = 1;
         bytes32[] storage own = leaders[id][base][partner];
-        uint256 size = own.length;
-        for (uint256 index; index < size; index++) {
+        uint256 length = own.length;
+        for (uint256 index; index < length; index++) {
             bytes32 leader = own[index];
             if (leader == poolId) continue;
             ids[count] = leader;
@@ -1680,8 +2118,8 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         }
         address[] storage list = groups[id][base];
         mapping(address => bytes32) storage firsts = heads[id][base];
-        size = list.length;
-        for (uint256 index; index < size; index++) {
+        length = list.length;
+        for (uint256 index; index < length; index++) {
             address other = list[index];
             if (other == partner) continue;
             ids[count] = firsts[other];
@@ -1690,12 +2128,70 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         }
     }
 
+    /// @dev The venues read so far, in arrays with room for the twin's as well.
+    function _grow(bytes32[] memory ids, address[] memory partners, uint256 count)
+        internal
+        pure
+        returns (bytes32[] memory allIds, address[] memory allPartners)
+    {
+        allIds = new bytes32[](ids.length * 2);
+        allPartners = new address[](ids.length * 2);
+        for (uint256 index; index < count; index++) {
+            allIds[index] = ids[index];
+            allPartners[index] = partners[index];
+        }
+    }
+
+    /// @dev The same lists under the other ether token, after the venues already read: the
+    /// leaders of the same partner's group, then the first leader of every other group.
+    function _twinVenues(
+        bytes32[] memory ids,
+        address[] memory partners,
+        uint256 count,
+        address partner
+    ) internal view returns (uint256) {
+        address base = _twin(home);
+        bytes32[] storage own = leaders[active][base][partner];
+        for (uint256 index; index < own.length; index++) {
+            ids[count] = own[index];
+            partners[count] = partner;
+            count++;
+        }
+        address[] storage list = groups[active][base];
+        for (uint256 index; index < list.length; index++) {
+            if (list[index] == partner) continue;
+            ids[count] = heads[active][base][list[index]];
+            partners[count] = list[index];
+            count++;
+        }
+        return count;
+    }
+
     function _requote(Venue memory venue) internal view {
         if (venue.id == bytes32(0)) {
             (venue.rate, venue.keep) = _redeemQuote();
             return;
         }
-        _price(venue, _word(venue.id));
+        _price(venue, _word(venue.id), home);
+    }
+
+    /// @dev Whether the venue at `index` of a book holds the twin.
+    function _onTwin(Venue[] memory book, uint256 index) internal pure returns (bool) {
+        uint256 first = book[0].twins;
+        if (first == 0) return false;
+        return index >= first;
+    }
+
+    /// @dev Prices a venue again, in the direction of the ether token its pool holds.
+    function _requoteAt(Venue[] memory book, uint256 index) internal view {
+        uint256 first = book[0].twins;
+        if (first != 0) {
+            if (index >= first) {
+                Venue memory venue = book[index];
+                return _price(venue, _word(venue.id), _twin(home));
+            }
+        }
+        _requote(book[index]);
     }
 
     /// @dev A pool's price and fee in the form of the first storage word of a v4 pool. For
@@ -1713,8 +2209,8 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         if (wrapper == address(0)) return word;
         address pricer = pricers[wrapper];
         if (pricer == address(0)) return bytes32(0);
-        (uint256 price, uint256 fee,) = _ask(pricer, poolId);
-        return bytes32(price | (fee << 208));
+        uint256[5] memory answer = _ask(pricer, poolId);
+        return bytes32(answer[0] | (answer[1] << 208));
     }
 
     /// @dev A pool's liquidity: the pricer's figure for a pool on a hook that has one, the
@@ -1725,19 +2221,20 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         if (wrapper == address(0)) return poolManager.getLiquidity(PoolId.wrap(poolId));
         address pricer = pricers[wrapper];
         if (pricer == address(0)) return 0;
-        (,, units) = _ask(pricer, poolId);
+        units = _ask(pricer, poolId)[2];
     }
 
     /// @dev Asks a pricer about a pool. The call is read-only, gets the market's `asking`
-    /// gas, and has exactly three words copied back. A failure, a different length or a
-    /// value out of range all give zeros, which reads as no price.
+    /// gas, and has exactly five words copied back: price, fee, liquidity, and the range
+    /// the answer holds over. A failure, a different length or a value out of range all give
+    /// zeros, which reads as no price. The book uses the first three words; the sizing walk
+    /// also uses the range.
     function _ask(address pricer, bytes32 poolId)
         internal
         view
-        returns (uint256 price, uint256 fee, uint256 units)
+        returns (uint256[5] memory answer)
     {
         bytes memory question = abi.encodeCall(IVenuePricer.price, (keys[poolId]));
-        uint256[3] memory answer;
         uint256 allowance = asking;
         bool heard;
         assembly ("memory-safe") {
@@ -1747,22 +2244,30 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
                 add(question, 0x20),
                 mload(question),
                 answer,
-                0x60
+                0xa0
             )
-            if iszero(eq(returndatasize(), 0x60)) { heard := 0 }
+            if iszero(eq(returndatasize(), 0xa0)) { heard := 0 }
         }
-        if (!heard) return (0, 0, 0);
-        if (answer[0] > type(uint160).max) return (0, 0, 0);
-        if (answer[1] >= 1e6) return (0, 0, 0);
-        if (answer[2] > type(uint128).max) return (0, 0, 0);
-        return (answer[0], answer[1], answer[2]);
+        if (!heard) return _none();
+        if (answer[0] > type(uint160).max) return _none();
+        if (answer[1] >= 1e6) return _none();
+        if (answer[2] > type(uint128).max) return _none();
+        if (answer[3] > answer[0]) return _none();
+        if (answer[4] < answer[0]) return _none();
+        if (answer[3] < TickMath.MIN_SQRT_PRICE) return _none();
+        if (answer[4] > TickMath.MAX_SQRT_PRICE) return _none();
+        return answer;
     }
 
+    function _none() internal pure returns (uint256[5] memory none) { }
+
     /// @dev Fills in a venue's price and fee factor from its pool's first storage word.
-    function _price(Venue memory venue, bytes32 word) internal view {
+    /// `base` is the ether token the venue's pool holds, which is not always the token the
+    /// search counts in.
+    function _price(Venue memory venue, bytes32 word, address base) internal pure {
         uint24 fee;
         uint24 levy;
-        (venue.rate, fee, levy) = _unpack(word, home < venue.partner);
+        (venue.rate, fee, levy) = _unpack(word, base < venue.partner);
         venue.keep = _keep(_swapFee(fee, levy));
     }
 
@@ -1842,16 +2347,34 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         focus.known++;
     }
 
-    /// @dev One connecting pool when there is one; otherwise two that meet at WETH.
+    /// @dev In order: no link for the same token; the wrap link between the two ether
+    /// tokens; one connecting pool; a connecting pool to the twin of an ether end, plus the
+    /// wrap link; two pools that meet at WETH.
     function _route(address from, address to) internal view returns (Route memory route) {
         route.rate = Q96;
         route.keep = WAD;
         if (from == to) return route;
+        // ETH and WETH together have bits that OR to WETH's address. This runs for every
+        // partner of every search, so that is tested first and the rest only when it holds.
+        address weth = backingAsset;
+        bool possible;
+        assembly ("memory-safe") {
+            possible := eq(or(from, to), weth)
+        }
+        if (possible) {
+            if (_isEther(from)) {
+                if (_isEther(to)) {
+                    _wrapHop(route, 0);
+                    return route;
+                }
+            }
+        }
         bytes32 direct = _connector(from, to);
         if (direct != bytes32(0)) {
             _hop(route, 0, direct, from < to);
             return route;
         }
+        if (_viaTwin(route, from, to)) return route;
         // Two pools that meet at WETH would pass through the token profit is counted in.
         if (home == backingAsset) {
             route.rate = 0;
@@ -1862,6 +2385,38 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         // A missing pool has no price, which leaves the route's rate at zero.
         _hop(route, 0, near, backingAsset < to);
         _hop(route, 1, far, from < backingAsset);
+    }
+
+    /// @dev Exactly one end an ether token and a connecting pool between the other end and
+    /// its twin: that pool and the wrap link, the pool nearest the focus pool.
+    function _viaTwin(Route memory route, address from, address to)
+        internal
+        view
+        returns (bool)
+    {
+        if (_isEther(from)) {
+            address twin = _twin(from);
+            bytes32 pool = _connector(twin, to);
+            if (pool == bytes32(0)) return false;
+            _hop(route, 0, pool, twin < to);
+            _wrapHop(route, 1);
+            return true;
+        }
+        if (_isEther(to)) {
+            address twin = _twin(to);
+            bytes32 pool = _connector(from, twin);
+            if (pool == bytes32(0)) return false;
+            _wrapHop(route, 0);
+            _hop(route, 1, pool, from < twin);
+            return true;
+        }
+        return false;
+    }
+
+    /// @dev The wrap link changes neither the rate nor the fees.
+    function _wrapHop(Route memory route, uint256 slot) internal pure {
+        route.links[slot] = WRAP;
+        route.rates[slot] = Q96;
     }
 
     function _connector(address a, address b) internal view returns (bytes32) {
@@ -1875,7 +2430,9 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         (uint256 rate, uint256 keep) = _quote(poolId, baseFirst);
         route.links[slot] = poolId;
         route.rates[slot] = rate;
-        route.rate = FixedPointMathLib.fullMulDiv(route.rate, rate, Q96);
+        // The route's rate is still `Q96` at the first slot, so the product is `rate`; the
+        // multiplication is skipped because this runs for every partner of every search.
+        route.rate = slot == 0 ? rate : FixedPointMathLib.fullMulDiv(route.rate, rate, Q96);
         route.keep = route.keep * keep / WAD;
     }
 
@@ -1906,10 +2463,10 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         returns (uint256 depth)
     {
         // `flow` is the price of SZR in each connecting pool's quote token, nearest first.
-        depth = _depth(route.links[0], route.rates[0], flow);
+        depth = _linkDepth(route.links[0], route.rates[0], flow);
         if (route.links[1] == bytes32(0)) return depth;
         flow = FixedPointMathLib.fullMulDiv(flow, Q96, route.rates[0]);
-        depth = _harmonic(depth, _depth(route.links[1], route.rates[1], flow));
+        depth = _harmonic(depth, _linkDepth(route.links[1], route.rates[1], flow));
     }
 
     /// @dev `candidate.gap` is how far the square-root prices are apart beyond fees, as a
@@ -1917,8 +2474,9 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
     /// across every leg together, so the gap times the depth is the SZR to trade and the
     /// gap times that again is the profit. The focus pool is moved only its own share of
     /// the way to `target`; the other legs move the rest.
-    /// ponytail: straight-line estimate from each pool's liquidity at its current price.
-    /// It is wrong once a leg crosses into a different range; `_attempt` retries halfway.
+    /// The estimate is a straight line from each pool's liquidity at its current price.
+    /// It is wrong once a leg crosses into a different range, and `_attempt` retries
+    /// halfway.
     function _offer(
         Plan memory best,
         Focus memory focus,
@@ -2003,6 +2561,16 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         return FixedPointMathLib.fullMulDiv(scaled, Q96, flow);
     }
 
+    /// @dev The wrap link has no limit to how much it converts.
+    function _linkDepth(bytes32 poolId, uint256 rate, uint256 flow)
+        internal
+        view
+        returns (uint256)
+    {
+        if (poolId == WRAP) return MAX_DEPTH;
+        return _depth(poolId, rate, flow);
+    }
+
     /// @dev Depths in a chain combine like resistors in parallel. An empty leg gives zero.
     function _harmonic(uint256 a, uint256 b) internal pure returns (uint256) {
         if (a == 0) return 0;
@@ -2063,6 +2631,518 @@ contract ArbitrageHook is IHooks, IUnlockCallback {
         if (nav > type(uint64).max) return (0, 0);
         rate = FixedPointMathLib.sqrt(FixedPointMathLib.fullMulDiv(nav, Q192, WAD));
         keep = WAD;
+    }
+
+    /// @notice The size of a cycle's first try, found by walking its legs across the
+    /// initialised ticks they meet, up to `SIZING_STEPS` boundary events in all. Within one
+    /// range the legs compose into one constant-product curve, whose best size has a closed
+    /// form; when a leg reaches the edge of its range first, the walk moves every leg that
+    /// far, crosses the tick, and solves again. It returns the focus pool's price limit and
+    /// what it may pay in, or the plan's own estimate when the walk finds nothing to improve
+    /// on. It only estimates: moves nothing, and a wrong answer is a worse size, caught by
+    /// the profit check and the other sizes. A guard that trips reverts, and the first try
+    /// then uses the estimate. Only cycles whose every leg is a plain pool, a wrapped pool, the
+    /// wrap link or Core are sized; see `_sizeable`. A wrapped pool is asked its price and
+    /// the range that holds over, and reaching the end of that range is the end of its leg. It
+    /// is an under-trade, not a dead end: a cycle with a wrapped leg is never declined.
+    function size(bytes32 poolId, Plan calldata plan)
+        external
+        view
+        onlySelf
+        returns (uint160 limit, uint256 spend, bool declined)
+    {
+        (limit, spend,, declined) = _walk(poolId, plan);
+    }
+
+    /// @dev Whether every leg of a cycle is one the walk can read: a plain pool, a wrapped
+    /// pool, the wrap link or Core. A leg is wrapped if its pool was added as one or if its
+    /// hook now has a pricer, the test `_legLimit` makes, so a pool added before its hook was
+    /// given a pricer is not walked as plain and traded as wrapped. A wrapped pool whose pricer
+    /// gives no range is read here, and the walk then gives up on it and uses the estimate.
+    /// Virtual so that a test can switch the walk off and exercise the other sizes alone.
+    function _sizeable(Plan memory plan) internal view virtual returns (bool) {
+        if (!_readable(plan.venue)) return false;
+        if (!_readable(plan.links[0])) return false;
+        return _readable(plan.links[1]);
+    }
+
+    function _readable(bytes32 poolId) internal view returns (bool) {
+        if (poolId == bytes32(0)) return true;
+        if (poolId == WRAP) return true;
+        address wrapper = wrappers[poolId];
+        if (wrapper != address(0)) return pricers[wrapper] != address(0);
+        return pricers[address(keys[poolId].hooks)] == address(0);
+    }
+
+    /// @dev The gas the walk is given: its own, and what a pricer gets for each wrapped leg
+    /// it asks.
+    function _sizingGas(Plan memory plan) internal view returns (uint256 gas) {
+        uint256 each = asking;
+        if (each == 0) return SIZING_GAS;
+        uint256 wrapped;
+        if (_asked(true, plan.venue)) wrapped++;
+        if (_asked(true, plan.links[0])) wrapped++;
+        if (_asked(true, plan.links[1])) wrapped++;
+        gas = SIZING_GAS + wrapped * each;
+        // A large pricer allowance must not let the walk eat the gas held back for the tries
+        // after it, the swap and the search that follows.
+        uint256 most = _plan(each) / 2 - SIZING_CALL_GAS;
+        if (gas > most) gas = most;
+    }
+
+    /// @dev Whether the walk asks a pricer about this pool. A market with no wrapped pool
+    /// has `asking` zero, and nothing to look up.
+    function _asked(bool asks, bytes32 poolId) internal view returns (bool) {
+        if (!asks) return false;
+        return wrappers[poolId] != address(0);
+    }
+
+    function _walk(bytes32 poolId, Plan calldata plan)
+        internal
+        view
+        returns (uint160 limit, uint256 spend, uint256 steps, bool declined)
+    {
+        (Leg[] memory legs, uint256 focus) = _legs(poolId, plan);
+        _load(legs, plan.gap, plan.full, focus);
+        Walk memory walk;
+        // Reaching a wrapped leg's range end is an under-trade, never a dead end: the venue
+        // may hold deep liquidity past what its pricer reports, so the walk never declines.
+        for (uint256 index; index < legs.length; index++) {
+            if (legs[index].wrapped) walk.stopped = true;
+        }
+        for (uint256 round; round <= SIZING_STEPS; round++) {
+            if (!_round(legs, walk, focus, round)) break;
+        }
+        steps = walk.steps;
+        return _answer(walk, plan, steps);
+    }
+
+    /// @dev One round of the walk: crosses a hole, or solves the legs within their ranges and
+    /// moves them to the nearest boundary. False when the walk is over. Whatever the walk
+    /// could not carry on with after it has found a size is a stop, never a decline.
+    function _round(Leg[] memory legs, Walk memory walk, uint256 focus, uint256 round)
+        internal
+        view
+        returns (bool)
+    {
+        // Short of gas for another step: what has been found is an under-trade.
+        if (gasleft() < legs.length * SIZING_STEP_GAS + SIZING_TAIL_GAS) {
+            walk.stopped = true;
+            return false;
+        }
+        uint256 empty = _shapeAll(legs);
+        if (empty != legs.length) return _pass(legs[empty], walk, round);
+        (uint256 rate, uint256 depth, bool fits) = _compose(legs);
+        if (!fits) {
+            walk.stopped = true;
+            return false;
+        }
+        if (rate <= Q96) return false;
+        uint256 cycle = FixedPointMathLib.fullMulDiv(depth, rate - Q96, Q96);
+        uint256 hit;
+        // A best size of zero, or of no more than the few wei that rounding is worth, with the
+        // rate still above break-even is a range too thin to matter, not the optimum: go to
+        // its nearest boundary, and across it if that is zero too.
+        bool thin = cycle <= SIZING_WEI;
+        (cycle, hit) = _bounded(legs, thin ? type(uint256).max : cycle);
+        bool crossing = hit != legs.length;
+        if (!crossing) {
+            if (thin) return false;
+        }
+        // The next boundary is further than the few wei that rounding is worth: this is the
+        // optimum, not a range to skip.
+        if (thin) {
+            if (cycle > SIZING_WEI) return false;
+        }
+        if (crossing) {
+            if (_ends(legs[hit])) crossing = false;
+        }
+        _step(legs, walk, cycle, hit, focus, crossing);
+        if (!crossing) return false;
+        return _carryOn(legs[hit], walk, round);
+    }
+
+    /// @dev A leg in a hole, or in a range too thin to shape, crosses to its next boundary
+    /// for nothing, as in v4. The end of the leg is the only dead end.
+    function _pass(Leg memory leg, Walk memory walk, uint256 round)
+        internal
+        view
+        returns (bool)
+    {
+        if (_ends(leg)) return false;
+        return _carryOn(leg, walk, round);
+    }
+
+    function _carryOn(Leg memory leg, Walk memory walk, uint256 round)
+        internal
+        view
+        returns (bool)
+    {
+        if (round == SIZING_STEPS) {
+            walk.stopped = true;
+            return false;
+        }
+        _cross(leg);
+        walk.steps++;
+        if (leg.broken) {
+            walk.stopped = true;
+            return false;
+        }
+        return true;
+    }
+
+    /// @dev What the walk answers. A walk that ran to its natural end, the optimum within
+    /// range or the end of a leg, and found too little is final: profit is concave in size,
+    /// so no size can earn what this one cannot. One that stopped short answers only if what
+    /// it found is enough. Every size is held back by a millionth and a few wei, so that
+    /// every leg still fills whatever rounding the crossings left.
+    function _answer(Walk memory walk, Plan calldata plan, uint256 steps)
+        internal
+        view
+        returns (uint160, uint256, uint256, bool)
+    {
+        if (walk.total == 0) return (plan.limit, plan.spend, steps, false);
+        bool poor = walk.predicted < int256(uint256(minimumProfit[active][home]));
+        if (poor) {
+            return (plan.limit, plan.spend, steps, !walk.stopped);
+        }
+        uint256 spend = _shaved(plan.buying ? walk.focusIn : walk.total);
+        uint256 most = uint256(uint128(type(int128).max));
+        if (spend > most) spend = most;
+        if (spend == 0) return (plan.limit, plan.spend, steps, false);
+        return (plan.full, spend, steps, false);
+    }
+
+    function _shaved(uint256 spend) internal pure returns (uint256) {
+        uint256 cut = spend / SIZING_SHAVE + SIZING_WEI;
+        return spend > cut ? spend - cut : 0;
+    }
+
+    /// @dev Moves every leg by `cycle` of cycle input and books the result.
+    function _step(
+        Leg[] memory legs,
+        Walk memory walk,
+        uint256 cycle,
+        uint256 hit,
+        uint256 focus,
+        bool force
+    ) internal pure {
+        uint256 out;
+        uint256 focusIn;
+        (out, focusIn) = _advance(legs, cycle, force ? hit : legs.length, focus);
+        walk.total += cycle;
+        walk.focusIn += focusIn;
+        walk.predicted += int256(out) - int256(cycle);
+    }
+
+    /// @dev The legs of a cycle in the order value flows, and the focus pool's place in it.
+    /// A selling cycle runs the focus pool first and the venue last; a buying cycle the
+    /// other way round, so its legs are found in the order `_buyCycle` trades them and
+    /// turned over.
+    function _legs(bytes32 poolId, Plan calldata plan)
+        internal
+        view
+        returns (Leg[] memory legs, uint256 focus)
+    {
+        Leg[] memory found = new Leg[](4);
+        uint256 count;
+        bool buying = plan.buying;
+        PoolKey memory key = keys[poolId];
+        address asset = _other(key, home);
+        found[count++] = _leg(poolId, key, buying ? asset : home);
+        for (uint256 hop; hop < 2; hop++) {
+            bytes32 link = plan.links[hop];
+            if (link == bytes32(0)) break;
+            if (link == WRAP) {
+                asset = _twin(asset);
+                continue;
+            }
+            key = keys[link];
+            found[count++] = _leg(link, key, buying ? _other(key, asset) : asset);
+            asset = _other(key, asset);
+        }
+        if (plan.venue == bytes32(0)) {
+            found[count].rate = _coreRate();
+            found[count++].depth = MAX_DEPTH;
+        } else {
+            key = keys[plan.venue];
+            found[count++] = _leg(plan.venue, key, buying ? _other(key, asset) : asset);
+        }
+        legs = new Leg[](count);
+        for (uint256 index; index < count; index++) {
+            legs[buying ? count - 1 - index : index] = found[index];
+        }
+        focus = buying ? count - 1 : 0;
+    }
+
+    function _coreRate() internal view returns (uint256 rate) {
+        (rate,) = _redeemQuote();
+        if (rate == 0) revert Unsizable();
+    }
+
+    /// @dev A pool as a leg whose input is `input`.
+    function _leg(bytes32 poolId, PoolKey memory key, address input)
+        internal
+        pure
+        returns (Leg memory leg)
+    {
+        leg.id = poolId;
+        leg.zeroForOne = Currency.unwrap(key.currency0) == input;
+        leg.spacing = key.tickSpacing;
+    }
+
+    /// @dev Reads every leg's price, fee and liquidity in one call to the pool manager, and
+    /// finds each one's first boundary. A wrapped pool is asked instead, and its boundary is
+    /// the end of the range it reports. Whatever is out of bounds reverts.
+    function _load(Leg[] memory legs, uint256 gap, uint160 full, uint256 focus) internal view {
+        uint256 count = legs.length;
+        bool asks = asking != 0;
+        bytes32[] memory slots = new bytes32[](count * 2);
+        uint256 read;
+        for (uint256 index; index < count; index++) {
+            if (legs[index].id == bytes32(0)) continue;
+            if (_asked(asks, legs[index].id)) continue;
+            bytes32 slot = StateLibrary._getPoolStateSlot(PoolId.wrap(legs[index].id));
+            slots[read++] = slot;
+            slots[read++] = bytes32(uint256(slot) + 3);
+        }
+        assembly ("memory-safe") {
+            mstore(slots, read)
+        }
+        bytes32[] memory words = poolManager.extsload(slots);
+        read = 0;
+        for (uint256 index; index < count; index++) {
+            Leg memory leg = legs[index];
+            if (leg.id == bytes32(0)) continue;
+            if (_asked(asks, leg.id)) {
+                _loadWrapped(leg, gap);
+                continue;
+            }
+            _read(leg, uint256(words[read++]), uint256(words[read++]), gap);
+            if (index == focus) leg.limit = full;
+            _bound(leg);
+            // Nothing is found yet, so a boundary that cannot be read is a guard.
+            if (leg.broken) revert Unsizable();
+        }
+    }
+
+    /// @dev A wrapped pool as a leg: its pricer's price, fee and liquidity, as the book reads
+    /// them. It has no ticks and ignores a price limit, so the end of the range the pricer
+    /// reports, in the direction the leg trades, is where it ends. Without a price, or with
+    /// no room before that end, the walk gives up and the estimate is used.
+    function _loadWrapped(Leg memory leg, uint256 gap) internal view {
+        uint256[5] memory answer = _ask(pricers[wrappers[leg.id]], leg.id);
+        _read(leg, answer[0] | (answer[1] << 208), answer[2], gap);
+        leg.target = uint160(leg.zeroForOne ? answer[3] : answer[4]);
+        leg.edge = true;
+        leg.wrapped = true;
+        if (leg.target == leg.price) revert Unsizable();
+    }
+
+    /// @dev Fills in a leg from the first word of its pool's state, as `Pool.swap` reads it:
+    /// the fee is the one for the leg's direction.
+    function _read(Leg memory leg, uint256 packed, uint256 units, uint256 gap) internal pure {
+        leg.price = uint160(packed);
+        leg.tick = int24(uint24(packed >> 160));
+        uint16 levy = uint16(leg.zeroForOne ? (packed >> 184) & 0xfff : (packed >> 196) & 0xfff);
+        uint24 lpFee = uint24(packed >> 208);
+        leg.fee = levy == 0 ? lpFee : ProtocolFeeLibrary.calculateSwapFee(levy, lpFee);
+        leg.liquidity = uint128(units);
+        if (leg.price == 0) revert Unsizable();
+        if (leg.fee >= 1e6) revert Unsizable();
+        uint256 rate = leg.zeroForOne ? leg.price : Q192 / leg.price;
+        if (rate < MIN_RATE) revert Unsizable();
+        if (rate > MAX_RATE) revert Unsizable();
+        leg.keep = _keep(leg.fee);
+        // The limit the real trade is given, `_legLimit`; the focus leg's is set by the caller.
+        leg.limit = _limitFrom(leg.price, leg.zeroForOne, gap);
+    }
+
+    /// @dev The next tick `Pool.swap` would stop at going the leg's way: the next
+    /// initialised one within a bitmap word, or the word's edge when it has none. Reaching
+    /// the end of the tick range is the end of liquidity.
+    function _bound(Leg memory leg) internal view {
+        int24 compressed = TickBitmap.compress(leg.tick, leg.spacing);
+        PoolId pool = PoolId.wrap(leg.id);
+        int24 next;
+        unchecked {
+            if (leg.zeroForOne) {
+                (int16 word, uint8 bit) = TickBitmap.position(compressed);
+                uint256 masked =
+                    poolManager.getTickBitmap(pool, word) & (type(uint256).max >> (255 - bit));
+                leg.initialized = masked != 0;
+                uint8 back = leg.initialized ? bit - BitMath.mostSignificantBit(masked) : bit;
+                next = (compressed - int24(uint24(back))) * leg.spacing;
+            } else {
+                (int16 word, uint8 bit) = TickBitmap.position(++compressed);
+                uint256 masked =
+                    poolManager.getTickBitmap(pool, word) & ~((uint256(1) << bit) - 1);
+                leg.initialized = masked != 0;
+                uint8 ahead = leg.initialized
+                    ? BitMath.leastSignificantBit(masked) - bit
+                    : type(uint8).max - bit;
+                next = (compressed + int24(uint24(ahead))) * leg.spacing;
+            }
+        }
+        leg.edge = next <= TickMath.MIN_TICK || next >= TickMath.MAX_TICK;
+        if (next <= TickMath.MIN_TICK) next = TickMath.MIN_TICK;
+        if (next >= TickMath.MAX_TICK) next = TickMath.MAX_TICK;
+        leg.next = next;
+        leg.target = TickMath.getSqrtPriceAtTick(next);
+        // The real trade is stopped at its limit, so that is where the leg ends if nearer.
+        if (leg.zeroForOne) {
+            if (leg.target <= leg.limit) (leg.target, leg.edge) = (leg.limit, true);
+            if (leg.target > leg.price) leg.broken = true;
+        } else {
+            if (leg.target >= leg.limit) (leg.target, leg.edge) = (leg.limit, true);
+            if (leg.target < leg.price) leg.broken = true;
+        }
+    }
+
+    /// @dev The cycle's whole chain of legs, at their current prices, as one curve:
+    /// its marginal rate at size zero (a Q96 square root) and its depth in input units. Each
+    /// leg also keeps the same for the legs before it. See `docs/specs/hook-exact-sizing.md`.
+    function _compose(Leg[] memory legs)
+        internal
+        pure
+        returns (uint256 rate, uint256 depth, bool fits)
+    {
+        rate = Q96;
+        depth = MAX_DEPTH;
+        for (uint256 index; index < legs.length; index++) {
+            Leg memory leg = legs[index];
+            leg.rateIn = rate;
+            leg.depthIn = depth;
+            uint256 flow = FixedPointMathLib.fullMulDiv(
+                FixedPointMathLib.fullMulDiv(depth, rate, Q96), rate, Q96
+            );
+            leg.flowIn = flow;
+            depth = FixedPointMathLib.fullMulDiv(depth, leg.depth, leg.depth + flow);
+            rate = FixedPointMathLib.fullMulDiv(rate, leg.rate, Q96);
+            if (rate > MAX_CYCLE_RATE) return (0, 0, false);
+        }
+        return (rate, depth, true);
+    }
+
+    /// @dev Shapes every leg, and says which is the first with no depth to compose: in a hole,
+    /// or in a range so thin that its depth rounds to zero. Such a leg is crossed for
+    /// nothing. `legs.length` if there is none.
+    function _shapeAll(Leg[] memory legs) internal pure returns (uint256 empty) {
+        empty = legs.length;
+        for (uint256 index; index < legs.length; index++) {
+            if (legs[index].id == bytes32(0)) continue;
+            _shape(legs[index]);
+            if (empty == legs.length) {
+                if (legs[index].depth == 0) empty = index;
+            }
+        }
+    }
+
+    /// @dev A leg's rate and depth from its price and liquidity: the input token's side of
+    /// its virtual reserves, with the fee taken from the input.
+    function _shape(Leg memory leg) internal pure {
+        uint256 price = leg.price;
+        uint256 reserve;
+        if (leg.liquidity == 0) {
+            leg.depth = 0;
+            return;
+        }
+        if (leg.zeroForOne) {
+            leg.rate = FixedPointMathLib.fullMulDiv(price, leg.keep, WAD);
+            reserve = FixedPointMathLib.fullMulDiv(leg.liquidity, Q96, price);
+        } else {
+            leg.rate = FixedPointMathLib.fullMulDiv(Q192, leg.keep, price * WAD);
+            reserve = FixedPointMathLib.fullMulDiv(leg.liquidity, price, Q96);
+        }
+        uint256 depth = FixedPointMathLib.fullMulDiv(reserve, 1e6, 1e6 - leg.fee);
+        leg.depth = depth > MAX_DEPTH ? MAX_DEPTH : depth;
+    }
+
+    /// @dev The cycle input at which the first leg to reach its boundary does, if that is
+    /// less than `cycle`, and which leg it is (`legs.length` for none). A leg gets `x` of
+    /// its own input from the legs before it when the cycle puts in `x * P / (M * P - x)`,
+    /// `M` and `P` being their price and depth; if they can never supply `x` the leg never
+    /// gets there.
+    function _bounded(Leg[] memory legs, uint256 cycle)
+        internal
+        pure
+        returns (uint256, uint256 hit)
+    {
+        hit = legs.length;
+        for (uint256 index; index < legs.length; index++) {
+            Leg memory leg = legs[index];
+            if (leg.id == bytes32(0)) continue;
+            leg.reach = _reach(leg);
+            uint256 input = leg.reach;
+            if (index != 0) {
+                if (input >= leg.flowIn) continue;
+                input = FixedPointMathLib.fullMulDiv(input, leg.depthIn, leg.flowIn - input);
+            }
+            if (input < cycle) {
+                cycle = input;
+                hit = index;
+            }
+        }
+        return (cycle, hit);
+    }
+
+    /// @dev The gross input, fee included, that takes a leg from its price to its boundary.
+    function _reach(Leg memory leg) internal pure returns (uint256 amount) {
+        amount = leg.zeroForOne
+            ? SqrtPriceMath.getAmount0Delta(leg.target, leg.price, leg.liquidity, true)
+            : SqrtPriceMath.getAmount1Delta(leg.price, leg.target, leg.liquidity, true);
+        amount += FullMath.mulDivRoundingUp(amount, leg.fee, 1e6 - leg.fee);
+    }
+
+    /// @dev Whether the leg's boundary is the end of the leg, its price limit or the end of the
+    /// tick range. If not, it also finds the liquidity past it, for `_cross`. Zero liquidity
+    /// past it is a hole, which is crossed, not an end.
+    function _ends(Leg memory leg) internal view returns (bool) {
+        if (leg.edge) return true;
+        leg.beyond = leg.liquidity;
+        if (!leg.initialized) return false;
+        (, int128 net) = poolManager.getTickLiquidity(PoolId.wrap(leg.id), leg.next);
+        leg.beyond = LiquidityMath.addDelta(leg.liquidity, leg.zeroForOne ? -net : net);
+        return false;
+    }
+
+    /// @dev Moves a leg across its boundary, as `Pool.swap` does, and finds the next one.
+    function _cross(Leg memory leg) internal view {
+        leg.price = leg.target;
+        leg.liquidity = leg.beyond;
+        leg.tick = leg.zeroForOne ? leg.next - 1 : leg.next;
+        _bound(leg);
+    }
+
+    /// @dev Trades `cycle` through every leg in turn, as `SwapMath` would, and returns what
+    /// the last one pays out and what went into the focus pool. The leg at `hit` is taken to
+    /// its boundary whatever rounding says, since it is the one the walk is stopping at.
+    function _advance(Leg[] memory legs, uint256 cycle, uint256 hit, uint256 focus)
+        internal
+        pure
+        returns (uint256 amount, uint256 focusIn)
+    {
+        amount = cycle;
+        for (uint256 index; index < legs.length; index++) {
+            Leg memory leg = legs[index];
+            if (leg.id == bytes32(0)) {
+                amount = FixedPointMathLib.fullMulDiv(
+                    FixedPointMathLib.fullMulDiv(amount, leg.rate, Q96), leg.rate, Q96
+                );
+                continue;
+            }
+            if (index == hit) {
+                if (amount < leg.reach) amount = leg.reach;
+            }
+            if (index == focus) focusIn = amount;
+            if (amount == 0) {
+                if (index == hit) leg.price = leg.target;
+                continue;
+            }
+            (leg.price,, amount,) = SwapMath.computeSwapStep(
+                leg.price, leg.target, leg.liquidity, -int256(amount), leg.fee
+            );
+        }
     }
 
     function beforeInitialize(address, PoolKey calldata, uint160)

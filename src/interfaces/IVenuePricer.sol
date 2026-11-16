@@ -8,7 +8,7 @@ import { PoolKey } from "v4-core/types/PoolKey.sol";
 /// arbitrage hook asks one of these, in place of the pool manager, about any pool on a hook
 /// that Liquidity's manager has paired with it.
 /// @dev The call is read-only and is given very little gas. Anything but exactly these
-/// three words back, or a value out of range, is taken as "no price", and the pool is then
+/// five words back, or a value out of range, is taken as "no price", and the pool is then
 /// simply passed over. A pricer can never make a swap fail or move any funds; a wrong
 /// answer only makes a cycle fail its profit check or go unnoticed.
 interface IVenuePricer {
@@ -20,8 +20,24 @@ interface IVenuePricer {
     /// the wrapped exchange's fee together with any fee the wrapping hook adds.
     /// @return liquidity The liquidity in range at that price, in Uniswap v4's terms: what
     /// a v4 pool that responded to trades in the same way would report.
+    /// @return lowerSqrtPriceX96 The lowest square-root price, in the same orientation as
+    /// `sqrtPriceX96`, down to which the pool answers trades as a v4 range with `liquidity`
+    /// would.
+    /// @return upperSqrtPriceX96 The highest such price. A v2-style (constant-product) venue
+    /// is one range over every price, so it returns `TickMath.MIN_SQRT_PRICE` and
+    /// `TickMath.MAX_SQRT_PRICE`. A v3-style venue holds only to its next tick, and a
+    /// stable-swap or weighted one only near the current price. A pricer that cannot say
+    /// returns `lower == upper == sqrtPriceX96`, and the pool is then sized by an estimate.
+    /// Both must lie within `TickMath`'s bounds, `lower` at or below the price and `upper`
+    /// at or above it, or the whole answer is taken as "no price".
     function price(PoolKey calldata pool)
         external
         view
-        returns (uint160 sqrtPriceX96, uint24 fee, uint128 liquidity);
+        returns (
+            uint160 sqrtPriceX96,
+            uint24 fee,
+            uint128 liquidity,
+            uint160 lowerSqrtPriceX96,
+            uint160 upperSqrtPriceX96
+        );
 }

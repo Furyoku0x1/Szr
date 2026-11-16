@@ -30,6 +30,10 @@ contract ConfigureArbitrageHook is Script {
         uint256[] positions;
         /// The leaders of each partner token's group, deepest pool first.
         Group[] groups;
+        /// Tokens to approve as profit tokens, other than WETH and native ETH.
+        address[] profitTokens;
+        /// Receives the protocol's share of each of `profitTokens`.
+        address treasury;
     }
 
     struct Group {
@@ -40,6 +44,9 @@ contract ConfigureArbitrageHook is Script {
 
     error MissingHook();
     error MismatchedConnectors();
+    error MissingTreasury();
+    error TreasuryIsHook();
+    error ProfitTokenRefused(address token);
 
     function run() external {
         run(_readConfig());
@@ -48,6 +55,7 @@ contract ConfigureArbitrageHook is Script {
     /// @notice Typed inputs let rehearsals execute without shared environment-variable state.
     function run(Config memory config) public {
         if (address(config.hook).code.length == 0) revert MissingHook();
+        _checkProfitTokens(config);
         Liquidity liquidity = config.hook.liquidity();
         vm.startBroadcast(liquidity.manager());
         // The allowance has to cover the leaders set below, so it goes up before they are.
@@ -78,11 +86,40 @@ contract ConfigureArbitrageHook is Script {
             }
             config.hook.setLeaders(1, token, group.partner, poolIds);
         }
+        _approveProfitTokens(config);
         vm.stopBroadcast();
         console2.log("TRACKED_POOLS", config.hook.market(1).poolCount);
         console2.log("GROUPS", config.hook.groupsOf(1, token).length);
         console2.log("GAS_LIMIT", config.hook.market(1).gasLimit);
         console2.log("MINIMUM_GAS_LIMIT", config.hook.minimumGasLimit(1));
+    }
+
+    /// @dev Checked before anything is sent, so a bad list changes nothing.
+    function _checkProfitTokens(Config memory config) internal view {
+        if (config.profitTokens.length == 0) return;
+        if (config.treasury == address(0)) revert MissingTreasury();
+        if (config.treasury == address(config.hook)) revert TreasuryIsHook();
+        for (uint256 index; index < config.profitTokens.length; index++) {
+            address asset = config.profitTokens[index];
+            if (asset == address(0)) revert ProfitTokenRefused(asset);
+            if (asset == config.hook.backingAsset()) revert ProfitTokenRefused(asset);
+            if (asset == config.hook.token()) revert ProfitTokenRefused(asset);
+        }
+    }
+
+    /// @dev Native ETH's share goes to Core, which counts it as WETH. The listed tokens go to
+    /// the treasury. Calls that would change nothing are skipped so the script can be re-run.
+    /// Tokens approved earlier but absent from the list keep their old recipient, so rotating
+    /// the treasury means listing every token again.
+    function _approveProfitTokens(Config memory config) internal {
+        if (config.hook.shareRecipient(address(0)) != address(config.hook.core())) {
+            config.hook.setProfitToken(address(0), address(config.hook.core()));
+        }
+        for (uint256 index; index < config.profitTokens.length; index++) {
+            address asset = config.profitTokens[index];
+            if (config.hook.shareRecipient(asset) == config.treasury) continue;
+            config.hook.setProfitToken(asset, config.treasury);
+        }
     }
 
     /// @dev Connecting pools are given as five parallel lists, one entry per pool. One
@@ -94,6 +131,8 @@ contract ConfigureArbitrageHook is Script {
             config.groups = new Group[](1);
             config.groups[0] = Group(partner, vm.envUint("LEADER_POSITIONS", ","));
         }
+        config.profitTokens = vm.envOr("PROFIT_TOKENS", ",", new address[](0));
+        config.treasury = vm.envOr("TREASURY", address(0));
         config.gasLimit = uint32(vm.envOr("HOOK_GAS_LIMIT", uint256(0)));
         config.positions = vm.envOr("TRACK_POSITIONS", ",", new uint256[](0));
         address[] memory token0 = vm.envOr("CONNECTOR_TOKEN0", ",", new address[](0));

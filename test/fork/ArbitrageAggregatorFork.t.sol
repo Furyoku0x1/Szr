@@ -120,7 +120,7 @@ contract ArbitrageAggregatorForkTest is Test {
         vm.startPrank(TEAM);
         arbitrage.setPricer(AGGREGATOR, address(pricer));
         vm.stopPrank();
-        (uint160 outsideRoot,,) = pricer.price(wrapped);
+        (uint160 outsideRoot,,,,) = pricer.price(wrapped);
         hooked = PoolKey(wrapped.currency0, wrapped.currency1, 3_000, 60, arbitrage);
         vm.startPrank(OWNER);
         id = arbitrage.openMarket(TREASURY);
@@ -185,7 +185,7 @@ contract ArbitrageAggregatorForkTest is Test {
 
     /// What the pricer's price and fee say a small sale of WETH should fetch.
     function _implied(uint128 amount) internal view returns (uint256) {
-        (uint160 root, uint24 fee,) = pricer.price(wrapped);
+        (uint160 root, uint24 fee,,,) = pricer.price(wrapped);
         uint256 spot = uint256(root) * root / (1 << 96) * amount / (1 << 96);
         return spot * (1e6 - fee) / 1e6;
     }
@@ -193,7 +193,7 @@ contract ArbitrageAggregatorForkTest is Test {
     function testPricerAgreesWithTheQuoter() public {
         if (!live) return vm.skip(true);
         _open();
-        (uint160 root, uint24 fee, uint128 depth) = pricer.price(wrapped);
+        (uint160 root, uint24 fee, uint128 depth,,) = pricer.price(wrapped);
         emit log_named_uint("outside sqrtPriceX96", root);
         emit log_named_uint("pricer fee (hundredths of a bip)", fee);
         emit log_named_uint("outside liquidity", depth);

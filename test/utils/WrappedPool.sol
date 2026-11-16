@@ -136,7 +136,8 @@ contract WrappedPool {
     }
 }
 
-/// @dev Prices pools on a `WrappedPool` from the reserves it holds. `mode` makes it give a
+/// @dev Prices pools on a `WrappedPool` from the reserves it holds. A constant-product pool
+/// is one range over every price, so that is the range it reports. `mode` makes it give a
 /// bad answer.
 contract WrappedPricer is IVenuePricer {
     using PoolIdLibrary for PoolKey;
@@ -144,8 +145,15 @@ contract WrappedPricer is IVenuePricer {
     WrappedPool internal immutable wrapper;
     /// 1: revert. 2: burn all the gas given. 3: answer with four words. 4: answer with a
     /// very long one. 5: a fee of more than everything. 6: a price too large for a pool.
-    /// 7: liquidity too large for a pool. 8: a fee that does not fit in its field.
+    /// 7: liquidity too large for a pool. 8: a fee that does not fit in its field. 9: no range
+    /// (it cannot say how far its answer holds). 10: a short range, `reach` parts per million
+    /// of the price either side. 11: a lower bound above the price. 12: an upper bound below
+    /// it. 13: a lower bound below `TickMath`'s. 14: an upper bound above it. 15: six words.
+    /// 16: burn all the gas it is given when given less than a million, as the sizing walk
+    /// gives it at a large allowance; the book's reads give it more.
     uint256 public mode;
+    /// The distance, in parts per million of the square-root price, that mode 10 holds over.
+    uint256 public reach;
 
     constructor(WrappedPool pool) {
         wrapper = pool;
@@ -155,35 +163,95 @@ contract WrappedPricer is IVenuePricer {
         mode = value;
     }
 
-    function price(PoolKey calldata pool) external view returns (uint160, uint24, uint128) {
+    function setReach(uint256 ppm) external {
+        reach = ppm;
+    }
+
+    function price(PoolKey calldata pool)
+        external
+        view
+        returns (uint160, uint24, uint128, uint160, uint160)
+    {
         uint256 state = mode;
         if (state == 1) revert("no price");
-        if (state == 2) {
-            uint256 spin;
-            while (gasleft() > 200) spin++;
+        if (state == 16) {
+            if (gasleft() < 1_000_000) _burn();
         }
+        if (state == 2) _burn();
         (uint256 first, uint256 second) = wrapper.reservesOf(PoolId.unwrap(pool.toId()));
         uint256 root =
             FixedPointMathLib.sqrt(FixedPointMathLib.fullMulDiv(second, 1 << 192, first));
         uint256 units = FixedPointMathLib.sqrt(first * second);
-        // A right answer with something after it: one word more, or a great many.
-        if (state == 3) _answer(root, 3_000, units, 0x80);
-        if (state == 4) _answer(root, 3_000, units, 0x4000);
-        // Three words of the right length, one of them out of range.
-        if (state == 6) _answer(1 << 161, 3_000, units, 0x60);
-        if (state == 7) _answer(root, 3_000, 1 << 129, 0x60);
-        if (state == 8) _answer(root, 1 << 24, units, 0x60);
-        if (state == 5) return (uint160(root), type(uint24).max, uint128(units));
-        return (uint160(root), 3_000, uint128(units));
+        // A right answer with something after it or missing from it.
+        if (state == 3) _answer(root, 3_000, units, root, root, 0x80);
+        if (state == 4) _answer(root, 3_000, units, root, root, 0x4000);
+        if (state == 15) _answer(root, 3_000, units, TickMath.MIN_SQRT_PRICE, root, 0xc0);
+        // Five words of the right length, one of them out of range.
+        uint256 low = TickMath.MIN_SQRT_PRICE;
+        uint256 high = TickMath.MAX_SQRT_PRICE;
+        if (state == 6) _answer(1 << 161, 3_000, units, low, high, 0xa0);
+        if (state == 7) _answer(root, 3_000, 1 << 129, low, high, 0xa0);
+        if (state == 8) _answer(root, 1 << 24, units, low, high, 0xa0);
+        if (state == 9) {
+            return (uint160(root), 3_000, uint128(units), uint160(root), uint160(root));
+        }
+        if (state == 10) {
+            return (
+                uint160(root),
+                3_000,
+                uint128(units),
+                uint160(root * (1e6 - reach) / 1e6),
+                uint160(root * (1e6 + reach) / 1e6)
+            );
+        }
+        if (state == 11) _answer(root, 3_000, units, root + 1, high, 0xa0);
+        if (state == 12) _answer(root, 3_000, units, low, root - 1, 0xa0);
+        if (state == 13) _answer(root, 3_000, units, low - 1, high, 0xa0);
+        if (state == 14) _answer(root, 3_000, units, low, high + 1, 0xa0);
+        uint24 fee = state == 5 ? type(uint24).max : 3_000;
+        return (uint160(root), fee, uint128(units), uint160(low), uint160(high));
     }
 
-    function _answer(uint256 root, uint256 fee, uint256 units, uint256 length) internal pure {
+    function _burn() internal view {
+        uint256 spin;
+        while (gasleft() > 200) spin++;
+    }
+
+    function _answer(
+        uint256 root,
+        uint256 fee,
+        uint256 units,
+        uint256 lower,
+        uint256 upper,
+        uint256 length
+    ) internal pure {
         assembly ("memory-safe") {
             let start := mload(0x40)
             mstore(start, root)
             mstore(add(start, 0x20), fee)
             mstore(add(start, 0x40), units)
+            mstore(add(start, 0x60), lower)
+            mstore(add(start, 0x80), upper)
+            mstore(add(start, 0xa0), 0)
             return(start, length)
         }
+    }
+}
+
+/// @dev A pricer that answers the same five words whatever it is asked, at almost no gas of
+/// its own, so that a test can measure what asking costs the hook beyond the pricer's work.
+contract FlatPricer is IVenuePricer {
+    function price(PoolKey calldata)
+        external
+        pure
+        returns (uint160, uint24, uint128, uint160, uint160)
+    {
+        return (
+            uint160(1 << 96),
+            3_000,
+            1_000_000e18,
+            TickMath.MIN_SQRT_PRICE,
+            TickMath.MAX_SQRT_PRICE
+        );
     }
 }

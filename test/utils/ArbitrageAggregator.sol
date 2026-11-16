@@ -33,11 +33,17 @@ contract AggregatorPricer is IVenuePricer {
         hookFee = cut;
     }
 
-    function price(PoolKey calldata pool) external view returns (uint160, uint24, uint128) {
+    /// A Slipstream pool holds only to its next tick, which this does not read, so it says
+    /// nothing about its range and the hook sizes it by an estimate.
+    function price(PoolKey calldata pool)
+        external
+        view
+        returns (uint160, uint24, uint128, uint160, uint160)
+    {
         IOutsidePool outside =
             IOutsidePool(aggregator.poolIdToExternalPool(PoolId.unwrap(pool.toId())));
         // Slipstream's slot0 has more words than this reads; only the first is the price.
         uint160 root = outside.slot0();
-        return (root, outside.fee() + hookFee, outside.liquidity());
+        return (root, outside.fee() + hookFee, outside.liquidity(), root, root);
     }
 }

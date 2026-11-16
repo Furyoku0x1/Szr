@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import { console } from "forge-std/console.sol";
 import { MarketsWorld } from "./ArbitrageMarkets.t.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
-import { WrappedPool, WrappedPricer } from "./utils/WrappedPool.sol";
+import { WrappedPool, WrappedPricer, FlatPricer } from "./utils/WrappedPool.sol";
+import { ArbitrageProbe } from "./utils/ArbitrageProbe.sol";
+import { IVenuePricer } from "../src/interfaces/IVenuePricer.sol";
 import { ArbitrageHook } from "../src/ArbitrageHook.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
@@ -120,7 +123,9 @@ contract ArbitrageWrappedTest is MarketsWorld {
     /// A pricer that reverts, burns its gas, answers at the wrong length or out of range
     /// only makes its pools disappear. The swap goes through, on little gas too.
     function testBadPricerOnlyHidesItsPools() public {
-        for (uint256 mode = 1; mode < 9; mode++) {
+        for (uint256 mode = 1; mode < 16; mode++) {
+            if (mode == 9) continue;
+            if (mode == 10) continue;
             uint256 snapshot = vm.snapshotState();
             pricer.arm(mode);
             vm.recordLogs();
@@ -130,6 +135,77 @@ contract ArbitrageWrappedTest is MarketsWorld {
             assertTrue(_swapWithGas(first, address(coin), 1e15, 900_000), "short swap fills");
             vm.revertToState(snapshot);
         }
+    }
+
+    /// A pricer that cannot say how far its answer holds, or holds it over a short range,
+    /// still has its pool traded: the walk only changes the size of the first try.
+    function testPricerWithNoRangeOrAShortOneIsStillTraded() public {
+        for (uint256 mode = 9; mode < 11; mode++) {
+            uint256 snapshot = vm.snapshotState();
+            pricer.arm(mode);
+            pricer.setReach(2_000);
+            vm.recordLogs();
+            _trade(first, address(coin), 50_000e18);
+            assertGt(_cycles(), 0, "a cycle against the wrapped pool");
+            _assertNothingHeld();
+            vm.revertToState(snapshot);
+        }
+    }
+
+    /// `_ask` takes exactly five words back, and only a range that holds the price, inside
+    /// `TickMath`'s bounds. Anything else, as a failure does, is no price: all zeros.
+    function testAskValidatesTheAnswer() public {
+        ArbitrageProbe probe = _probeInHook();
+        bytes32 poolId = _id(outside);
+        uint256[5] memory good = probe.ask(address(pricer), poolId, 20_000);
+        assertEq(good[0], 1 << 96, "price");
+        assertEq(good[1], 3_000, "fee");
+        assertEq(
+            good[3], TickMath.MIN_SQRT_PRICE, "a v2 venue's range starts at the least price"
+        );
+        assertEq(good[4], TickMath.MAX_SQRT_PRICE, "and ends at the greatest");
+        // A pricer that cannot say gives a range of nothing but the price itself.
+        pricer.arm(9);
+        uint256[5] memory none = probe.ask(address(pricer), poolId, 20_000);
+        assertEq(none[3], none[0], "lower is the price");
+        assertEq(none[4], none[0], "and so is upper");
+        pricer.arm(10);
+        pricer.setReach(5_000);
+        uint256[5] memory short = probe.ask(address(pricer), poolId, 20_000);
+        assertEq(short[3], good[0] * 995_000 / 1e6, "a short range below");
+        assertEq(short[4], good[0] * 1_005_000 / 1e6, "and above");
+        // Four words, six, a great many, a bound that excludes the price or lies outside
+        // `TickMath`'s range, and a price, fee or liquidity too large: no price.
+        uint8[10] memory bad = [3, 4, 15, 11, 12, 13, 14, 6, 7, 8];
+        for (uint256 index; index < bad.length; index++) {
+            pricer.arm(bad[index]);
+            uint256[5] memory answer = probe.ask(address(pricer), poolId, 20_000);
+            for (uint256 word; word < 5; word++) {
+                assertEq(answer[word], 0, "no price");
+            }
+        }
+    }
+
+    /// One ask of a pricer, with the five-word answer, costs the hook no more than
+    /// `ASK_OVERHEAD` beyond the pricer's own gas. The hook reserves that much per ask, so a
+    /// larger answer must not need more.
+    function testAnAskFitsItsOverhead() public {
+        FlatPricer flat = new FlatPricer();
+        hook.setPricer(address(wrapper), address(flat));
+        ArbitrageProbe probe = _probeInHook();
+        PoolKey memory pool = outside;
+        uint256 own;
+        {
+            uint256 start = gasleft();
+            IVenuePricer(address(flat)).price(pool);
+            own = start - gasleft();
+        }
+        vm.cool(address(hook));
+        vm.cool(address(flat));
+        (uint256 used, uint256 overhead) = probe.askCost(_id(outside), 20_000);
+        console.log("ask gas", used, "pricer own", own);
+        assertEq(overhead, 16_000, "the overhead the hook reserves");
+        assertLe(used - own, overhead, "an ask fits within it");
     }
 
     /// While a cycle runs through a wrapped pool, that pool's hook and the tokens it moves
