@@ -5,7 +5,8 @@ import { Vm } from "forge-std/Vm.sol";
 import { WrapWorld } from "./ArbitrageWrap.t.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 import { WrappedPool, WrappedPricer } from "./utils/WrappedPool.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { EntryPart } from "../src/arbitrage/ArbitrageEntry.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { Liquidity } from "../src/Liquidity.sol";
 import { FeeCollector } from "../src/FeeCollector.sol";
 import { ArbitrageProbe } from "./utils/ArbitrageProbe.sol";
@@ -31,7 +32,7 @@ contract SyncedPayer is IUnlockCallback {
         TestAsset asset,
         uint256 amount,
         bytes32 poolId,
-        ArbitrageHook.Plan calldata plan
+        ArbitrageLogic.Plan calldata plan
     ) external returns (uint256 used) {
         return abi.decode(
             manager.unlock(abi.encode(probe, asset, amount, poolId, abi.encode(plan))),
@@ -47,7 +48,7 @@ contract SyncedPayer is IUnlockCallback {
             bytes32 poolId,
             bytes memory raw
         ) = abi.decode(data, (ArbitrageProbe, TestAsset, uint256, bytes32, bytes));
-        ArbitrageHook.Plan memory plan = abi.decode(raw, (ArbitrageHook.Plan));
+        ArbitrageLogic.Plan memory plan = abi.decode(raw, (ArbitrageLogic.Plan));
         Currency currency = Currency.wrap(address(asset));
         manager.sync(currency);
         asset.transfer(address(manager), amount);
@@ -76,7 +77,7 @@ contract ArbitrageCleanupTest is WrapWorld {
         config.hooks = IHooks(address(foreign));
         uint256 position =
             locker.addPool(config, FeeCollector.AssetConfig(1e18, 20_000e18, 1e12));
-        vm.expectRevert(ArbitrageHook.NotTrusted.selector);
+        vm.expectRevert(ArbitrageLogic.NotTrusted.selector);
         hook.track(position);
         hook.setPricer(address(foreign), address(new WrappedPricer(foreign)));
         // A wrapped pool raises what the market must reserve, so the allowance goes first.
@@ -90,7 +91,7 @@ contract ArbitrageCleanupTest is WrapWorld {
     /// Core can only count WETH, so any other token sent to it would be locked. ETH is paid
     /// as WETH and is fine. A zero recipient still takes a token off the list.
     function testCoreReceivesOnlyEtherAndWeth() public {
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setProfitToken(address(usd), address(core));
         hook.setProfitToken(address(0), address(core));
         hook.setProfitToken(address(backing), address(core));
@@ -101,12 +102,12 @@ contract ArbitrageCleanupTest is WrapWorld {
 
     /// Anything credited to the pool manager itself would be surplus nobody can claim.
     function testPoolManagerReceivesNothing() public {
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setProfitToken(address(usd), address(manager));
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.openMarket(address(manager));
         vm.prank(team);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setRecipient(id, address(manager));
     }
 
@@ -146,8 +147,8 @@ contract ArbitrageCleanupTest is WrapWorld {
         uint256 tried;
         for (uint256 index; index < logs.length; index++) {
             bytes32 topic = logs[index].topics[0];
-            if (topic != ArbitrageHook.CycleFailed.selector) {
-                if (topic != ArbitrageHook.Arbitraged.selector) continue;
+            if (topic != ArbitrageLogic.CycleFailed.selector) {
+                if (topic != ArbitrageLogic.Arbitraged.selector) continue;
             }
             if (logs[index].topics[2] == _id(both)) tried++;
         }
@@ -160,8 +161,8 @@ contract ArbitrageCleanupTest is WrapWorld {
     /// callbacks against it. Their selectors, and what they return for a swap that is left
     /// alone (Liquidity's own), are pinned here.
     function testSwapCallbacksMatchIHooks() public {
-        assertEq(ArbitrageHook.beforeSwap.selector, IHooks.beforeSwap.selector, "before");
-        assertEq(ArbitrageHook.afterSwap.selector, IHooks.afterSwap.selector, "after");
+        assertEq(EntryPart.beforeSwap.selector, IHooks.beforeSwap.selector, "before");
+        assertEq(EntryPart.afterSwap.selector, IHooks.afterSwap.selector, "after");
         IPoolManager.SwapParams memory params = IPoolManager.SwapParams(true, -1, 1);
         vm.startPrank(address(manager));
         (bytes4 beforeSelector, BeforeSwapDelta delta, uint24 fee) =
@@ -190,7 +191,7 @@ contract ArbitrageCleanupTest is WrapWorld {
         probe.setSkipTries(true);
         SyncedPayer payer = new SyncedPayer(manager);
         usd.mint(address(payer), 1e18);
-        ArbitrageHook.Plan memory plan;
+        ArbitrageLogic.Plan memory plan;
         plan.index = 1;
         plan.venue = bytes32(uint256(0xA1));
         plan.links[0] = bytes32(uint256(0xA2));
@@ -202,5 +203,16 @@ contract ArbitrageCleanupTest is WrapWorld {
         uint256 used = payer.run(probe, usd, 1e18, _id(mainPool), plan);
         emit log_named_uint("failed cycle beyond its budget, no tries", used);
         assertLe(used, 70_000, "more than OVERHEAD_GAS");
+    }
+
+    // ----- C: a zero balance is not settled while another book holds a credit -----
+
+    /// A cycle that nets to nothing in a token in which an earlier book of the same search
+    /// holds a credit has spent that credit. With no credit, nothing owed is settled.
+    function testZeroBalanceWithCreditIsUnsettled() public {
+        ArbitrageProbe probe = _probeInHook();
+        probe.settledWithCredit(address(usd), 0);
+        vm.expectRevert(ArbitrageLogic.Unsettled.selector);
+        probe.settledWithCredit(address(usd), 1e18);
     }
 }

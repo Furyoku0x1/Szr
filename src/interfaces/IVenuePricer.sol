@@ -7,9 +7,11 @@ import { PoolKey } from "v4-core/types/PoolKey.sol";
 /// such as one of Uniswap's aggregator hooks wrapping a pool of another exchange. The
 /// arbitrage hook asks one of these, in place of the pool manager, about any pool on a hook
 /// that Liquidity's manager has paired with it.
-/// @dev The call is read-only and is given very little gas. Anything but exactly these
-/// five words back, or a value out of range, is taken as "no price", and the pool is then
-/// simply passed over. A pricer can never make a swap fail or move any funds; a wrong
+/// @dev The hook asks with an ordinary CALL, with the market's pricer gas, once per search,
+/// inside a frame that always reverts. A pricer may therefore write storage or open a
+/// pool-manager balance to read its price, and all of it is undone. Anything but exactly
+/// these five words back, or a value out of range, is taken as "no price", and the pool is
+/// then simply passed over. A pricer can never make a swap fail or move any funds; a wrong
 /// answer only makes a cycle fail its profit check or go unnoticed.
 interface IVenuePricer {
     /// @param pool The pool as the pool manager knows it. Its currencies, fee, tick spacing
@@ -32,7 +34,6 @@ interface IVenuePricer {
     /// at or above it, or the whole answer is taken as "no price".
     function price(PoolKey calldata pool)
         external
-        view
         returns (
             uint160 sqrtPriceX96,
             uint24 fee,

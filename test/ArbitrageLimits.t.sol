@@ -2,14 +2,14 @@
 pragma solidity 0.8.30;
 
 import { MarketsWorld } from "./ArbitrageMarkets.t.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 
 contract ArbitrageLimitsTest is MarketsWorld {
     function _check(uint256 market, address base, address other) internal {
-        ArbitrageHook.Market memory before = hook.market(market);
+        ArbitrageLogic.Market memory before = hook.market(market);
         uint128 kept = hook.minimumProfit(market, other);
         hook.setMinimumProfit(market, base, 7e18);
-        ArbitrageHook.Market memory afterwards = hook.market(market);
+        ArbitrageLogic.Market memory afterwards = hook.market(market);
         assertEq(hook.minimumProfit(market, base), 7e18, "profit set");
         assertEq(hook.minimumProfit(market, other), kept, "other token untouched");
         assertEq(afterwards.gasLimit, before.gasLimit, "gas unchanged");
@@ -27,9 +27,9 @@ contract ArbitrageLimitsTest is MarketsWorld {
     }
 
     function testEmitsStoredGasAndEdge() public {
-        ArbitrageHook.Market memory settings = hook.market(id);
+        ArbitrageLogic.Market memory settings = hook.market(id);
         vm.expectEmit(true, true, false, true, address(hook));
-        emit ArbitrageHook.LimitsSet(
+        emit ArbitrageLogic.LimitsSet(
             id, address(backing), settings.gasLimit, 3e18, settings.minimumEdge
         );
         vm.prank(team);
@@ -37,10 +37,10 @@ contract ArbitrageLimitsTest is MarketsWorld {
     }
 
     function testOnlyTheOwnerSetsMinimumProfit() public {
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setMinimumProfit(id, address(backing), 1);
         vm.prank(team);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setMinimumProfit(1, address(szr), 1);
     }
 }

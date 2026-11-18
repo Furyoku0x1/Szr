@@ -13,7 +13,7 @@ import { WrappedPool, WrappedPricer } from "./utils/WrappedPool.sol";
 import { PresyncRouter, SyncEarlyRouter } from "./utils/Routers.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 import { Vm } from "forge-std/Vm.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
@@ -248,9 +248,9 @@ contract ArbitrageNativeTest is MarketsWorld {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
             bytes32 topic = logs[index].topics[0];
-            assertTrue(topic != ArbitrageHook.CycleFailed.selector, "cycle tried");
-            assertTrue(topic != ArbitrageHook.Arbitraged.selector, "arbitraged");
-            assertTrue(topic != ArbitrageHook.SearchUndone.selector, "searched");
+            assertTrue(topic != ArbitrageLogic.CycleFailed.selector, "cycle tried");
+            assertTrue(topic != ArbitrageLogic.Arbitraged.selector, "arbitraged");
+            assertTrue(topic != ArbitrageLogic.SearchUndone.selector, "searched");
         }
     }
 
@@ -327,10 +327,10 @@ contract ArbitrageNativeTest is MarketsWorld {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         bool undone;
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] != ArbitrageHook.SearchUndone.selector) continue;
+            if (logs[index].topics[0] != ArbitrageLogic.SearchUndone.selector) continue;
             undone = true;
             (bytes4 reason) = abi.decode(logs[index].data, (bytes4));
-            assertEq(reason, ArbitrageHook.Unsettled.selector, "named error");
+            assertEq(reason, ArbitrageLogic.Unsettled.selector, "named error");
         }
         assertTrue(undone, "the search was undone");
         _assertClean();
@@ -373,7 +373,7 @@ contract ArbitrageNativeTest is MarketsWorld {
         id = wethMarket;
         PoolKey memory stray = _make(address(0), address(coin), 3_000, address(hook));
         assertEq(hook.partnerOf(_id(stray)), address(0), "none");
-        vm.expectRevert(ArbitrageHook.UnknownPool.selector);
+        vm.expectRevert(ArbitrageLogic.UnknownPool.selector);
         hook.arb(_id(stray));
         vm.recordLogs();
         assertTrue(_inWithGas(stray, address(coin), 1_000e18, 700_000), "swap goes through");
@@ -399,12 +399,12 @@ contract ArbitrageNativeTest is MarketsWorld {
     function testOnlyThePoolManagerMaySendEtherToTheHook() public {
         (bool ok, bytes memory reason) = address(hook).call{ value: 1 }("");
         assertFalse(ok, "sent by a test");
-        assertEq(bytes4(reason), ArbitrageHook.NotPoolManager.selector);
+        assertEq(bytes4(reason), ArbitrageLogic.NotPoolManager.selector);
         vm.deal(team, 1);
         vm.prank(team);
         (ok, reason) = address(hook).call{ value: 1 }("");
         assertFalse(ok, "sent by an owner");
-        assertEq(bytes4(reason), ArbitrageHook.NotPoolManager.selector);
+        assertEq(bytes4(reason), ArbitrageLogic.NotPoolManager.selector);
         assertEq(address(hook).balance, 0);
     }
 
@@ -422,7 +422,7 @@ contract ArbitrageNativeTest is MarketsWorld {
         assertEq(groups[groups.length - 1], address(0));
         // A pool of the wrong pair is refused whichever side is zero.
         vm.prank(team);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setLeaders(id, address(usd), address(0), _list(_id(first)));
     }
 

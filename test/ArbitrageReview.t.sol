@@ -4,7 +4,7 @@ pragma solidity 0.8.30;
 import { Vm } from "forge-std/Vm.sol";
 import { ArbitrageWorld } from "./utils/ArbitrageWorld.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
@@ -72,7 +72,7 @@ contract ArbitrageReviewTest is ArbitrageWorld {
     function _arbitraged() internal returns (uint256 count) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] == ArbitrageHook.Arbitraged.selector) count++;
+            if (logs[index].topics[0] == ArbitrageLogic.Arbitraged.selector) count++;
         }
     }
 

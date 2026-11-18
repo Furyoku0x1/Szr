@@ -5,7 +5,8 @@ import { Vm } from "forge-std/Vm.sol";
 import { WrapWorld } from "./ArbitrageWrap.t.sol";
 import { TryMeter } from "./utils/ArbitrageSizing.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { CyclePart } from "../src/arbitrage/ArbitrageCycle.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
@@ -43,7 +44,7 @@ contract CreditingAsset is TestAsset {
 /// only once the WETH has been converted, not when it is settled.
 contract ArbitrageRedeemWrapTest is WrapWorld {
     bytes32 internal poolId;
-    ArbitrageHook.Plan internal plan;
+    ArbitrageLogic.Plan internal plan;
 
     /// What one fixed try did. `excess` is what Core returned beyond what was owed, so a try
     /// with `excess` above zero reached the `clear`.
@@ -74,13 +75,13 @@ contract ArbitrageRedeemWrapTest is WrapWorld {
             bytes memory data = accesses[index].data;
             if (accesses[index].account != address(hook)) continue;
             if (data.length < 4) continue;
-            if (bytes4(data) != ArbitrageHook.execute.selector) continue;
+            if (bytes4(data) != CyclePart.execute.selector) continue;
             bytes memory body = new bytes(data.length - 4);
             for (uint256 j; j < body.length; j++) {
                 body[j] = data[j + 4];
             }
-            (bytes32 found, ArbitrageHook.Plan memory tried) =
-                abi.decode(body, (bytes32, ArbitrageHook.Plan));
+            (bytes32 found, ArbitrageLogic.Plan memory tried) =
+                abi.decode(body, (bytes32, ArbitrageLogic.Plan));
             if (!tried.buying) continue;
             if (tried.venue != bytes32(0)) continue;
             poolId = found;
@@ -98,7 +99,7 @@ contract ArbitrageRedeemWrapTest is WrapWorld {
 
     /// One fixed try at `spend`, from the state it is called in, which it leaves changed.
     function _run(uint256 spend) internal returns (Outcome memory out) {
-        ArbitrageHook.Plan memory sized = plan;
+        ArbitrageLogic.Plan memory sized = plan;
         sized.spend = spend;
         uint256 supply = core.activeSupply();
         uint256 backed = core.backingAmount();
@@ -111,7 +112,7 @@ contract ArbitrageRedeemWrapTest is WrapWorld {
         // and the debt, converted to ETH, comes out.
         uint256 received;
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] == ArbitrageHook.Arbitraged.selector) {
+            if (logs[index].topics[0] == ArbitrageLogic.Arbitraged.selector) {
                 (, out.profit) = abi.decode(logs[index].data, (bool, uint256));
             }
             if (logs[index].emitter != address(backing)) continue;

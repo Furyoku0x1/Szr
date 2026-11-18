@@ -11,7 +11,7 @@ import {
 } from "./utils/ArbitrageNative.sol";
 import { ArbitrageProbe } from "./utils/ArbitrageProbe.sol";
 import { PresyncRouter } from "./utils/Routers.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
@@ -114,7 +114,7 @@ abstract contract WrapWorld is MarketsWorld {
         returns (uint256 bought, uint256 sold, uint256 wraps, uint256 unwraps)
     {
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] == ArbitrageHook.Arbitraged.selector) {
+            if (logs[index].topics[0] == ArbitrageLogic.Arbitraged.selector) {
                 (bool buying,) = abi.decode(logs[index].data, (bool, uint256));
                 if (buying) bought++;
                 else sold++;
@@ -315,7 +315,7 @@ contract ArbitrageWrapTest is WrapWorld {
         uint256 profit = hook.arb(_id(usdPool));
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] != ArbitrageHook.CycleFailed.selector) continue;
+            if (logs[index].topics[0] != ArbitrageLogic.CycleFailed.selector) continue;
             assertTrue(logs[index].topics[2] != bytes32(0), "a try at Core failed");
         }
         (uint256 bought,,, uint256 unwraps) = _tallyOf(logs);
@@ -389,12 +389,12 @@ contract ArbitrageWrapTest is WrapWorld {
     function testOnlyThePoolManagerAndWethMaySendEther() public {
         (bool ok, bytes memory reason) = address(hook).call{ value: 1 }("");
         assertFalse(ok, "sent by a test");
-        assertEq(bytes4(reason), ArbitrageHook.NotPoolManager.selector);
+        assertEq(bytes4(reason), ArbitrageLogic.NotPoolManager.selector);
         vm.deal(team, 1);
         vm.prank(team);
         (ok, reason) = address(hook).call{ value: 1 }("");
         assertFalse(ok, "sent by an owner");
-        assertEq(bytes4(reason), ArbitrageHook.NotPoolManager.selector);
+        assertEq(bytes4(reason), ArbitrageLogic.NotPoolManager.selector);
         assertEq(address(hook).balance, 0);
     }
 
@@ -406,13 +406,13 @@ contract ArbitrageWrapTest is WrapWorld {
         _countWethAndUsd();
         PoolKey memory both = _make(address(0), address(backing), 3_000, address(hook));
         assertEq(hook.partnerOf(_id(both)), address(0), "not searched");
-        vm.expectRevert(ArbitrageHook.UnknownPool.selector);
+        vm.expectRevert(ArbitrageLogic.UnknownPool.selector);
         hook.arb(_id(both));
         vm.startPrank(team);
         hook.untrack(id, _id(both));
         hook.retrack(_id(both));
         vm.stopPrank();
-        vm.expectRevert(ArbitrageHook.UnknownPool.selector);
+        vm.expectRevert(ArbitrageLogic.UnknownPool.selector);
         hook.arb(_id(both));
     }
 
@@ -428,14 +428,14 @@ contract ArbitrageWrapTest is WrapWorld {
         _countWethAndUsd();
         PoolKey memory both = _make(address(0), address(backing), 3_000, address(hook));
         vm.startPrank(team);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setLeaders(id, address(backing), address(0), _list(_id(both)));
         // Counting in ETH too.
         address[] memory tokens = new address[](2);
         tokens[0] = address(backing);
         tokens[1] = address(0);
         hook.setTokens(id, tokens);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setLeaders(id, address(0), address(backing), _list(_id(both)));
         // A group can always be emptied, whatever its two tokens are.
         hook.setLeaders(id, address(0), address(backing), new bytes32[](0));

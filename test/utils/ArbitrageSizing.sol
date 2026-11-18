@@ -15,10 +15,19 @@ import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { Vm } from "forge-std/Vm.sol";
 import { console } from "forge-std/console.sol";
 import { WrapWorld } from "../ArbitrageWrap.t.sol";
-import { ArbitrageHook } from "../../src/ArbitrageHook.sol";
+import { CyclePart } from "../../src/arbitrage/ArbitrageCycle.sol";
+import { ArbitrageLogic } from "../../src/arbitrage/ArbitrageLogic.sol";
 import { ArbitrageProbe } from "./ArbitrageProbe.sol";
-import { IVenuePricer } from "../../src/interfaces/IVenuePricer.sol";
 import { WrappedPool, WrappedPricer } from "./WrappedPool.sol";
+
+/// @dev The mock pricers answer from state they only read, so the measuring code can ask
+/// them in view functions, which `IVenuePricer` no longer allows.
+interface ViewPricer {
+    function price(PoolKey calldata pool)
+        external
+        view
+        returns (uint160, uint24, uint128, uint160, uint160);
+}
 
 /// @dev Prices a cycle without the hook's maths. Inside one pool-manager `unlock` it runs a
 /// list of pools in the order value flows as exact-input swaps, then reverts with the
@@ -166,7 +175,7 @@ contract TryMeter is IUnlockCallback {
         uint256 market,
         address base,
         bytes32 poolId,
-        ArbitrageHook.Plan memory plan
+        ArbitrageLogic.Plan memory plan
     ) external returns (uint256, bytes4) {
         manager.unlock(abi.encode(market, base, poolId, plan));
         return (used, reason);
@@ -174,8 +183,8 @@ contract TryMeter is IUnlockCallback {
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         require(msg.sender == address(manager));
-        (uint256 market, address base, bytes32 poolId, ArbitrageHook.Plan memory plan) =
-            abi.decode(data, (uint256, address, bytes32, ArbitrageHook.Plan));
+        (uint256 market, address base, bytes32 poolId, ArbitrageLogic.Plan memory plan) =
+            abi.decode(data, (uint256, address, bytes32, ArbitrageLogic.Plan));
         (used, reason) = probe.tryCost(market, base, poolId, plan);
         return "";
     }
@@ -257,7 +266,7 @@ abstract contract SizingWorld is WrapWorld {
         bool walkCut;
         bool walkReverted;
         /// The plan of every try, in order.
-        ArbitrageHook.Plan[] plans;
+        ArbitrageLogic.Plan[] plans;
     }
 
     function setUp() public virtual override {
@@ -597,7 +606,7 @@ abstract contract SizingWorld is WrapWorld {
         uint160 price;
         uint24 fee;
         if (_isWrapped(pool)) {
-            (price, fee,,,) = IVenuePricer(wrappedPricer).price(pool);
+            (price, fee,,,) = ViewPricer(wrappedPricer).price(pool);
         } else {
             (price,,, fee) = manager.getSlot0(pool.toId());
         }
@@ -689,7 +698,7 @@ abstract contract SizingWorld is WrapWorld {
         for (uint256 index; index < accesses.length; index++) {
             if (_isTry(accesses[index])) result.tries++;
         }
-        result.plans = new ArbitrageHook.Plan[](result.tries);
+        result.plans = new ArbitrageLogic.Plan[](result.tries);
         uint256 seen;
         for (uint256 index; index < accesses.length; index++) {
             if (!_isTry(accesses[index])) continue;
@@ -701,23 +710,27 @@ abstract contract SizingWorld is WrapWorld {
     function _isTry(Vm.AccountAccess memory access) internal view returns (bool) {
         if (access.account != address(hook)) return false;
         if (access.data.length < 4) return false;
-        return bytes4(access.data) == ArbitrageHook.execute.selector;
+        return bytes4(access.data) == CyclePart.execute.selector;
     }
 
-    function _planOf(bytes memory data) internal pure returns (ArbitrageHook.Plan memory plan) {
+    function _planOf(bytes memory data)
+        internal
+        pure
+        returns (ArbitrageLogic.Plan memory plan)
+    {
         bytes memory body = new bytes(data.length - 4);
         for (uint256 index; index < body.length; index++) {
             body[index] = data[index + 4];
         }
-        (, plan) = abi.decode(body, (bytes32, ArbitrageHook.Plan));
+        (, plan) = abi.decode(body, (bytes32, ArbitrageLogic.Plan));
     }
 
     function _count(Result memory result, Vm.Log memory entry) internal pure {
         bytes32 topic = entry.topics[0];
-        if (topic == ArbitrageHook.CycleFailed.selector) result.failed++;
-        if (topic == ArbitrageHook.TryRanOut.selector) result.ranOut++;
-        if (topic == ArbitrageHook.SearchUndone.selector) result.undone++;
-        if (topic != ArbitrageHook.Arbitraged.selector) return;
+        if (topic == ArbitrageLogic.CycleFailed.selector) result.failed++;
+        if (topic == ArbitrageLogic.TryRanOut.selector) result.ranOut++;
+        if (topic == ArbitrageLogic.SearchUndone.selector) result.undone++;
+        if (topic != ArbitrageLogic.Arbitraged.selector) return;
         (, uint256 profit) = abi.decode(entry.data, (bool, uint256));
         if (result.cycles == 0) result.first = profit;
         result.cycles++;
@@ -799,7 +812,7 @@ abstract contract SizingWorld is WrapWorld {
     /// Runs each try again, alone, from the state the search began in, and says what it
     /// cost and how it failed. The probe replaces the hook's code, so call it after any
     /// state is restored and not before `_measure`.
-    function _retry(bytes32 poolId, ArbitrageHook.Plan[] memory plans)
+    function _retry(bytes32 poolId, ArbitrageLogic.Plan[] memory plans)
         internal
         returns (uint256[] memory used, bytes4[] memory reasons)
     {
@@ -813,13 +826,13 @@ abstract contract SizingWorld is WrapWorld {
     }
 
     /// Every try of the search fails with `Incomplete` for no more than `most` gas.
-    function _assertFailFast(bytes32 poolId, ArbitrageHook.Plan[] memory plans, uint256 most)
+    function _assertFailFast(bytes32 poolId, ArbitrageLogic.Plan[] memory plans, uint256 most)
         internal
     {
         assertGt(plans.length, 0, "there was a try");
         (uint256[] memory used, bytes4[] memory reasons) = _retry(poolId, plans);
         for (uint256 index; index < plans.length; index++) {
-            assertEq(reasons[index], ArbitrageHook.Incomplete.selector, "leg could not fill");
+            assertEq(reasons[index], ArbitrageLogic.Incomplete.selector, "leg could not fill");
             assertLt(used[index], most, "and failed cheaply");
         }
     }

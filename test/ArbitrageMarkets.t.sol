@@ -4,7 +4,7 @@ pragma solidity 0.8.30;
 import { Vm } from "forge-std/Vm.sol";
 import { ArbitrageWorld } from "./utils/ArbitrageWorld.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { OpenArbitrageMarket } from "../script/OpenArbitrageMarket.s.sol";
 import { IHooks } from "v4-core/interfaces/IHooks.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
@@ -90,7 +90,7 @@ abstract contract MarketsWorld is ArbitrageWorld {
 
     /// Sets a group's leaders with the market switched off, then switches it back on.
     function _lead(address base, address partner, bytes32[] memory list) internal {
-        ArbitrageHook.Market memory settings = hook.market(id);
+        ArbitrageLogic.Market memory settings = hook.market(id);
         uint128 profit = hook.minimumProfit(id, base);
         vm.startPrank(team);
         hook.setLimits(id, base, 0, profit, settings.minimumEdge);
@@ -112,7 +112,7 @@ abstract contract MarketsWorld is ArbitrageWorld {
     function _cycles() internal returns (uint256 count) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] == ArbitrageHook.Arbitraged.selector) count++;
+            if (logs[index].topics[0] == ArbitrageLogic.Arbitraged.selector) count++;
         }
     }
 
@@ -180,34 +180,34 @@ contract ArbitrageMarketsTest is MarketsWorld {
     function testOnlyTheOwnerConfiguresAMarket() public {
         PoolKey memory extra = _pair(address(backing), address(usd), 500, address(hook));
         bytes32[] memory list = _list(_id(second));
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.createPool(id, extra, uint160(1 << 96));
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.addVenue(id, publicPool);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setLeaders(id, address(backing), address(coin), list);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setLimits(id, address(backing), 0, 0, 1.0001e18);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setConnector(id, publicPool, true);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setRecipient(id, address(this));
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.nominateOwner(id, address(this));
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.untrack(id, _id(second));
         // Nor can the team touch SZR's market or the list of profit tokens.
         vm.startPrank(team);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setLeaders(1, address(szr), address(usd), list);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.untrack(1, _id(usdPool));
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setProfitToken(address(usd), desk);
         // A pool of one market cannot lead in another.
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setLeaders(id, address(szr), address(usd), _list(_id(usdPool)));
         vm.stopPrank();
     }
@@ -216,17 +216,17 @@ contract ArbitrageMarketsTest is MarketsWorld {
     /// holds SZR.
     function testHookedPoolsJoinOnlyByBeingCreatedThroughTheHook() public {
         vm.startPrank(team);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.createPool(id, publicPool, uint160(1 << 96));
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.createPool(
             id, _pair(address(szr), address(backing), 500, address(hook)), uint160(1 << 96)
         );
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.addVenue(id, usdPool);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.addVenue(id, mainPool);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.createPool(1, _pair(address(coin), address(usd), 500, address(hook)), 1 << 96);
         vm.stopPrank();
         // A pool somebody else already created on the hook cannot be claimed.
@@ -237,7 +237,7 @@ contract ArbitrageMarketsTest is MarketsWorld {
         hook.createPool(id, taken, uint160(1 << 96));
         assertEq(hook.partnerOf(_id(taken)), address(0), "not tracked");
         assertFalse(hook.tracked(id, _id(taken)));
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.openMarket(address(0));
     }
 
@@ -249,14 +249,14 @@ contract ArbitrageMarketsTest is MarketsWorld {
         uint256 rival = hook.openMarket(address(0xBEEF));
         vm.startPrank(address(0xBEEF));
         // Another market's pool on this hook would be traded without that market's search.
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setConnector(rival, own, true);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setConnector(rival, usdPool, true);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setConnector(rival, mainPool, true);
         PoolKey memory foreign = _pair(address(coin), address(usd), 3_000, address(0xF00D));
-        vm.expectRevert(ArbitrageHook.NotTrusted.selector);
+        vm.expectRevert(ArbitrageLogic.NotTrusted.selector);
         hook.setConnector(rival, foreign, true);
         // A hookless pool is fine for anyone.
         hook.setConnector(rival, publicPool, true);
@@ -298,11 +298,11 @@ contract ArbitrageMarketsTest is MarketsWorld {
         vm.prank(team);
         hook.untrack(id, _id(extra));
         assertEq(hook.partnerOf(_id(extra)), address(0));
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.retrack(_id(extra));
-        vm.expectRevert(ArbitrageHook.UnknownPool.selector);
+        vm.expectRevert(ArbitrageLogic.UnknownPool.selector);
         hook.retrack(_id(usdPool));
-        vm.expectRevert(ArbitrageHook.UnknownPool.selector);
+        vm.expectRevert(ArbitrageLogic.UnknownPool.selector);
         hook.retrack(_id(publicPool));
         vm.prank(team);
         hook.retrack(_id(extra));
@@ -310,7 +310,7 @@ contract ArbitrageMarketsTest is MarketsWorld {
         assertEq(hook.market(id).poolCount, 3);
         // A leader cannot be untracked, whichever of its tokens it leads for.
         vm.startPrank(team);
-        vm.expectRevert(ArbitrageHook.StillLeader.selector);
+        vm.expectRevert(ArbitrageLogic.StillLeader.selector);
         hook.untrack(id, _id(first));
         vm.stopPrank();
     }
@@ -320,21 +320,21 @@ contract ArbitrageMarketsTest is MarketsWorld {
         address heir = address(0xE1);
         vm.prank(team);
         hook.nominateOwner(id, heir);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.acceptOwnership(id);
         vm.prank(heir);
         hook.acceptOwnership(id);
         assertEq(hook.market(id).owner, heir);
         vm.prank(team);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setRecipient(id, team);
         vm.prank(heir);
         hook.setRecipient(id, heir);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.nominateOwner(1, heir);
         // Nobody can accept a market that named nobody.
         vm.prank(address(0));
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.acceptOwnership(1);
     }
 }
@@ -411,7 +411,7 @@ contract ArbitrageProfitTokensTest is MarketsWorld {
         vm.startPrank(rivalOwner);
         uint256 rival = hook.openMarket(rivalOwner);
         hook.addVenue(rival, publicPool);
-        vm.expectRevert(ArbitrageHook.AlreadyTracked.selector);
+        vm.expectRevert(ArbitrageLogic.AlreadyTracked.selector);
         hook.addVenue(rival, publicPool);
         hook.setLeaders(rival, address(backing), address(usd), _list(_id(publicPool)));
         vm.stopPrank();
@@ -425,7 +425,7 @@ contract ArbitrageProfitTokensTest is MarketsWorld {
         assertEq(hook.leadersOf(rival, address(backing), address(usd)).length, 1);
         // A pool on the hook can only be a venue in the market that created it.
         vm.prank(rivalOwner);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setLeaders(rival, address(backing), address(coin), _list(_id(first)));
     }
 
@@ -500,22 +500,22 @@ contract ArbitrageProfitTokensTest is MarketsWorld {
     function testNamingRules() public {
         vm.startPrank(team);
         // Leaders can only be named for a token profit may be counted in.
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setLeaders(id, address(coin), address(usd), _list(_id(dollars)));
         // Nothing may be paid to the hook itself.
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setRecipient(id, address(hook));
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.openMarket(address(hook));
         vm.stopPrank();
         // SZR's pools come from Liquidity, even for its manager.
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.createPool(1, _pair(address(coin), address(usd), 500, address(hook)), 1 << 96);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.addVenue(1, publicPool);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setProfitToken(address(szr), desk);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setProfitToken(address(usd), address(hook));
     }
 
@@ -539,7 +539,7 @@ contract ArbitrageMarketScriptTest is MarketsWorld {
     function _switchedOff(uint256 opened) internal returns (bool) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] != ArbitrageHook.LimitsSet.selector) continue;
+            if (logs[index].topics[0] != ArbitrageLogic.LimitsSet.selector) continue;
             if (uint256(logs[index].topics[1]) != opened) continue;
             (uint32 gas,,) = abi.decode(logs[index].data, (uint32, uint128, uint64));
             if (gas == 0) return true;

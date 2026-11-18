@@ -4,7 +4,6 @@ pragma solidity 0.8.30;
 import { SizingWorld } from "./utils/ArbitrageSizing.sol";
 import { ArbitrageProbe } from "./utils/ArbitrageProbe.sol";
 import { WrappedPricer } from "./utils/WrappedPool.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
@@ -62,26 +61,19 @@ contract ArbitrageSizingDeclineTest is SizingWorld {
         assertGt(result.total, 0, "and earned");
     }
 
-    /// The walk's gas is capped at half the cycle's budget, however much a market lets its
+    /// The walk's gas is below half the cycle's budget, however much a market lets its
     /// pricers use, so the first try keeps a full share.
     function testWalkGasIsCappedAtHalfTheBudget() public {
         PoolKey memory venue = _wrappedVenue(75_000);
         hook.setPricerGas(1, 1_020_000);
         ArbitrageProbe probe = _probeInHook();
         (uint256 gas,, uint256 plan) = probe.sizingLimits();
-        ArbitrageHook.Plan memory cycle;
-        cycle.venue = _id(venue);
-        uint256 asking = hook.market(1).pricerGas;
-        uint256 most = plan - probe.sizingCallGas();
-        assertEq(probe.sizingGasWith(asking, cycle), most, "capped below half of the budget");
-        cycle.links[0] = _id(venue);
-        cycle.links[1] = _id(venue);
-        assertEq(probe.sizingGasWith(asking, cycle), most, "and with three wrapped legs");
-        assertEq(probe.sizingGasWith(0, cycle), gas, "a market with no pricers gets its own");
-        // A real search in such a market, with a pricer that burns what it is given inside
-        // the walk: the walk's whole charge leaves the first try a full share, and a swap
-        // given what `gasForSwap` states fills.
-        WrappedPricer(wrappedPricer).arm(16);
+        // The walk asks nothing, it reads the search's answers, so its gas does not grow
+        // with the pricers' allowance and stays below half of the cycle's budget.
+        assertLt(gas, plan - probe.sizingCallGas(), "the walk's gas is below half the budget");
+        // A real search in such a market, whatever its pricers are given: the walk's whole
+        // charge leaves the first try a full share, and a swap given what `gasForSwap` states
+        // fills.
         _on();
         uint256 stated = hook.gasForSwap(1);
         _cheapen(usdPool, 100_000);
@@ -120,7 +112,7 @@ contract ArbitrageSizingDeclineTest is SizingWorld {
         bytes memory input = probe.walkInput();
         vm.revertToState(open);
         probe = _probeInHook();
-        (uint256 charged, uint256 inner) = probe.callOverhead(input, 20_000);
+        (uint256 charged, uint256 inner) = probe.callOverhead(input, 1);
         assertLe(charged - inner, probe.sizingCallGas(), "the call's overhead fits its margin");
     }
 }

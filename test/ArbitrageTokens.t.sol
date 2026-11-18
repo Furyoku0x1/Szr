@@ -4,7 +4,7 @@ pragma solidity 0.8.30;
 import { Vm } from "forge-std/Vm.sol";
 import { MarketsWorld } from "./ArbitrageMarkets.t.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
@@ -44,7 +44,7 @@ contract ArbitrageTokensTest is MarketsWorld {
     function _paid() internal returns (uint256 count, uint256 amount, uint256 share) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] != ArbitrageHook.ProfitPaid.selector) continue;
+            if (logs[index].topics[0] != ArbitrageLogic.ProfitPaid.selector) continue;
             (uint256 paid, uint256 kept) = abi.decode(logs[index].data, (uint256, uint256));
             count++;
             amount += paid;
@@ -81,12 +81,12 @@ contract ArbitrageTokensTest is MarketsWorld {
     }
 
     function testSetProfitTokenRules() public {
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setProfitToken(address(szr), desk);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setProfitToken(address(usd), address(hook));
         vm.prank(team);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setProfitToken(address(usd), desk);
     }
 
@@ -100,16 +100,16 @@ contract ArbitrageTokensTest is MarketsWorld {
             hook.setProfitToken(nine[index], desk);
         }
         vm.startPrank(team);
-        vm.expectRevert(ArbitrageHook.InvalidLimit.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidLimit.selector);
         hook.setTokens(fresh, nine);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setTokens(fresh, _only(address(0xBAD)));
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setTokens(fresh, _two(address(usd), address(usd)));
         vm.stopPrank();
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setTokens(1, _only(address(usd)));
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setTokens(fresh, _only(address(usd)));
         // Eight is allowed.
         address[] memory eight = new address[](8);
@@ -245,7 +245,7 @@ contract ArbitrageTokensTest is MarketsWorld {
             hook.minimumProfit(id, address(backing)),
             1.0001e18
         );
-        vm.expectRevert(ArbitrageHook.InvalidLimit.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidLimit.selector);
         hook.setTokens(id, _two(address(backing), address(usd)));
         vm.stopPrank();
     }

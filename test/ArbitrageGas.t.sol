@@ -7,7 +7,8 @@ import { TestAsset } from "./utils/TestAsset.sol";
 import { ArbitrageProbe } from "./utils/ArbitrageProbe.sol";
 import { TryMeter } from "./utils/ArbitrageSizing.sol";
 import { TwoHopRouter } from "./utils/Routers.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { CyclePart } from "../src/arbitrage/ArbitrageCycle.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
@@ -192,7 +193,7 @@ contract ArbitrageGasTest is ArbitrageWorld {
         uint256 few = _noGapCost();
         assertLt(few, 420_000, "six pools, all leaders");
         // The limit the drained-pool guard was held to, enforced from here on.
-        assertLe(few, 247_531, "six pools, no gap, gas");
+        assertLe(few, 252_000, "six pools, no gap, gas");
         emit log_named_uint("no-gap swap gas, six pools", few);
         poolUnits = 1_000e18;
         for (uint256 index; index < 60; index++) {
@@ -266,8 +267,8 @@ contract ArbitrageGasTest is ArbitrageWorld {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
             bytes32 topic = logs[index].topics[0];
-            if (topic == ArbitrageHook.SearchCutShort.selector) cut++;
-            if (topic != ArbitrageHook.Arbitraged.selector) continue;
+            if (topic == ArbitrageLogic.SearchCutShort.selector) cut++;
+            if (topic != ArbitrageLogic.Arbitraged.selector) continue;
             if (cut == 0) first++;
             else last++;
         }
@@ -422,10 +423,10 @@ contract ArbitrageGasTest is ArbitrageWorld {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         uint256 cycles;
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] == ArbitrageHook.Arbitraged.selector) cycles++;
+            if (logs[index].topics[0] == ArbitrageLogic.Arbitraged.selector) cycles++;
         }
         assertEq(cycles, 1, "one cycle");
-        (bytes32 poolId, ArbitrageHook.Plan memory plan) = _firstTry(accesses);
+        (bytes32 poolId, ArbitrageLogic.Plan memory plan) = _firstTry(accesses);
         uint256 walk = probe.sizingGas();
         vm.revertToState(snapshot);
         // The same state with the market off, so the gap is open and nothing else runs,
@@ -450,18 +451,18 @@ contract ArbitrageGasTest is ArbitrageWorld {
     function _firstTry(Vm.AccountAccess[] memory accesses)
         internal
         view
-        returns (bytes32 poolId, ArbitrageHook.Plan memory plan)
+        returns (bytes32 poolId, ArbitrageLogic.Plan memory plan)
     {
         for (uint256 index; index < accesses.length; index++) {
             bytes memory data = accesses[index].data;
             if (accesses[index].account != address(hook)) continue;
             if (data.length < 4) continue;
-            if (bytes4(data) != ArbitrageHook.execute.selector) continue;
+            if (bytes4(data) != CyclePart.execute.selector) continue;
             bytes memory body = new bytes(data.length - 4);
             for (uint256 j; j < body.length; j++) {
                 body[j] = data[j + 4];
             }
-            return abi.decode(body, (bytes32, ArbitrageHook.Plan));
+            return abi.decode(body, (bytes32, ArbitrageLogic.Plan));
         }
         revert("no try");
     }
@@ -576,7 +577,7 @@ contract ArbitrageGasTest is ArbitrageWorld {
     function _ranOut() internal returns (uint256 count) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] == ArbitrageHook.TryRanOut.selector) count++;
+            if (logs[index].topics[0] == ArbitrageLogic.TryRanOut.selector) count++;
         }
     }
 

@@ -7,7 +7,8 @@ import { ArbitrageWorld } from "./utils/ArbitrageWorld.sol";
 import { MarketsWorld } from "./ArbitrageMarkets.t.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 import { WrappedPool, WrappedPricer } from "./utils/WrappedPool.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageApi } from "../src/arbitrage/ArbitrageApi.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
@@ -18,7 +19,7 @@ import { Currency } from "v4-core/types/Currency.sol";
 /// cleared between a test's top-level calls.
 contract SweepThenSwap {
     function run(
-        ArbitrageHook hook,
+        ArbitrageApi hook,
         uint256 id,
         address base,
         PoolSwapTest swapper,
@@ -82,7 +83,7 @@ contract ArbitrageSweepTest is MarketsWorld {
 
     function testSweepClosesAGapOnAHooklessHead() public {
         _openGap(first, address(coin), 50_000e18);
-        vm.expectRevert(ArbitrageHook.UnknownPool.selector);
+        vm.expectRevert(ArbitrageLogic.UnknownPool.selector);
         hook.arb(_id(open));
         uint256 protocol = backing.balanceOf(address(core));
         uint256 paid = backing.balanceOf(treasury);
@@ -239,7 +240,7 @@ contract ArbitrageSweepWrappedTest is MarketsWorld {
         _limits(address(backing), 1e15);
         wrapper.arm(6, outside, address(hook), id);
         assertGt(hook.sweep(id, address(backing)), 0, "the cycle went through");
-        assertEq(wrapper.seen(), ArbitrageHook.Busy.selector, "refused");
+        assertEq(wrapper.seen(), ArbitrageLogic.Busy.selector, "refused");
         _assertNothingHeld();
     }
 }

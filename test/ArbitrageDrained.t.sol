@@ -7,7 +7,7 @@ import { BrokenWrapAsset } from "./utils/ArbitrageNative.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 import { WrappedPool, WrappedPricer } from "./utils/WrappedPool.sol";
 import { DrainRouter } from "./utils/ArbitrageDrain.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 
@@ -61,7 +61,7 @@ contract ArbitrageDrainedTest is WrapWorld {
 
     function _assertDrained(bool ok, bytes memory data) internal pure {
         assertFalse(ok, "the swap fails");
-        assertTrue(_has(data, ArbitrageHook.Drained.selector), "with Drained");
+        assertTrue(_has(data, ArbitrageLogic.Drained.selector), "with Drained");
     }
 
     /// A sale into the SZR/USD pool with SZR's market switched off, so the gap stays open.
@@ -83,7 +83,7 @@ contract ArbitrageDrainedTest is WrapWorld {
     function _coreCycles() internal returns (uint256 count) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] != ArbitrageHook.Arbitraged.selector) continue;
+            if (logs[index].topics[0] != ArbitrageLogic.Arbitraged.selector) continue;
             if (logs[index].topics[2] == bytes32(0)) count++;
         }
     }
@@ -291,7 +291,7 @@ contract ArbitrageDrainedTest is WrapWorld {
         assertGt(hook.arb(_id(usdPool)), 0, "control");
         vm.revertToState(snapshot);
         _empty(address(szr));
-        vm.expectRevert(ArbitrageHook.Drained.selector);
+        vm.expectRevert(ArbitrageLogic.Drained.selector);
         hook.arb(_id(usdPool));
     }
 
@@ -305,9 +305,9 @@ contract ArbitrageDrainedTest is WrapWorld {
         assertGt(hook.sweep(1, address(szr)), 0, "sweep control");
         vm.revertToState(snapshot);
         _empty(address(szr));
-        vm.expectRevert(ArbitrageHook.Drained.selector);
+        vm.expectRevert(ArbitrageLogic.Drained.selector);
         hook.arb(_id(mainPool));
-        vm.expectRevert(ArbitrageHook.Drained.selector);
+        vm.expectRevert(ArbitrageLogic.Drained.selector);
         hook.sweep(1, address(szr));
     }
 

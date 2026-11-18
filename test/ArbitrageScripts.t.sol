@@ -4,7 +4,7 @@ pragma solidity 0.8.30;
 import { Vm } from "forge-std/Vm.sol";
 import { ArbitrageWorld } from "./utils/ArbitrageWorld.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { Liquidity } from "../src/Liquidity.sol";
 import { FeeCollector } from "../src/FeeCollector.sol";
 import { DeployArbitrageHook } from "../script/DeployArbitrageHook.s.sol";
@@ -182,7 +182,7 @@ contract ArbitrageScriptsTest is ArbitrageWorld {
         setup.run(plan);
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
-            assertTrue(logs[index].topics[0] != ArbitrageHook.ProfitTokenSet.selector);
+            assertTrue(logs[index].topics[0] != ArbitrageLogic.ProfitTokenSet.selector);
         }
     }
 }

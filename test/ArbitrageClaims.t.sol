@@ -5,7 +5,7 @@ import { Vm } from "forge-std/Vm.sol";
 import { MarketsWorld } from "./ArbitrageMarkets.t.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 import { ArbitrageProbe } from "./utils/ArbitrageProbe.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { IUnlockCallback } from "v4-core/interfaces/callback/IUnlockCallback.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
@@ -84,6 +84,10 @@ contract ArbitrageClaimsTest is MarketsWorld {
         ink = new BlockableAsset();
         _approve(ink);
         hook.setProfitToken(address(ink), desk);
+        // Three tokens let a swap open three books, which needs a larger allowance first.
+        uint128 profit = hook.minimumProfit(id, address(backing));
+        vm.prank(team);
+        hook.setLimits(id, address(backing), 30_000_000, profit, 1.0001e18);
         _choose(id, address(ink));
         inkPool = _create(address(ink), address(coin), 3_000);
         inkCheap = _create(address(ink), address(coin), 500);
@@ -112,13 +116,13 @@ contract ArbitrageClaimsTest is MarketsWorld {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
             bytes32 topic = logs[index].topics[0];
-            if (topic == ArbitrageHook.SearchUndone.selector) undone++;
-            if (topic == ArbitrageHook.ShareHeld.selector) {
+            if (topic == ArbitrageLogic.SearchUndone.selector) undone++;
+            if (topic == ArbitrageLogic.ShareHeld.selector) {
                 held += abi.decode(logs[index].data, (uint256));
                 assertEq(logs[index].topics[1], bytes32(uint256(uint160(address(ink)))));
                 assertEq(logs[index].topics[2], bytes32(uint256(uint160(desk))));
             }
-            if (topic != ArbitrageHook.ProfitPaid.selector) continue;
+            if (topic != ArbitrageLogic.ProfitPaid.selector) continue;
             (uint256 amount, uint256 share) = abi.decode(logs[index].data, (uint256, uint256));
             paid += amount;
             shares += share;
@@ -176,7 +180,7 @@ contract ArbitrageClaimsTest is MarketsWorld {
     /// never use, so the recipient is stored directly (`shareRecipient` is slot 0) to keep
     /// the payout's Core branch covered.
     function testBlockedCoreRecipientUndoesTheSearch() public {
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setProfitToken(address(ink), address(core));
         vm.store(
             address(hook),

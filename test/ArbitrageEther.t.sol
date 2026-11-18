@@ -5,7 +5,7 @@ import { Vm } from "forge-std/Vm.sol";
 import { WrapWorld } from "./ArbitrageWrap.t.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 import { DrainRouter } from "./utils/ArbitrageDrain.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
@@ -67,12 +67,12 @@ abstract contract EtherWorld is WrapWorld {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
             bytes32 topic = logs[index].topics[0];
-            if (topic == ArbitrageHook.CycleFailed.selector) seen.failed++;
-            if (topic == ArbitrageHook.ProfitPaid.selector) {
+            if (topic == ArbitrageLogic.CycleFailed.selector) seen.failed++;
+            if (topic == ArbitrageLogic.ProfitPaid.selector) {
                 if (logs[index].topics[2] == bytes32(0)) seen.payouts++;
             }
-            if (topic == ArbitrageHook.SearchUndone.selector) seen.undone++;
-            if (topic == ArbitrageHook.Arbitraged.selector) {
+            if (topic == ArbitrageLogic.SearchUndone.selector) seen.undone++;
+            if (topic == ArbitrageLogic.Arbitraged.selector) {
                 (bool buying,) = abi.decode(logs[index].data, (bool, uint256));
                 if (buying) seen.bought++;
                 else seen.sold++;
@@ -317,7 +317,7 @@ contract ArbitrageEtherTest is EtherWorld {
         PoolKey memory venue = _make(address(backing), address(team0), 2_000, address(0));
         _venue(venue);
         vm.prank(team);
-        vm.expectRevert(ArbitrageHook.InvalidLimit.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidLimit.selector);
         hook.setLeaders(id, address(backing), address(team0), _list(_id(venue)));
         // With the allowance raised to what it now needs, the same call works.
         vm.startPrank(team);
@@ -355,7 +355,11 @@ contract ArbitrageEtherTest is EtherWorld {
         _lead(address(usd), address(coin), _list(_id(hooked), _id(venue)));
         _limits(address(usd), 1e15);
         assertEq(hook.minimumGasLimit(id), 6_660_000, "allowance");
-        assertEq(hook.gasForSwap(id), 6_945_346, "gas for a swap");
+        assertEq(
+            hook.gasForSwap(id),
+            7_080_242,
+            "gas for a swap, with the base and the one centre it lists"
+        );
         emit log_named_uint("usd market gasForSwap", hook.gasForSwap(id));
         _in(hooked, address(usd), 1e18);
         _in(hooked, address(usd), 1e15);
@@ -438,7 +442,7 @@ contract ArbitrageEtherDrainTest is EtherWorld {
         uint256 snapshot = vm.snapshotState();
         (bool ok, bytes memory data) = _try(hooked, drained, 0);
         assertFalse(ok, "the swap fails");
-        assertTrue(_has(data, ArbitrageHook.Drained.selector), "with Drained");
+        assertTrue(_has(data, ArbitrageLogic.Drained.selector), "with Drained");
         vm.revertToState(snapshot);
         (ok,) = _try(hooked, drained, NONE);
         assertTrue(ok, "the control fills");

@@ -3,7 +3,7 @@ pragma solidity 0.8.30;
 
 import { console } from "forge-std/console.sol";
 import { SizingWorld } from "./utils/ArbitrageSizing.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 import { WrappedPricer } from "./utils/WrappedPool.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
@@ -175,7 +175,7 @@ abstract contract SizingScenarios is SizingWorld {
         _assertRanOutThenEighth(result);
         // The eighth earns, so the pair is not benched for a failed cycle.
         assertGt(result.total, 0, "the smallest size earned");
-        ArbitrageHook.Plan memory plan = result.plans[0];
+        ArbitrageLogic.Plan memory plan = result.plans[0];
         uint256 until =
             hook.benchedUntil(1, address(szr), _id(usdPool), plan.venue, plan.buying);
         assertEq(until, 0, "and the pair was not benched");
@@ -188,7 +188,7 @@ abstract contract SizingScenarios is SizingWorld {
         assertEq(result.ranOut, 1, "the try that ran out of gas was noticed, once");
         assertGe(result.tries, 2, "another try followed");
         if (result.tries < 2) return;
-        ArbitrageHook.Plan memory next = result.plans[1];
+        ArbitrageLogic.Plan memory next = result.plans[1];
         uint256 eighth = next.fullSpend;
         for (uint256 halving; halving < 3; halving++) {
             eighth = eighth / 2 + 1;
@@ -311,7 +311,7 @@ abstract contract SizingScenarios is SizingWorld {
         vm.revertToState(snapshot);
         assertTrue(result.sized, "the walk sized it");
         assertFalse(result.firstTryFailed, "the first try filled");
-        ArbitrageHook.Plan[] memory first = new ArbitrageHook.Plan[](1);
+        ArbitrageLogic.Plan[] memory first = new ArbitrageLogic.Plan[](1);
         first[0] = result.plans[0];
         (, bytes4[] memory reasons) = _retry(_id(spec.focus), first);
         assertEq(reasons[0], bytes4(0), "and earned");

@@ -4,7 +4,7 @@ pragma solidity 0.8.30;
 import { Vm } from "forge-std/Vm.sol";
 import { WrapWorld } from "./ArbitrageWrap.t.sol";
 import { DrainRouter } from "./utils/ArbitrageDrain.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
@@ -52,8 +52,8 @@ contract ArbitrageDrainedAfterTest is WrapWorld {
     function _undoneByDrain() internal returns (uint256 count) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] != ArbitrageHook.SearchUndone.selector) continue;
-            if (abi.decode(logs[index].data, (bytes4)) == ArbitrageHook.Drained.selector) {
+            if (logs[index].topics[0] != ArbitrageLogic.SearchUndone.selector) continue;
+            if (abi.decode(logs[index].data, (bytes4)) == ArbitrageLogic.Drained.selector) {
                 count++;
             }
         }
@@ -136,8 +136,8 @@ contract ArbitrageDrainedAfterTest is WrapWorld {
             abi.encodeCall(drain.trade, (usdPool, address(usd), 1e18, address(szr), 0))
         );
         assertFalse(ok, "the swap fails");
-        assertEq(_has(data, ArbitrageHook.Drained.selector), true, "with Drained");
-        assertEq(_has(data, ArbitrageHook.InsufficientGas.selector), false, "not gas");
+        assertEq(_has(data, ArbitrageLogic.Drained.selector), true, "with Drained");
+        assertEq(_has(data, ArbitrageLogic.InsufficientGas.selector), false, "not gas");
     }
 
     function _has(bytes memory data, bytes4 wanted) internal pure returns (bool) {

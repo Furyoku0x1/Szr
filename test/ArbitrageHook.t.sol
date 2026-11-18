@@ -4,7 +4,7 @@ pragma solidity 0.8.30;
 import { Vm } from "forge-std/Vm.sol";
 import { ArbitrageWorld } from "./utils/ArbitrageWorld.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { Liquidity } from "../src/Liquidity.sol";
 import { FeeCollector } from "../src/FeeCollector.sol";
 import { IHooks } from "v4-core/interfaces/IHooks.sol";
@@ -111,27 +111,27 @@ contract ArbitrageHookTest is ArbitrageWorld {
 
     function testOnlyTheManagerConfigures() public {
         vm.startPrank(alice);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.track(0);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.untrack(1, _id(usdPool));
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setConnector(1, mainPool, false);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         vm.stopPrank();
-        vm.expectRevert(ArbitrageHook.InvalidLimit.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidLimit.selector);
         hook.setLimits(1, address(szr), 8_000_000, 0, 0.99e18);
         uint32 tooLittle = uint32(hook.minimumGasLimit(1) - 1);
-        vm.expectRevert(ArbitrageHook.InvalidLimit.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidLimit.selector);
         hook.setLimits(1, address(szr), tooLittle, 0, 1.0001e18);
         vm.startPrank(alice);
-        vm.expectRevert(ArbitrageHook.NotSelf.selector);
+        vm.expectRevert(ArbitrageLogic.NotSelf.selector);
         hook.search(_id(usdPool), 1, address(szr), address(usd), true, false, alice);
         vm.stopPrank();
         _untrack(usdPool);
         assertEq(hook.market(1).poolCount, 1);
-        vm.expectRevert(ArbitrageHook.UnknownPool.selector);
+        vm.expectRevert(ArbitrageLogic.UnknownPool.selector);
         hook.arb(_id(usdPool));
     }
 
@@ -203,7 +203,7 @@ contract ArbitrageHookTest is ArbitrageWorld {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         uint256 followed;
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] != ArbitrageHook.Arbitraged.selector) continue;
+            if (logs[index].topics[0] != ArbitrageLogic.Arbitraged.selector) continue;
             if (logs[index].topics[1] != _id(usdPool)) followed++;
         }
         assertGt(followed, 0, "searched from another pool");
@@ -249,7 +249,7 @@ contract ArbitrageHookTest is ArbitrageWorld {
         (, bytes memory data) = address(swapper).call{ gas: SHORT_GAS }(
             abi.encodeCall(swapper.swap, (usdPool, params, settings, ""))
         );
-        bytes4 wanted = ArbitrageHook.InsufficientGas.selector;
+        bytes4 wanted = ArbitrageLogic.InsufficientGas.selector;
         for (uint256 index; index + 4 <= data.length; index++) {
             bytes4 word;
             assembly ("memory-safe") {

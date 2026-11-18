@@ -2,7 +2,7 @@
 pragma solidity 0.8.30;
 
 import { SizingWorld } from "./utils/ArbitrageSizing.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { ArbitrageProbe } from "./utils/ArbitrageProbe.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 
@@ -21,7 +21,7 @@ contract ArbitrageSizingEligibleTest is SizingWorld {
     function testPoolOnAPricedHookIsNeverWalkedAsPlain() public {
         PoolKey memory venue = _wrappedVenue(75_000);
         ArbitrageProbe probe = _probeInHook();
-        ArbitrageHook.Plan memory plan;
+        ArbitrageLogic.Plan memory plan;
         plan.venue = _id(venue);
         assertTrue(
             probe.sizeableAsking(plan, 20_000), "added as a wrapped pool, which gives a range"
@@ -31,7 +31,7 @@ contract ArbitrageSizingEligibleTest is SizingWorld {
         hook.setPricer(wrapped, wrappedPricer);
         vm.store(address(hook), _wrappersSlot(plan.venue), bytes32(0));
         assertFalse(probe.sizeableAsking(plan, 20_000), "added before its hook had a pricer");
-        ArbitrageHook.Plan memory link;
+        ArbitrageLogic.Plan memory link;
         link.links[1] = plan.venue;
         assertFalse(probe.sizeableAsking(link, 20_000), "as a connecting pool too");
         plan.venue = _id(usdPool);
@@ -51,11 +51,11 @@ contract ArbitrageSizingEligibleTest is SizingWorld {
     function testWrappedPoolIsNotWalkedWhereNoPricerIsAsked() public {
         PoolKey memory venue = _wrappedVenue(75_000);
         ArbitrageProbe probe = _probeInHook();
-        ArbitrageHook.Plan memory plan;
+        ArbitrageLogic.Plan memory plan;
         plan.venue = _id(venue);
         assertTrue(probe.sizeableAsking(plan, 20_000), "asked in its own market");
         assertFalse(probe.sizeable(plan), "not where no pricer is asked");
-        ArbitrageHook.Plan memory link;
+        ArbitrageLogic.Plan memory link;
         link.links[0] = plan.venue;
         assertFalse(probe.sizeable(link), "as a connecting pool too");
     }

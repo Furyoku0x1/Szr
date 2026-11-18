@@ -7,7 +7,7 @@ import { IHooks } from "v4-core/interfaces/IHooks.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
 import { Currency } from "v4-core/types/Currency.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageApi } from "../src/arbitrage/ArbitrageApi.sol";
 import { Liquidity } from "../src/Liquidity.sol";
 
 /// @notice The manager's setup steps for the arbitrage hook in one run: raise the gas
@@ -20,7 +20,7 @@ contract ConfigureArbitrageHook is Script {
     using PoolIdLibrary for PoolKey;
 
     struct Config {
-        ArbitrageHook hook;
+        ArbitrageApi hook;
         /// Zero leaves the hook's limits as they are.
         uint32 gasLimit;
         /// Connecting pools, each already registered with `Liquidity.registerRoute`.
@@ -125,7 +125,7 @@ contract ConfigureArbitrageHook is Script {
     /// @dev Connecting pools are given as five parallel lists, one entry per pool. One
     /// group's leaders can be given per run, as its partner token and its position ids.
     function _readConfig() internal view returns (Config memory config) {
-        config.hook = ArbitrageHook(payable(vm.envAddress("ARBITRAGE_HOOK")));
+        config.hook = ArbitrageApi(payable(vm.envAddress("ARBITRAGE_HOOK")));
         address partner = vm.envOr("LEADER_PARTNER", address(0));
         if (partner != address(0)) {
             config.groups = new Group[](1);

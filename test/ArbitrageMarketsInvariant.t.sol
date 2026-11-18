@@ -10,7 +10,8 @@ import { WrappingAsset } from "./utils/ArbitrageNative.sol";
 import { PayFirstRouter } from "./utils/Routers.sol";
 import { DrainRouter } from "./utils/ArbitrageDrain.sol";
 import { WrappedPool, WrappedPricer } from "./utils/WrappedPool.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageApi } from "../src/arbitrage/ArbitrageApi.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { SzrCore } from "../src/SzrCore.sol";
 import { IHooks } from "v4-core/interfaces/IHooks.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
@@ -97,7 +98,7 @@ contract MarketsHandler is Test {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
 
-    ArbitrageHook public hook;
+    ArbitrageApi public hook;
     SzrCore public core;
     IPoolManager public manager;
     PoolSwapTest public swapper;
@@ -152,7 +153,7 @@ contract MarketsHandler is Test {
     receive() external payable { }
 
     constructor(
-        ArbitrageHook arbitrage,
+        ArbitrageApi arbitrage,
         PoolSwapTest swaps,
         HostileAsset asset,
         TestAsset dollars
@@ -289,14 +290,16 @@ contract MarketsHandler is Test {
     function _audit() internal {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] == ArbitrageHook.SearchUndone.selector) undoneSearches++;
+            if (logs[index].topics[0] == ArbitrageLogic.SearchUndone.selector) {
+                undoneSearches++;
+            }
             if (logs[index].emitter == address(weth)) {
                 if (logs[index].topics[0] == TRANSFER) {
                     if (logs[index].topics[2] == bytes32(0)) unwraps++;
                     if (logs[index].topics[1] == bytes32(0)) wraps++;
                 }
             }
-            if (logs[index].topics[0] != ArbitrageHook.ProfitPaid.selector) continue;
+            if (logs[index].topics[0] != ArbitrageLogic.ProfitPaid.selector) continue;
             if (uint256(logs[index].topics[1]) != id) continue;
             address asset = address(uint160(uint256(logs[index].topics[2])));
             if (asset == address(0)) ethPayouts++;
@@ -463,11 +466,9 @@ contract MarketsHandler is Test {
         uint256 pick = (seed / 8) % 4;
         address drained = pick == 0 ? address(weth) : pick == 1 ? address(usd) : address(0);
         if (pick == 3) drained = address(coin);
-        // The wrapped pool's own hook takes its input from the pool manager, which no check
-        // of this contract can stand in for, so it is left out of both runs. Draining the
-        // token a wrapped pool's hook takes is not covered: see the backlog.
-        uint256 hidden = pricer.mode();
-        pricer.arm(1);
+        // The wrapped pool is traded like any other: every wrapped leg the search plans has
+        // its input checked before the swap, and a buy through a wrapped leg whose input is
+        // borrowed is never planned, so a drain is refused or undone there too.
         uint256 snapshot = vm.snapshotState();
         _watch();
         bool filled = _drainSwap(pool, input, amount, drained, 0);
@@ -478,7 +479,6 @@ contract MarketsHandler is Test {
         _watch();
         _drainSwap(pool, input, amount, drained, type(uint256).max);
         _audit();
-        pricer.arm(hidden);
         if (filled) {
             if (undone) {
                 drainAfter++;
@@ -497,8 +497,8 @@ contract MarketsHandler is Test {
     function _undoneByDrain() internal returns (bool) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] != ArbitrageHook.SearchUndone.selector) continue;
-            if (abi.decode(logs[index].data, (bytes4)) == ArbitrageHook.Drained.selector) {
+            if (logs[index].topics[0] != ArbitrageLogic.SearchUndone.selector) continue;
+            if (abi.decode(logs[index].data, (bytes4)) == ArbitrageLogic.Drained.selector) {
                 return true;
             }
         }
@@ -528,7 +528,7 @@ contract MarketsHandler is Test {
             try hook.setLeaders(id, address(weth), address(coin), list) { } catch { }
             return;
         }
-        ArbitrageHook.Market memory settings = hook.market(id);
+        ArbitrageLogic.Market memory settings = hook.market(id);
         uint32 gas = settings.gasLimit == 0 ? uint32(hook.minimumGasLimit(id)) : 0;
         hook.setLimits(id, address(weth), gas, 1e15, settings.minimumEdge);
     }

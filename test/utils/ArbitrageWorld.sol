@@ -3,8 +3,10 @@ pragma solidity 0.8.30;
 
 import { Vm } from "forge-std/Vm.sol";
 import { SzrWorld } from "./SzrWorld.sol";
+import { ArbitrageDeploy } from "./ArbitrageDeploy.sol";
 import { TestAsset } from "./TestAsset.sol";
-import { ArbitrageHook } from "../../src/ArbitrageHook.sol";
+import { ArbitrageApi } from "../../src/arbitrage/ArbitrageApi.sol";
+import { ArbitrageLogic } from "../../src/arbitrage/ArbitrageLogic.sol";
 import { ArbitrageProbe } from "./ArbitrageProbe.sol";
 import { Liquidity } from "../../src/Liquidity.sol";
 import { FeeCollector } from "../../src/FeeCollector.sol";
@@ -21,11 +23,11 @@ import { Currency } from "v4-core/types/Currency.sol";
 /// @dev The real PoolManager with three pools: the hookless SZR/WETH main pool, a hooked
 /// SZR/USD pool, and an outside WETH/USD pool connecting the two partner tokens. Helpers add
 /// more.
-abstract contract ArbitrageWorld is SzrWorld {
+abstract contract ArbitrageWorld is SzrWorld, ArbitrageDeploy {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
 
-    ArbitrageHook internal hook;
+    ArbitrageApi internal hook;
     TestAsset internal usd;
     TestAsset internal szr;
     PoolKey internal mainPool;
@@ -54,8 +56,8 @@ abstract contract ArbitrageWorld is SzrWorld {
         super.setUp();
         szr = TestAsset(address(core.token()));
         // Only the beforeSwap and afterSwap permission bits are set in the address.
-        hook = ArbitrageHook(payable(address(uint160(0xA4B1 << 24 | 1 << 7 | 1 << 6))));
-        deployCodeTo("ArbitrageHook.sol:ArbitrageHook", abi.encode(locker), address(hook));
+        hook = ArbitrageApi(payable(address(uint160(0xA4B1 << 24 | 1 << 7 | 1 << 6))));
+        _deployHookAt(address(hook), locker);
         provider = new PoolModifyLiquidityTest(manager);
         _approve(backing);
         // SZR cannot be minted; this contract still holds what it migrated.
@@ -224,7 +226,7 @@ abstract contract ArbitrageWorld is SzrWorld {
     function _failures() internal returns (uint256 count) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] == ArbitrageHook.CycleFailed.selector) count++;
+            if (logs[index].topics[0] == ArbitrageLogic.CycleFailed.selector) count++;
         }
     }
 

@@ -4,7 +4,7 @@ pragma solidity 0.8.30;
 import { Vm } from "forge-std/Vm.sol";
 import { ArbitrageWorld } from "./utils/ArbitrageWorld.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { Liquidity } from "../src/Liquidity.sol";
 import { FeeCollector } from "../src/FeeCollector.sol";
 import { ArbitrageProbe } from "./utils/ArbitrageProbe.sol";
@@ -85,7 +85,7 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
         config.hooks = IHooks(address(hook));
         FeeCollector.AssetConfig memory unused;
         uint256 id = locker.addPool(config, unused);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.track(id);
     }
 
@@ -103,7 +103,7 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
             IHooks(address(0))
         );
         hook.setConnector(1, original, true);
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setConnector(1, other, false);
         hook.setConnector(1, original, false);
         assertEq(
@@ -276,7 +276,7 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         uint256 undone;
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] != ArbitrageHook.SearchUndone.selector) continue;
+            if (logs[index].topics[0] != ArbitrageLogic.SearchUndone.selector) continue;
             assertEq(bytes4(abi.decode(logs[index].data, (bytes32))), bytes4("clos"));
             undone++;
         }
@@ -387,7 +387,7 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
     /// A gap setting above the widest gap the hook will act on would switch it off
     /// without saying so, so it is refused.
     function testMinimumEdgeAboveTheWidestGapIsRefused() public {
-        vm.expectRevert(ArbitrageHook.InvalidLimit.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidLimit.selector);
         hook.setLimits(1, address(szr), 8_000_000, 10e18, 4e18 + 1);
         hook.setLimits(1, address(szr), 8_000_000, 10e18, 4e18);
     }
@@ -457,10 +457,11 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
         }
     }
 
-    /// A connecting pool can carry someone else's hook. Here that hook tries to start the
-    /// arbitrage hook's search from inside every swap through it. It is refused each time,
-    /// and the cycles that cross it still complete.
-    function testConnectingPoolWithAMeddlingHook() public {
+    /// SZR's market takes a connecting pool on someone else's hook only once Liquidity's
+    /// manager has paired that hook with a pricer. Taken in unpaired, the hook's code would
+    /// run in a cycle while the market's guards, which follow its list of wrapped pools,
+    /// stood down. Once paired, the pool is listed and the market reserves gas for asking.
+    function testSzrConnectingPoolOnAnUnpairedHookIsRefused() public {
         TestAsset eur = new TestAsset();
         _approve(eur);
         backing.mint(address(this), 60_000_000e18);
@@ -480,17 +481,22 @@ contract ArbitrageHardeningTest is ArbitrageWorld {
         manager.initialize(route, uint160(1 << 96));
         _provide(route, 50_000_000e18);
         locker.registerRoute(route);
+        vm.expectRevert(ArbitrageLogic.NotTrusted.selector);
         hook.setConnector(1, route, true);
-        uint256 inventory = core.unreleasedSupply();
-        _trade(pool, address(szr), 50_000e18);
-        uint256 afterSale = core.unreleasedSupply();
-        assertGt(afterSale, inventory, "sale backrun");
-        _trade(pool, address(eur), 100_000e18);
-        assertGt(core.unreleasedSupply(), afterSale, "purchase backrun");
-        assertGt(meddler.swaps(), 0, "cycles crossed the hooked pool");
-        assertEq(meddler.refused(), meddler.swaps(), "every attempt refused");
-        assertEq(eur.balanceOf(address(hook)), 0, "hook partner");
-        _assertHookEmpty();
+        assertEq(hook.wrappedPools(1).length, 0, "not listed");
+        hook.setPricer(address(meddler), address(0xCAFE));
+        hook.setLimits(1, address(szr), 0, 10e18, 1.0001e18);
+        hook.setConnector(1, route, true);
+        assertEq(hook.wrappedPools(1).length, 1, "listed once paired");
+        assertGt(hook.market(1).pricerGas, 0, "and the market asks pricers now");
+        // Taking the pricer away again leaves it listed, so the market's guards stay up.
+        hook.setPricer(address(meddler), address(0));
+        assertEq(hook.wrappedPools(1).length, 1, "still listed");
+        assertGt(hook.market(1).pricerGas, 0, "still asking");
+        // The owner can still clear it, which empties the list and stops the asking.
+        hook.setConnector(1, route, false);
+        assertEq(hook.wrappedPools(1).length, 0, "unlisted once cleared");
+        assertEq(hook.market(1).pricerGas, 0, "no longer asking");
     }
 
     /// Anyone can call `arb`, and can stage a failure for it. It reports the failure but

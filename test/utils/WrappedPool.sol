@@ -149,8 +149,6 @@ contract WrappedPricer is IVenuePricer {
     /// (it cannot say how far its answer holds). 10: a short range, `reach` parts per million
     /// of the price either side. 11: a lower bound above the price. 12: an upper bound below
     /// it. 13: a lower bound below `TickMath`'s. 14: an upper bound above it. 15: six words.
-    /// 16: burn all the gas it is given when given less than a million, as the sizing walk
-    /// gives it at a large allowance; the book's reads give it more.
     uint256 public mode;
     /// The distance, in parts per million of the square-root price, that mode 10 holds over.
     uint256 public reach;
@@ -174,9 +172,6 @@ contract WrappedPricer is IVenuePricer {
     {
         uint256 state = mode;
         if (state == 1) revert("no price");
-        if (state == 16) {
-            if (gasleft() < 1_000_000) _burn();
-        }
         if (state == 2) _burn();
         (uint256 first, uint256 second) = wrapper.reservesOf(PoolId.unwrap(pool.toId()));
         uint256 root =
@@ -253,5 +248,134 @@ contract FlatPricer is IVenuePricer {
             TickMath.MIN_SQRT_PRICE,
             TickMath.MAX_SQRT_PRICE
         );
+    }
+}
+
+/// @dev A pricer that needs a normal call, as Metric's does: it writes storage before it
+/// answers, which a STATICCALL refuses. It answers as `inner` does.
+contract CallOnlyPricer {
+    WrappedPricer internal immutable inner;
+    uint256 public calls;
+
+    constructor(WrappedPricer answers) {
+        inner = answers;
+    }
+
+    function price(PoolKey calldata pool)
+        external
+        returns (uint160, uint24, uint128, uint160, uint160)
+    {
+        calls++;
+        return inner.price(pool);
+    }
+}
+
+/// @dev A pricer that does more than answer. `mode` 1: it takes one unit of `asset` out of
+/// the pool manager, which opens a balance it never settles. 2: it tries to swap `target`,
+/// a pool of the arbitrage hook, in the middle of the ask. It always writes `marker` too.
+contract MeddlingPricer {
+    IPoolManager internal immutable manager;
+    WrappedPricer internal immutable inner;
+    address internal immutable asset;
+    uint256 public marker;
+    uint256 public mode;
+    PoolKey public target;
+
+    constructor(IPoolManager poolManager, WrappedPricer answers, address token) {
+        manager = poolManager;
+        inner = answers;
+        asset = token;
+    }
+
+    function arm(uint256 value, PoolKey calldata pool) external {
+        mode = value;
+        target = pool;
+    }
+
+    function price(PoolKey calldata pool)
+        external
+        returns (uint160, uint24, uint128, uint160, uint160)
+    {
+        marker = 1;
+        if (mode == 1) manager.take(Currency.wrap(asset), address(this), 1);
+        if (mode == 2) {
+            try manager.swap(
+                target, IPoolManager.SwapParams(true, -1e15, TickMath.MIN_SQRT_PRICE + 1), ""
+            ) { }
+                catch { }
+        }
+        return inner.price(pool);
+    }
+}
+
+/// @dev A pricer that reverts with a good answer in its revert data, to look like what
+/// `askFrame` itself reverts with. `mode` 1: exactly the five words. 2: the same behind
+/// the selector of `Answer`.
+contract EchoRevertPricer {
+    error Answer(uint256[5] answer);
+
+    uint256 public mode = 1;
+
+    function arm(uint256 value) external {
+        mode = value;
+    }
+
+    function price(PoolKey calldata)
+        external
+        view
+        returns (uint160, uint24, uint128, uint160, uint160)
+    {
+        uint256[5] memory good = [uint256(1 << 96), 3_000, 1_000e18, 0, 0];
+        good[3] = TickMath.MIN_SQRT_PRICE;
+        good[4] = TickMath.MAX_SQRT_PRICE;
+        if (mode == 2) revert Answer(good);
+        assembly ("memory-safe") {
+            revert(good, 0xa0)
+        }
+    }
+}
+
+/// @dev A pricer that needs `cost` gas to answer, as one that reads a pool of another
+/// exchange does. Given less it runs out and has no answer.
+contract HungryPricer {
+    WrappedPricer internal immutable inner;
+    uint256 internal immutable cost;
+
+    constructor(WrappedPricer answers, uint256 gas) {
+        inner = answers;
+        cost = gas;
+    }
+
+    function price(PoolKey calldata pool)
+        external
+        view
+        returns (uint160, uint24, uint128, uint160, uint160)
+    {
+        uint256 start = gasleft();
+        while (start - gasleft() < cost) { }
+        return inner.price(pool);
+    }
+}
+
+/// @dev A pricer that refuses at once when it is given less than `gate` gas, as one that
+/// checks its budget before a costly read does. Unlike `HungryPricer`, which burns what it
+/// is given and so starves the search around it anyway, it leaves the search able to go on
+/// with "no price", which is what a short ask must never be allowed to cause.
+contract GatedPricer {
+    WrappedPricer internal immutable inner;
+    uint256 internal immutable gate;
+
+    constructor(WrappedPricer answers, uint256 limit) {
+        inner = answers;
+        gate = limit;
+    }
+
+    function price(PoolKey calldata pool)
+        external
+        view
+        returns (uint160, uint24, uint128, uint160, uint160)
+    {
+        if (gasleft() < gate) revert("short of gas");
+        return inner.price(pool);
     }
 }

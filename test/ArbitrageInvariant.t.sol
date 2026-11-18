@@ -7,7 +7,8 @@ import { console2 } from "forge-std/console2.sol";
 import { ArbitrageWorld } from "./utils/ArbitrageWorld.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 import { PayFirstRouter, PresyncRouter, HostileSyncRouter } from "./utils/Routers.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageApi } from "../src/arbitrage/ArbitrageApi.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { SzrCore } from "../src/SzrCore.sol";
 import { Liquidity } from "../src/Liquidity.sol";
 import { IHooks } from "v4-core/interfaces/IHooks.sol";
@@ -42,7 +43,7 @@ contract ArbitrageHandler is Test {
         uint256 floor;
     }
 
-    ArbitrageHook public hook;
+    ArbitrageApi public hook;
     SzrCore public core;
     Liquidity public locker;
     IPoolManager public manager;
@@ -80,7 +81,7 @@ contract ArbitrageHandler is Test {
     uint256 public managerSwaps;
     uint256 public payFirstSwaps;
 
-    constructor(ArbitrageHook arbitrage, PoolSwapTest swaps_) {
+    constructor(ArbitrageApi arbitrage, PoolSwapTest swaps_) {
         hook = arbitrage;
         swapper = swaps_;
         locker = arbitrage.liquidity();
@@ -142,7 +143,7 @@ contract ArbitrageHandler is Test {
         uint256 donated;
         for (uint256 index; index < logs.length; index++) {
             Vm.Log memory entry = logs[index];
-            if (entry.topics[0] == ArbitrageHook.Arbitraged.selector) {
+            if (entry.topics[0] == ArbitrageLogic.Arbitraged.selector) {
                 (, uint256 gained) = abi.decode(entry.data, (bool, uint256));
                 earned += gained;
                 found++;
@@ -150,7 +151,7 @@ contract ArbitrageHandler is Test {
                 if (gained < watch.floor) profitBelowFloor = true;
                 if (entry.topics[2] == bytes32(0)) redeemCycles++;
             }
-            if (entry.topics[0] == ArbitrageHook.CycleFailed.selector) failures++;
+            if (entry.topics[0] == ArbitrageLogic.CycleFailed.selector) failures++;
             if (entry.topics[0] == SzrCore.SzrDonated.selector) {
                 if (entry.topics[1] == bytes32(uint256(uint160(address(hook))))) {
                     donated += abi.decode(entry.data, (uint256));

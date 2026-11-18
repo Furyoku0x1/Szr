@@ -7,7 +7,7 @@ import { TestAsset } from "./utils/TestAsset.sol";
 import { WrappedPool, WrappedPricer, FlatPricer } from "./utils/WrappedPool.sol";
 import { ArbitrageProbe } from "./utils/ArbitrageProbe.sol";
 import { IVenuePricer } from "../src/interfaces/IVenuePricer.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { StateLibrary } from "v4-core/libraries/StateLibrary.sol";
@@ -99,19 +99,19 @@ contract ArbitrageWrappedTest is MarketsWorld {
     /// refused, and taking the pricer away stops the pool being traded at once.
     function testOnlyAPricedHooksPoolsCanJoin() public {
         vm.prank(team);
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setPricer(address(wrapper), address(pricer));
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.setPricer(address(hook), address(pricer));
         PoolKey memory stranger = _pair(address(backing), address(coin), 500, address(0xF00D));
         vm.startPrank(team);
-        vm.expectRevert(ArbitrageHook.NotTrusted.selector);
+        vm.expectRevert(ArbitrageLogic.NotTrusted.selector);
         hook.addVenue(id, stranger);
-        vm.expectRevert(ArbitrageHook.NotTrusted.selector);
+        vm.expectRevert(ArbitrageLogic.NotTrusted.selector);
         hook.setConnector(id, _pair(address(coin), address(usd), 500, address(0xF00D)), true);
         vm.stopPrank();
         // SZR's market takes a wrapped pool only if it holds SZR.
-        vm.expectRevert(ArbitrageHook.InvalidPool.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.addVenue(1, outside);
         hook.setPricer(address(wrapper), address(0));
         vm.recordLogs();
@@ -196,16 +196,21 @@ contract ArbitrageWrappedTest is MarketsWorld {
         PoolKey memory pool = outside;
         uint256 own;
         {
+            // Cold, as in an ask, which starts from a reverted access list.
+            vm.cool(address(flat));
             uint256 start = gasleft();
-            IVenuePricer(address(flat)).price(pool);
+            bytes memory question = abi.encodeCall(IVenuePricer.price, (pool));
+            (bool ok,) = address(flat).staticcall(question);
             own = start - gasleft();
+            assertTrue(ok);
         }
         vm.cool(address(hook));
         vm.cool(address(flat));
-        (uint256 used, uint256 overhead) = probe.askCost(_id(outside), 20_000);
+        (uint256 used, uint256 overhead) = probe.askCost(id, _id(outside), 20_000);
         console.log("ask gas", used, "pricer own", own);
-        assertEq(overhead, 16_000, "the overhead the hook reserves");
+        assertEq(overhead, 24_000, "the overhead the hook reserves");
         assertLe(used - own, overhead, "an ask fits within it");
+        assertLe(probe.cacheReadCost(id, _id(outside)), probe.cacheReadGas(), "a read fits");
     }
 
     /// While a cycle runs through a wrapped pool, that pool's hook and the tokens it moves
@@ -291,21 +296,21 @@ contract ArbitrageWrappedTest is MarketsWorld {
         hook.createPool(rival, theirs, uint160(1 << 96));
         hook.setLeaders(rival, address(backing), address(coin), _list(_id(theirs)));
         uint256 plain = hook.minimumGasLimit(rival);
-        vm.expectRevert(ArbitrageHook.InvalidLimit.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidLimit.selector);
         hook.setPricerGas(rival, 40_000);
         hook.addVenue(rival, outside);
         uint256 wrapped = hook.minimumGasLimit(rival);
         assertGt(wrapped, plain, "more is reserved once a wrapped pool is added");
-        assertEq(hook.market(rival).pricerGas, 20_000, "the default");
-        hook.setPricerGas(rival, 37_000);
-        assertEq(hook.market(rival).pricerGas, 40_000, "rounded up to a whole unit");
+        assertEq(hook.market(rival).pricerGas, 48_000, "the default");
+        hook.setPricerGas(rival, 49_000);
+        assertEq(hook.market(rival).pricerGas, 52_000, "rounded up to a whole unit");
         assertGt(hook.minimumGasLimit(rival), wrapped, "and more again for more gas");
-        vm.expectRevert(ArbitrageHook.InvalidLimit.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidLimit.selector);
         hook.setPricerGas(rival, 0);
-        vm.expectRevert(ArbitrageHook.InvalidLimit.selector);
+        vm.expectRevert(ArbitrageLogic.InvalidLimit.selector);
         hook.setPricerGas(rival, 1_020_001);
         vm.stopPrank();
-        vm.expectRevert(ArbitrageHook.NotManager.selector);
+        vm.expectRevert(ArbitrageLogic.NotManager.selector);
         hook.setPricerGas(rival, 40_000);
     }
 
@@ -345,7 +350,9 @@ contract ArbitrageWrappedTest is MarketsWorld {
         assertTrue(_swapWithGas(first, address(coin), 1_000e18, stated), "stated gas is enough");
     }
 
-    /// SZR's market can use a wrapped pool to convert between two partner tokens.
+    /// SZR's market can use a wrapped pool to convert between two partner tokens. Only when
+    /// selling SZR: a buy through a wrapped connecting pool is never planned, since its input
+    /// is borrowed from the pool manager (see `ArbitrageWrappedDrainTest`).
     function testSzrMarketConvertsThroughAWrappedPool() public {
         PoolKey memory route = _wrap(address(backing), address(usd));
         locker.registerRoute(route);
@@ -356,10 +363,29 @@ contract ArbitrageWrappedTest is MarketsWorld {
         assertGt(hook.market(1).pricerGas, 0);
         (uint256 zero,) = wrapper.reservesOf(_id(route));
         uint256 inventory = core.unreleasedSupply();
-        _trade(usdPool, address(szr), 50_000e18);
+        _trade(usdPool, address(usd), 50_000e18);
         assertGt(core.unreleasedSupply(), inventory, "profit retired");
         (uint256 later,) = wrapper.reservesOf(_id(route));
         assertTrue(later != zero, "the wrapped pool carried the conversion");
+        _assertNothingHeld();
+    }
+
+    /// The buy direction of the same route is never planned: Core's buy would run the wrapped
+    /// connecting pool on USD the hook has borrowed from the pool manager and does not hold.
+    function testSzrMarketBuyThroughAWrappedLinkIsNeverPlanned() public {
+        PoolKey memory route = _wrap(address(backing), address(usd));
+        locker.registerRoute(route);
+        hook.setLimits(1, address(szr), 0, 10e18, 1.0001e18);
+        hook.setConnector(1, publicPool, false);
+        hook.setConnector(1, route, true);
+        hook.setLimits(1, address(szr), uint32(hook.minimumGasLimit(1)), 10e18, 1.0001e18);
+        (uint256 zero, uint256 one) = wrapper.reservesOf(_id(route));
+        uint256 inventory = core.unreleasedSupply();
+        _trade(usdPool, address(szr), 50_000e18);
+        assertEq(core.unreleasedSupply(), inventory, "nothing retired");
+        (uint256 laterZero, uint256 laterOne) = wrapper.reservesOf(_id(route));
+        assertEq(laterZero, zero, "wrapped reserve 0 unchanged");
+        assertEq(laterOne, one, "wrapped reserve 1 unchanged");
         _assertNothingHeld();
     }
 }

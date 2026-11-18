@@ -7,7 +7,8 @@ import { IHooks } from "v4-core/interfaces/IHooks.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
 import { Currency } from "v4-core/types/Currency.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageApi } from "../src/arbitrage/ArbitrageApi.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 
 /// @notice Sets up a market of one's own in the arbitrage hook in one run: opens it (or
 /// uses one already open), creates its pools on the hook, adds public pools to trade
@@ -36,7 +37,7 @@ contract OpenArbitrageMarket is Script {
     }
 
     struct Config {
-        ArbitrageHook hook;
+        ArbitrageApi hook;
         address owner;
         /// Zero opens a new market paying `recipient`.
         uint256 market;
@@ -117,7 +118,7 @@ contract OpenArbitrageMarket is Script {
         if (config.groups.length == 0) {
             if (config.tokens.length == 0) return;
         }
-        ArbitrageHook.Market memory settings = config.hook.market(id);
+        ArbitrageLogic.Market memory settings = config.hook.market(id);
         if (settings.gasLimit == 0) return;
         if (settings.gasLimit >= CEILING) return;
         address base = config.tokens.length != 0 ? config.tokens[0] : config.groups[0].base;
@@ -148,7 +149,7 @@ contract OpenArbitrageMarket is Script {
     /// @dev Pools are given as parallel lists, one entry per pool. One group of leaders
     /// and one profit floor can be given per run; leave `PROFIT_TOKEN` out to set none.
     function _readConfig() internal view returns (Config memory config) {
-        config.hook = ArbitrageHook(payable(vm.envAddress("ARBITRAGE_HOOK")));
+        config.hook = ArbitrageApi(payable(vm.envAddress("ARBITRAGE_HOOK")));
         config.owner = vm.envAddress("MARKET_OWNER");
         config.market = vm.envOr("MARKET_ID", uint256(0));
         config.recipient = vm.envOr("MARKET_RECIPIENT", config.owner);

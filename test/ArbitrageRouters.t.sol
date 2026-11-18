@@ -12,7 +12,7 @@ import {
     SplitPayer,
     HostileSyncRouter
 } from "./utils/Routers.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
+import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 
@@ -140,7 +140,7 @@ contract ArbitrageRoutersTest is ArbitrageWorld {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         uint256 redemptions;
         for (uint256 index; index < logs.length; index++) {
-            if (logs[index].topics[0] != ArbitrageHook.Arbitraged.selector) continue;
+            if (logs[index].topics[0] != ArbitrageLogic.Arbitraged.selector) continue;
             if (logs[index].topics[2] == bytes32(0)) redemptions++;
         }
         assertGt(redemptions, 0, "redeemed at Core in the same swap");
@@ -174,7 +174,7 @@ contract ArbitrageRoutersTest is ArbitrageWorld {
         hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
         SplitPayer payer = new SplitPayer(manager, swapper);
         szr.transfer(address(payer), 2_000e18);
-        vm.expectRevert(ArbitrageHook.Busy.selector);
+        vm.expectRevert(ArbitrageLogic.Busy.selector);
         payer.payThenCall(
             address(szr), 1_000e18, address(hook), abi.encodeCall(hook.arb, (_id(usdPool)))
         );

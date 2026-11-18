@@ -15,7 +15,7 @@ import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
 import { Currency } from "v4-core/types/Currency.sol";
 import { DeploySzr } from "../../script/DeploySzr.s.sol";
 import { DeployArbitrageHook } from "../../script/DeployArbitrageHook.s.sol";
-import { ArbitrageHook } from "../../src/ArbitrageHook.sol";
+import { ArbitrageApi } from "../../src/arbitrage/ArbitrageApi.sol";
 import { SzrCore } from "../../src/SzrCore.sol";
 import { ILegacySzrHook, ILegacySzrToken } from "../../src/SzrMigration.sol";
 import { Liquidity } from "../../src/Liquidity.sol";
@@ -57,7 +57,7 @@ contract ArbitrageHookForkTest is Test {
     IERC20 internal szr;
     SzrCore internal core;
     Liquidity internal locker;
-    ArbitrageHook internal arbitrage;
+    ArbitrageApi internal arbitrage;
     PoolSwapTest internal router;
     PoolModifyLiquidityTest internal provider;
     PoolKey internal mainPool;
@@ -94,7 +94,10 @@ contract ArbitrageHookForkTest is Test {
         config.fundInitialLiquidity = true;
         (core,, locker) = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr")).run(config);
         szr = IERC20(address(core.token()));
-        arbitrage = new DeployArbitrageHook().run(block.chainid, locker);
+        arbitrage = DeployArbitrageHook(
+                deployCode("DeployArbitrageHook.s.sol:DeployArbitrageHook")
+            )
+            .run(block.chainid, locker);
         router = new PoolSwapTest(manager);
         provider = new PoolModifyLiquidityTest(manager);
         mainPool = locker.key(0);

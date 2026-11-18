@@ -2,7 +2,6 @@
 pragma solidity 0.8.30;
 
 import { SizingWorld } from "./utils/ArbitrageSizing.sol";
-import { ArbitrageHook } from "../src/ArbitrageHook.sol";
 import { ArbitrageProbe } from "./utils/ArbitrageProbe.sol";
 import { Vm } from "forge-std/Vm.sol";
 import { TestAsset } from "./utils/TestAsset.sol";

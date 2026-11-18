@@ -15,11 +15,12 @@ import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
 import { Currency } from "v4-core/types/Currency.sol";
 import { DeploySzr } from "../../script/DeploySzr.s.sol";
 import { DeployArbitrageHook } from "../../script/DeployArbitrageHook.s.sol";
-import { ArbitrageHook } from "../../src/ArbitrageHook.sol";
+import { ArbitrageApi } from "../../src/arbitrage/ArbitrageApi.sol";
+import { ArbitrageLogic } from "../../src/arbitrage/ArbitrageLogic.sol";
 import { SzrCore } from "../../src/SzrCore.sol";
 import { ILegacySzrHook, ILegacySzrToken } from "../../src/SzrMigration.sol";
 import { Liquidity } from "../../src/Liquidity.sol";
-import { AggregatorPricer, IAggregatorHook } from "../utils/ArbitrageAggregator.sol";
+import { AggregatorPricer, IAggregatorHook } from "../../src/pricers/AggregatorPricer.sol";
 
 interface IQuoter {
     struct QuoteExactSingleParams {
@@ -35,8 +36,8 @@ interface IQuoter {
 }
 
 /// @notice The wrapped-pool seam against a deployed aggregator hook on Robinhood Chain:
-/// the WETH/USDG pool on the Slipstream aggregator, priced from the pool it wraps by a
-/// test pricer. Skipped unless FORK_RPC_URL is set.
+/// the WETH/USDG pool on the Slipstream aggregator, priced from the pool it wraps by the
+/// production pricer. Skipped unless FORK_RPC_URL is set.
 contract ArbitrageAggregatorForkTest is Test {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -57,7 +58,7 @@ contract ArbitrageAggregatorForkTest is Test {
     IERC20 internal weth;
     SzrCore internal core;
     Liquidity internal locker;
-    ArbitrageHook internal arbitrage;
+    ArbitrageApi internal arbitrage;
     PoolSwapTest internal router;
     PoolModifyLiquidityTest internal provider;
     AggregatorPricer internal pricer;
@@ -93,7 +94,10 @@ contract ArbitrageAggregatorForkTest is Test {
         config.auction = SzrCore.AuctionConfig(1014e9, 1, 200_000e18);
         config.fundInitialLiquidity = true;
         (core,, locker) = DeploySzr(deployCode("DeploySzr.s.sol:DeploySzr")).run(config);
-        arbitrage = new DeployArbitrageHook().run(block.chainid, locker);
+        arbitrage = DeployArbitrageHook(
+                deployCode("DeployArbitrageHook.s.sol:DeployArbitrageHook")
+            )
+            .run(block.chainid, locker);
         router = new PoolSwapTest(manager);
         provider = new PoolModifyLiquidityTest(manager);
         vm.prank(TEAM);
@@ -116,7 +120,7 @@ contract ArbitrageAggregatorForkTest is Test {
         assertGt(OUTSIDE.code.length, 0, "outside pool has code");
         (uint160 root,,,) = manager.getSlot0(wrapped.toId());
         assertGt(root, 0, "wrapped pool initialized");
-        pricer = new AggregatorPricer(IAggregatorHook(AGGREGATOR), 1_000);
+        pricer = new AggregatorPricer(IAggregatorHook(AGGREGATOR));
         vm.startPrank(TEAM);
         arbitrage.setPricer(AGGREGATOR, address(pricer));
         vm.stopPrank();
@@ -211,18 +215,18 @@ contract ArbitrageAggregatorForkTest is Test {
         for (uint256 index; index < logs.length; index++) {
             if (logs[index].emitter != address(arbitrage)) continue;
             bytes32 topic = logs[index].topics[0];
-            if (topic == ArbitrageHook.Arbitraged.selector) {
+            if (topic == ArbitrageLogic.Arbitraged.selector) {
                 cycles++;
                 assertEq(
                     logs[index].topics[2], PoolId.unwrap(wrapped.toId()), "against wrapped"
                 );
-            } else if (topic == ArbitrageHook.CycleFailed.selector) {
+            } else if (topic == ArbitrageLogic.CycleFailed.selector) {
                 failures++;
-            } else if (topic == ArbitrageHook.SearchUndone.selector) {
+            } else if (topic == ArbitrageLogic.SearchUndone.selector) {
                 other++;
-            } else if (topic == ArbitrageHook.SearchCutShort.selector) {
+            } else if (topic == ArbitrageLogic.SearchCutShort.selector) {
                 other++;
-            } else if (topic == ArbitrageHook.TryRanOut.selector) {
+            } else if (topic == ArbitrageLogic.TryRanOut.selector) {
                 other++;
             }
         }

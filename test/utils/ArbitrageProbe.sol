@@ -1,18 +1,25 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import { ArbitrageHook } from "../../src/ArbitrageHook.sol";
+import { ArbitrageApi } from "../../src/arbitrage/ArbitrageApi.sol";
+import { ArbitrageLogic } from "../../src/arbitrage/ArbitrageLogic.sol";
 import { Liquidity } from "../../src/Liquidity.sol";
 import { Currency } from "v4-core/types/Currency.sol";
+import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 
 /// @dev The hook with its scan exposed, so tests can measure what the gas constants assume.
-contract ArbitrageProbe is ArbitrageHook {
+/// It is one contract with every module's functions and no routing, the way the hook was
+/// before it was split, so it can reach the internals. It runs the hook's setup itself and
+/// skips the checks that only the hook has (its address, its modules).
+contract ArbitrageProbe is ArbitrageApi {
     /// While set, no cycle is sized by the walk, so the first try uses the plan's estimate
     /// as it did before the walk existed. For tests of what the other sizes do.
     bool public declineSizing;
 
-    constructor(Liquidity treasury) ArbitrageHook(treasury) { }
+    constructor(Liquidity treasury) ArbitrageLogic(treasury) {
+        _initialise();
+    }
 
     function setDeclineSizing(bool decline) external {
         declineSizing = decline;
@@ -53,9 +60,30 @@ contract ArbitrageProbe is ArbitrageHook {
         return _scanCost(market, base, poolId);
     }
 
+    /// The books a swap in `poolId` opens in `market`, and what listing them costs, cold.
+    function centresOf(uint256 market, bytes32 poolId, PoolKey calldata pool)
+        external
+        view
+        returns (uint256 used, address[] memory bases, bytes32[] memory centres)
+    {
+        used = gasleft();
+        Centres memory found = _centres(market, poolId, pool);
+        used -= gasleft();
+        return (used, found.bases, found.centres);
+    }
+
+    /// The constants `gasForSwap` is built from.
+    function swapGasConstants()
+        external
+        pure
+        returns (uint256 hop, uint256 overhead, uint256 centre, uint256 base)
+    {
+        return (HOP_GAS, OVERHEAD_GAS, CENTRE_GAS, CENTRE_BASE);
+    }
+
     /// The most venues the gas allowance of `market` is sized for.
-    function mostVenues(uint256 market) external view returns (uint256) {
-        return _mostVenues(market);
+    function mostVenues(uint256 market) external view returns (uint256 venues) {
+        (venues,) = _mostVenues(market);
     }
 
     function _scanCost(uint256 market, address base, bytes32 poolId)
@@ -71,15 +99,21 @@ contract ArbitrageProbe is ArbitrageHook {
         active = market;
         home = base;
         address partner = _other(keys[poolId], base);
+        // A market with wrapped pools has its answers asked first, as a search does, so
+        // that this is the cost of reading the book again from them.
+        _begin(market);
+        if (asking != 0) _fill();
         uint256 start = gasleft();
-        Venue[] memory prices = _book(poolId, partner);
+        Venue[] memory prices = _book(poolId, partner, false);
         book = start - gasleft();
         start = gasleft();
         _best(prices);
         best = start - gasleft();
         venues = prices.length;
-        allowance = SCAN_GAS_PER_VENUE;
+        // Ranking in a market with wrapped pools also reads five answers per venue.
+        allowance = SCAN_GAS_PER_VENUE + (asking == 0 ? 0 : 5 * CACHE_READ_GAS);
         bookAllowance = BOOK_GAS_PER_VENUE;
+        asking = 0;
         active = 0;
     }
 
@@ -206,12 +240,10 @@ contract ArbitrageProbe is ArbitrageHook {
         // The walk is run again to count its boundaries. It finds the storage warm and so can
         // afford more than the real one did; if its answer differs, the real walk was cut
         // short for gas, and the count is of the rerun.
-        try this.walkSteps{ gas: _sizingGas(before) }(poolId, before) returns (
-            uint256 followed
-        ) {
+        try this.walkSteps{ gas: SIZING_GAS }(poolId, before) returns (uint256 followed) {
             sizingSteps = followed;
         } catch { }
-        try this.size{ gas: _sizingGas(before) }(poolId, before) returns (
+        try this.size{ gas: SIZING_GAS }(poolId, before) returns (
             uint160, uint256 again, bool
         ) {
             sizingCut = again != plan.spend;
@@ -253,34 +285,154 @@ contract ArbitrageProbe is ArbitrageHook {
         return (more, walk.total, walk.steps);
     }
 
-    /// What a pricer answers to `_ask` given `gas`, as the hook reads it: five words, or all
-    /// zeros for no price.
+    /// What a pricer answers to one ask through `askFrame` given `gas`, as the hook reads
+    /// it: five words, or all zeros for no price.
     function ask(address pricer, bytes32 poolId, uint256 gas)
         external
         returns (uint256[5] memory answer)
     {
         asking = gas;
-        answer = _ask(pricer, poolId);
+        answer = _poll(pricer, poolId);
         asking = 0;
     }
 
-    /// The gas one ask of a pool's pricer costs, the lookups around the call included, and
-    /// `ASK_OVERHEAD`, which is what the hook reserves beyond the pricer's own gas.
-    function askCost(bytes32 poolId, uint256 gas)
+    /// The gas one refresh of a wrapped pool in `market` costs, the frame and the cache
+    /// writes included, and `ASK_OVERHEAD`, which is what the hook reserves beyond the
+    /// pricer's own gas. Returns the gas of a second refresh too, which finds the pool's
+    /// storage warm but the pricer's frame cold, as every ask is.
+    function askCost(uint256 market, bytes32 poolId, uint256 gas)
         external
         returns (uint256 used, uint256 overhead)
     {
+        active = market;
         asking = gas;
+        searching++;
         uint256 start = gasleft();
-        _wrapped(poolId, bytes32(0));
+        _refresh(poolId);
         used = start - gasleft();
         asking = 0;
+        active = 0;
         overhead = ASK_OVERHEAD;
     }
 
-    /// What the hook holds back from the walk's gas cap for the call's own overhead.
+    /// What reading one answer from the cache costs, after a fill of `market`.
+    function cacheReadCost(uint256 market, bytes32 poolId) external returns (uint256 used) {
+        active = market;
+        _begin(market);
+        _fill();
+        uint256 start = gasleft();
+        _ask(poolId);
+        used = start - gasleft();
+        asking = 0;
+        active = 0;
+    }
+
+    /// What `askFrame` does in a test of how `_poll` reads it: 0 is the real frame. 1 reverts
+    /// with an answer and one byte more, 2 with a selector that is not `Answer`'s, 3 with one
+    /// byte too few, and 4 returns the right bytes instead of reverting.
+    uint256 public frameMode;
+
+    function setFrameMode(uint256 mode) external {
+        frameMode = mode;
+    }
+
+    function askFrame(address pricer, bytes32 poolId) public override onlySelf {
+        uint256 mode = frameMode;
+        if (mode == 0) return super.askFrame(pricer, poolId);
+        uint256[5] memory good = [uint256(1 << 96), 3_000, 1_000e18, 0, 0];
+        good[3] = TickMath.MIN_SQRT_PRICE;
+        good[4] = TickMath.MAX_SQRT_PRICE;
+        bytes4 tag = mode == 2 ? bytes4(0xdeadbeef) : Answer.selector;
+        bytes memory data = abi.encodePacked(tag, good);
+        uint256 length = mode == 1 ? 165 : mode == 3 ? 163 : 164;
+        if (mode == 4) {
+            assembly ("memory-safe") {
+                return(add(data, 0x20), 164)
+            }
+        }
+        if (mode == 1) data = abi.encodePacked(data, uint8(1));
+        assembly ("memory-safe") {
+            revert(add(data, 0x20), length)
+        }
+    }
+
+    /// Fills `market`'s answers as a search does, then prices again after a cycle through
+    /// `poolId`, which is all that cycle used. Says whether the pool could be asked again.
+    /// Called with limited gas, it is cut short at the ask and not before it.
+    function repriceShort(uint256 market, address base, bytes32 poolId)
+        external
+        returns (bool done)
+    {
+        active = market;
+        home = base;
+        _begin(market);
+        _fill();
+        Venue[] memory book = new Venue[](1);
+        book[0].id = poolId;
+        book[0].partner = address(1);
+        Plan memory plan;
+        plan.venue = poolId;
+        done = _reprice(book, plan);
+        asking = 0;
+        active = 0;
+    }
+
+    /// `_floorHere`, which a search uses, and `_floor`, which the allowance uses, for the
+    /// same market once its answers are filled. They must agree.
+    function floorsBoth(uint256 market, uint256 venues, bool before)
+        external
+        returns (uint256 here, uint256 plain)
+    {
+        active = market;
+        _begin(market);
+        _fill();
+        uint256 ask = asking;
+        here = _floorHere(venues, before);
+        plain = _floor(venues, before, ask, _listed(market, ask));
+        asking = 0;
+        active = 0;
+    }
+
+    /// What the search before a swap holds back as its floor, for `venues` venues in
+    /// `market`, once the market's answers are filled as a search fills them.
+    function floorAfterFill(uint256 market, uint256 venues) external returns (uint256 floor) {
+        active = market;
+        _begin(market);
+        _fill();
+        floor = _floorHere(venues, true);
+        asking = 0;
+        active = 0;
+    }
+
+    /// Runs `_requireSettled` with another book's credit held in `asset`, in one call since
+    /// the credit is transient.
+    function settledWithCredit(address asset, uint256 credit) external {
+        _setCredited(asset, credit);
+        _requireSettled(asset);
+        _clearCredit();
+    }
+
+    /// The pool whose venues the hook has left remembered for the search after a swap.
+    function rememberedNow() external view returns (bytes32) {
+        return remembered;
+    }
+
+    /// The hook's constants for what reading the cache costs, and for one ask.
+    function cacheReadGas() external pure returns (uint256) {
+        return CACHE_READ_GAS;
+    }
+
+    function askOverhead() external pure returns (uint256) {
+        return ASK_OVERHEAD;
+    }
+
+    /// What `_size` charges beyond the gas the walk's call is given: encoding the call,
+    /// making it, decoding the answer and working out the gas. Measured at about 5.4k warm,
+    /// and rounded up for cold reads. The walk's gas, `SIZING_GAS`, is far below half a
+    /// cycle's budget less this, so that even a walk that spends all it is given leaves the
+    /// first try a full share.
     function sizingCallGas() external pure returns (uint256) {
-        return SIZING_CALL_GAS;
+        return 10_000;
     }
 
     /// The gas `_walk` itself uses for a plan.
@@ -297,25 +449,22 @@ contract ArbitrageProbe is ArbitrageHook {
 
     /// What `_size` charges a cycle's budget for the walk on a `walkInput`, and what the walk
     /// itself used, both warm. The difference is the overhead of the call: encoding it, making
-    /// it, decoding the answer, and working out the gas it gets.
-    function callOverhead(bytes calldata input, uint256 gas)
+    /// it, decoding the answer, and working out the gas it gets. Market `market` is filled
+    /// first, so that the walk reads answers.
+    function callOverhead(bytes calldata input, uint256 market)
         external
         returns (uint256 charged, uint256 inner)
     {
         (bytes32 poolId, Plan memory plan) = abi.decode(input, (bytes32, Plan));
-        asking = gas;
+        active = market;
+        _begin(market);
+        _fill();
         this.walkGas(poolId, plan);
         (uint256 left,) = super._size(poolId, plan, type(uint128).max);
         charged = type(uint128).max - left;
         inner = this.walkGas(poolId, plan);
         asking = 0;
-    }
-
-    /// The gas the walk is given for `plan` when the market's pricers get `gas` each.
-    function sizingGasWith(uint256 gas, Plan memory plan) external returns (uint256 given) {
-        asking = gas;
-        given = _sizingGas(plan);
-        asking = 0;
+        active = 0;
     }
 
     /// Whether the walk could read every leg of `plan`.
@@ -338,7 +487,7 @@ contract ArbitrageProbe is ArbitrageHook {
     /// whatever warmth the caller has left. Zero if it ran out.
     function coldSteps(bytes calldata input) external returns (uint256 steps) {
         (bytes32 poolId, Plan memory plan) = abi.decode(input, (bytes32, Plan));
-        try this.walkSteps{ gas: _sizingGas(plan) }(poolId, plan) returns (uint256 followed) {
+        try this.walkSteps{ gas: SIZING_GAS }(poolId, plan) returns (uint256 followed) {
             steps = followed;
         } catch { }
     }
