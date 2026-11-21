@@ -103,7 +103,7 @@ contract MockLiquidityPool is IMetricLiquidityPool {
         MetricLiquidityDelta calldata deltas,
         bytes calldata callbackData,
         bytes calldata
-    ) external returns (uint256 amount0Added, uint256 amount1Added) {
+    ) public virtual returns (uint256 amount0Added, uint256 amount1Added) {
         require(deltas.binIdxs.length == deltas.shares.length, "length");
         uint256 total0;
         uint256 total1;
@@ -150,7 +150,7 @@ contract MockLiquidityPool is IMetricLiquidityPool {
         uint80 salt,
         MetricLiquidityDelta calldata deltas,
         bytes calldata
-    ) external returns (uint256 amount0Removed, uint256 amount1Removed) {
+    ) public virtual returns (uint256 amount0Removed, uint256 amount1Removed) {
         require(msg.sender == owner, "not the owner");
         uint256 total0;
         uint256 total1;
