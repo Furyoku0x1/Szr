@@ -6,7 +6,11 @@ import { IERC20 } from "forge-std/interfaces/IERC20.sol";
 import { Liquidity } from "../../src/Liquidity.sol";
 import { MetricLiquidityExtension } from "../../src/extensions/MetricLiquidityExtension.sol";
 import { IMetricFactory } from "../../src/interfaces/metric/IMetricFactory.sol";
-import { IMetricLiquidityPool } from "../../src/interfaces/metric/IMetricPool.sol";
+import {
+    IMetricLiquidityPool,
+    IMetricPool,
+    IMetricSwapCallback
+} from "../../src/interfaces/metric/IMetricPool.sol";
 
 /// @dev Answers the one question the extension asks of its hook at construction.
 contract HookStub {
@@ -14,6 +18,18 @@ contract HookStub {
 
     constructor(address liquidity_) {
         liquidity = liquidity_;
+    }
+}
+
+/// @dev Another account that sells WETH into the pool, paying in the swap callback.
+contract Trader is IMetricSwapCallback {
+    function sell(IMetricLiquidityPool pool, uint256 amount) external {
+        IMetricPool(address(pool)).swap(address(this), true, int128(uint128(amount)), 0, "", "");
+    }
+
+    function metricOmmSwapCallback(int256 amount0, int256, bytes calldata) external {
+        IERC20(IMetricLiquidityPool(msg.sender).getImmutables().token0)
+            .transfer(msg.sender, uint256(amount0));
     }
 }
 
@@ -109,5 +125,43 @@ contract LiquidityExtensionsForkTest is Test {
         assertEq(IERC20(WETH).balanceOf(address(ext)), 0, "sent to Core");
         assertEq(ext.core().reserveCash(), cash + give, "backing raised");
         vm.stopPrank();
+    }
+
+    function testPositionValueMatchesAFullRemoval() public onlyFork {
+        deal(USDG, address(ext), 100_000e6);
+        vm.startPrank(manager);
+        ext.addPool(address(POOL));
+        ext.addLiquidity(address(POOL), 7, _bins(), _shares(), MAX, MAX, block.timestamp);
+        (uint256 value0, uint256 value1) = ext.positionValue(address(POOL), 7, _bins());
+        (uint256 out0, uint256 out1) =
+            ext.removeLiquidity(address(POOL), 7, _bins(), _shares(), 0, 0, block.timestamp);
+        vm.stopPrank();
+        console.log("value: WETH wei, USDG units", value0, value1);
+        // The tolerance covers per-bin rounding: one unit per bin per token.
+        assertApproxEqAbs(value0, out0, 2, "token0 value");
+        assertApproxEqAbs(value1, out1, 2, "token1 value");
+    }
+
+    function testLedgerShowsInAgainstOutAcrossASwap() public onlyFork {
+        deal(USDG, address(ext), 100_000e6);
+        vm.startPrank(manager);
+        ext.addPool(address(POOL));
+        (uint256 paid0, uint256 paid1) =
+            ext.addLiquidity(address(POOL), 3, _bins(), _shares(), MAX, MAX, block.timestamp);
+        vm.stopPrank();
+        // Another account trades through the pool, then the extension takes its bins out.
+        Trader trader = new Trader();
+        deal(WETH, address(trader), 5e18);
+        trader.sell(POOL, 1e18);
+        vm.prank(manager);
+        (uint256 got0, uint256 got1) =
+            ext.removeLiquidity(address(POOL), 3, _bins(), _shares(), 0, 0, block.timestamp);
+        (uint128 in0, uint128 in1, uint128 out0, uint128 out1) = ext.ledger(address(POOL), 3);
+        assertEq(in0, paid0, "in0");
+        assertEq(in1, paid1, "in1");
+        assertEq(out0, got0, "out0");
+        assertEq(out1, got1, "out1");
+        console.log("in: WETH wei, USDG units", in0, in1);
+        console.log("out: WETH wei, USDG units", out0, out1);
     }
 }

@@ -4,7 +4,7 @@ pragma solidity 0.8.30;
 import { ExtensionWorld } from "./V4LiquidityExtension.t.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 import { MockMetricFactory } from "./utils/metric/MockMetricPool.sol";
-import { MockLiquidityPool } from "./utils/metric/MockLiquidityPool.sol";
+import { MockLiquidityPool, Donor } from "./utils/metric/MockLiquidityPool.sol";
 import { LiquidityExtension } from "../src/extensions/LiquidityExtension.sol";
 import { MetricLiquidityExtension } from "../src/extensions/MetricLiquidityExtension.sol";
 import { IMetricFactory } from "../src/interfaces/metric/IMetricFactory.sol";
@@ -439,5 +439,120 @@ contract MetricLiquidityExtensionTest is MetricExtensionWorld {
             assertFalse(ok, "refused");
             assertEq(bytes4(data), LiquidityExtension.NotManager.selector);
         }
+    }
+
+    function _value(uint80 salt) internal view returns (uint256, uint256) {
+        return mext.positionValue(address(pool), salt, _bins());
+    }
+
+    function _expected(int256 bin, uint256 shares) internal view returns (uint256, uint256) {
+        (uint256 b0, uint256 b1) = pool.balancesOf(bin);
+        uint256 total = pool.totalOf(bin);
+        if (total == 0) return (0, 0);
+        return (b0 * shares / total, b1 * shares / total);
+    }
+
+    function testPositionValueMatchesBinBalancesTimesShare() public {
+        (uint256 zero0, uint256 zero1) = _value(1);
+        assertEq(zero0 + zero1, 0, "an empty bin is worth nothing");
+        _add();
+        // Bin 0 gains earnings, and a second owner dilutes bin 1.
+        pool.earn(0, 3e17, 7e17);
+        t0.mint(address(pool), 3e17);
+        t1.mint(address(pool), 7e17);
+        Donor donor = new Donor();
+        t0.mint(address(donor), 10e18);
+        t1.mint(address(donor), 10e18);
+        donor.donate(pool, address(donor), 1, 1, 1e18);
+        assertEq(pool.totalOf(1), 2e18, "bin 1 is shared");
+        uint256 want0;
+        uint256 want1;
+        int256[] memory bins = _bins();
+        for (uint256 index; index < bins.length; index++) {
+            (uint256 part0, uint256 part1) = _expected(bins[index], 1e18);
+            want0 += part0;
+            want1 += part1;
+        }
+        (uint256 value0, uint256 value1) = _value(1);
+        assertEq(value0, want0, "token0 value");
+        assertEq(value1, want1, "token1 value");
+        assertGt(value0 + value1, 1e18, "the earnings are inside");
+        // Another salt holds nothing, and a part of the bins counts only those bins.
+        (value0, value1) = _value(2);
+        assertEq(value0 + value1, 0, "no shares under another salt");
+        int256[] memory one = new int256[](1);
+        one[0] = 1;
+        (value0, value1) = mext.positionValue(address(pool), 1, one);
+        (want0, want1) = _expected(1, 1e18);
+        assertEq(value0, want0);
+        assertEq(value1, want1);
+        // Bin 1 holds token0 only, so the share shows in token0.
+        (uint256 full0,) = pool.balancesOf(1);
+        assertLt(value0, full0, "only the extension's fraction of bin 1");
+    }
+
+    function testPositionValueRefusesUnknownPoolsAndBadBins() public {
+        SwapPool stranger = _pool(address(t0), address(t1), none);
+        vm.expectRevert(LiquidityExtension.UnknownPool.selector);
+        mext.positionValue(address(stranger), 1, _bins());
+        int256[] memory far = new int256[](1);
+        far[0] = 11;
+        vm.expectRevert(MetricLiquidityExtension.InvalidBins.selector);
+        mext.positionValue(address(pool), 1, far);
+        far[0] = -11;
+        vm.expectRevert(MetricLiquidityExtension.InvalidBins.selector);
+        mext.positionValue(address(pool), 1, far);
+        // Rejected by the pool's bounds; the int16 check behind them is not reached here.
+        far[0] = int256(1) << 16;
+        vm.expectRevert(MetricLiquidityExtension.InvalidBins.selector);
+        mext.positionValue(address(pool), 1, far);
+    }
+
+    function _book(uint80 salt) internal view returns (uint256[4] memory out) {
+        (uint128 in0, uint128 in1, uint128 out0, uint128 out1) =
+            mext.ledger(address(pool), salt);
+        out = [uint256(in0), in1, out0, out1];
+    }
+
+    function testLedgerGrowsByTheReportedAmountsNotTheBonus() public {
+        // The bonus is paid to the extension in the middle of each call.
+        pool.setBonus(50e18, 50e18);
+        (uint256 paid0, uint256 paid1) = _add();
+        uint256[4] memory book = _book(1);
+        assertEq(book[0], paid0, "in0 is the callback total");
+        assertEq(book[1], paid1, "in1 is the callback total");
+        assertEq(book[2] + book[3], 0, "nothing out yet");
+        (uint256 got0, uint256 got1) = mext.removeLiquidity(
+            address(pool), 1, _bins(), _shares(4e17), 0, 0, block.timestamp
+        );
+        book = _book(1);
+        assertEq(book[2], got0, "out0 is the pool's report");
+        assertEq(book[3], got1, "out1 is the pool's report");
+        assertEq(book[0], paid0, "in is unchanged by a removal");
+        (uint256 more0, uint256 more1) = _add();
+        book = _book(1);
+        assertEq(book[0], paid0 + more0, "in adds up");
+        assertEq(book[1], paid1 + more1);
+    }
+
+    function testTwoSaltsKeepSeparateLedgers() public {
+        (uint256 paid0, uint256 paid1) = _add();
+        (uint256 other0, uint256 other1) = mext.addLiquidity(
+            address(pool), 2, _bins(), _shares(2e18), MAX, MAX, block.timestamp
+        );
+        uint256[4] memory book = _book(1);
+        assertEq(book[0], paid0);
+        assertEq(book[1], paid1);
+        book = _book(2);
+        assertEq(book[0], other0);
+        assertEq(book[1], other1);
+        (uint256 got0, uint256 got1) = mext.removeLiquidity(
+            address(pool), 2, _bins(), _shares(2e18), 0, 0, block.timestamp
+        );
+        book = _book(2);
+        assertEq(book[2], got0, "salt 2 out0");
+        assertEq(book[3], got1, "salt 2 out1");
+        book = _book(1);
+        assertEq(book[2] + book[3], 0, "salt 1 took nothing out");
     }
 }

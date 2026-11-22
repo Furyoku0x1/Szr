@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import { SafeCastLib } from "solady/utils/SafeCastLib.sol";
+import { FixedPointMathLib } from "solady/utils/FixedPointMathLib.sol";
 import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
 import { IMetricFactory } from "../interfaces/metric/IMetricFactory.sol";
 import {
@@ -34,10 +36,25 @@ contract MetricLiquidityExtension is
         address token1;
         int256 lowestBin;
         int256 highestBin;
+        uint256 token0ScaleMultiplier;
+        uint256 token1ScaleMultiplier;
     }
+
+    /// @dev What a position cost and returned, in token units, as the events report it.
+    struct Ledger {
+        uint128 in0;
+        uint128 in1;
+        uint128 out0;
+        uint128 out1;
+    }
+
+    uint256 internal constant BINS_SLOT = 4;
+    uint256 internal constant TOTALS_SLOT = 5;
+    uint256 internal constant SHARES_SLOT = 6;
 
     IMetricFactory public immutable factory;
     mapping(address pool => MetricInfo) public metricPools;
+    mapping(address pool => mapping(uint80 salt => Ledger)) public ledger;
     // The one pool whose callback may be answered, and only while this contract calls it.
     address internal transient active;
     // What the active pool's callbacks have been paid, per token of the pool.
@@ -70,8 +87,15 @@ contract MetricLiquidityExtension is
         if (imm.afterRemoveLiquidityOrder != 0) revert BlockingExtension();
         if (imm.token0 == szr) revert SzrPool();
         if (imm.token1 == szr) revert SzrPool();
-        metricPools[pool] =
-            MetricInfo(true, imm.token0, imm.token1, imm.lowestBin, imm.highestBin);
+        metricPools[pool] = MetricInfo(
+            true,
+            imm.token0,
+            imm.token1,
+            imm.lowestBin,
+            imm.highestBin,
+            imm.token0ScaleMultiplier,
+            imm.token1ScaleMultiplier
+        );
         emit MetricPoolAdded(pool);
     }
 
@@ -89,6 +113,9 @@ contract MetricLiquidityExtension is
         (paid0, paid1) = _add(pool, salt, MetricLiquidityDelta(binIdxs, shares));
         if (paid0 > max0) revert AboveMaximum();
         if (paid1 > max1) revert AboveMaximum();
+        Ledger storage book = ledger[pool][salt];
+        book.in0 += SafeCastLib.toUint128(paid0);
+        book.in1 += SafeCastLib.toUint128(paid1);
         emit MetricAdded(pool, salt, paid0, paid1);
     }
 
@@ -107,7 +134,34 @@ contract MetricLiquidityExtension is
         (got0, got1) = _remove(pool, salt, MetricLiquidityDelta(binIdxs, shares));
         if (got0 < min0) revert BelowMinimum();
         if (got1 < min1) revert BelowMinimum();
+        Ledger storage book = ledger[pool][salt];
+        book.out0 += SafeCastLib.toUint128(got0);
+        book.out1 += SafeCastLib.toUint128(got1);
         emit MetricRemoved(pool, salt, got0, got1);
+    }
+
+    /// @notice What this extension's shares in `bins` of a pool are worth now, in token
+    /// units, each bin rounded down and the sum scaled down once. Bins are the caller's list.
+    function positionValue(address pool, uint80 salt, int256[] calldata bins)
+        external
+        view
+        returns (uint256 amount0, uint256 amount1)
+    {
+        MetricInfo storage info = metricPools[pool];
+        if (!info.added) revert UnknownPool();
+        uint256 scaled0;
+        uint256 scaled1;
+        for (uint256 index; index < bins.length; index++) {
+            int256 bin = bins[index];
+            if (bin < info.lowestBin) revert InvalidBins();
+            if (bin > info.highestBin) revert InvalidBins();
+            if (bin != int256(int16(bin))) revert InvalidBins();
+            (uint256 part0, uint256 part1) = _binValue(pool, salt, bin);
+            scaled0 += part0;
+            scaled1 += part1;
+        }
+        amount0 = scaled0 / info.token0ScaleMultiplier;
+        amount1 = scaled1 / info.token1ScaleMultiplier;
     }
 
     /// @notice One exact-input swap on a Metric pool. A partial fill is allowed: only
@@ -229,6 +283,21 @@ contract MetricLiquidityExtension is
             if (bins[index] < info.lowestBin) revert InvalidBins();
             if (bins[index] > info.highestBin) revert InvalidBins();
         }
+    }
+
+    function _binValue(address pool, uint80 salt, int256 bin)
+        internal
+        view
+        returns (uint256 value0, uint256 value1)
+    {
+        IMetricLiquidityPool source = IMetricLiquidityPool(pool);
+        bytes32 key = keccak256(abi.encode(address(this), salt, int16(bin)));
+        uint256 held = uint256(source.extsload(keccak256(abi.encode(key, SHARES_SLOT))));
+        uint256 total = uint256(source.extsload(keccak256(abi.encode(bin, TOTALS_SLOT))));
+        if (total == 0) return (0, 0);
+        uint256 raw = uint256(source.extsload(keccak256(abi.encode(bin, BINS_SLOT))));
+        value0 = FixedPointMathLib.fullMulDiv(uint104(raw), held, total);
+        value1 = FixedPointMathLib.fullMulDiv(uint104(raw >> 104), held, total);
     }
 
     function _send(address asset, uint256 amount) internal {
