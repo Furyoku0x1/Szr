@@ -67,7 +67,7 @@ interface IArbitrageSelf {
     function size(bytes32 poolId, ArbitrageLogic.Plan calldata plan)
         external
         view
-        returns (uint160 limit, uint256 spend, bool declined);
+        returns (uint160 limit, uint256 spend, bool declined, bool short);
 
     function askFrame(address pricer, bytes32 poolId) external;
 }
@@ -416,14 +416,19 @@ abstract contract ArbitrageLogic {
     }
 
     /// @dev What a sizing walk has found so far: the cycle input, the input of the focus
-    /// pool, and the profit it is expected to make. `stopped` is set when it stopped short
-    /// of the optimum, at its cap on boundary events or for want of gas.
+    /// pool, and the profit it is expected to make. Two flags say different things.
+    /// `stopped` means the walk never declines what it found; it is set when the walk stops
+    /// at its cap on boundary events or for want of gas, and is also preset for any cycle
+    /// with a wrapped leg. `short` means the walk could not carry on to its natural end; it
+    /// is set at the four places where that happens and nowhere else, and it is what makes
+    /// a cycle partial.
     struct Walk {
         uint256 total;
         uint256 focusIn;
         int256 predicted;
         uint256 steps;
         bool stopped;
+        bool short;
     }
 
     IPoolManager public immutable poolManager;
@@ -1294,22 +1299,22 @@ abstract contract ArbitrageLogic {
 
     function _cycleMany(Many memory run) internal {
         for (uint256 number; number < MAX_ROUNDS; number++) {
-            // Once something is earned, stop while there is still gas to keep it.
+            // Once something is earned, stop while there is still gas to keep it, as in
+            // `_search`: failing the swap instead while closing a gap is still required.
             if (run.earned) {
-                if (gasleft() < run.floor) break;
+                if (_short(run.floor, run.failures, run.capped, run.before)) break;
             }
             if (number != 0) {
-                if (gasleft() < _rescan(run.venues)) break;
+                uint256 rescan = _rescan(run.venues);
+                if (_short(rescan, run.failures, run.capped, run.before)) break;
             }
             (uint256 pick, Plan memory plan) = _bestOf(run);
             if (plan.score == 0) {
+                run.failures = FAILURES_COVERED + 1;
                 if (!_followMany(run)) break;
                 continue;
             }
-            if (gasleft() < run.floor) {
-                if (_required(run.earned ? 1 : 0, run.failures, run.before)) {
-                    if (!run.capped) revert Starved();
-                }
+            if (_short(run.floor, run.failures, run.capped, run.before)) {
                 emit SearchCutShort(run.books[pick][0].id);
                 break;
             }
@@ -1335,7 +1340,7 @@ abstract contract ArbitrageLogic {
         home = run.bases[pick];
         if (run.resync == UNRELEASED) run.resync = _release(run.payer);
         Venue[] memory book = run.books[pick];
-        uint256 gained = _attempt(_limitEnd(book, plan), plan);
+        (uint256 gained, bool piece) = _attempt(_limitEnd(book, plan), plan);
         if (gained == 0) {
             run.failures++;
             _fail(book, plan, run.payer);
@@ -1343,9 +1348,14 @@ abstract contract ArbitrageLogic {
         }
         run.profits[pick] += gained;
         run.earned = true;
+        // One full cycle in any book ends the rule for all of them.
+        run.failures = piece ? run.failures + 1 : FAILURES_COVERED + 1;
         // The profit stays a credit, which later cycles through this token must leave alone.
         _setCredited(run.bases[pick], run.profits[pick]);
-        if (!_reprice(book, plan)) return false;
+        if (!_reprice(book, plan)) {
+            _starve(run.failures, run.capped, run.before);
+            return false;
+        }
         _requoteOthers(run, pick, _limitEnd(book, plan), plan);
         // A venue on the twin is no longer a pool of this book's token.
         if (plan.venue != bytes32(0)) {
@@ -1411,7 +1421,10 @@ abstract contract ArbitrageLogic {
     /// otherwise it reverts with `Starved`, which fails the swap.
     /// @dev `before` marks the search that runs ahead of a swap. Once it has earned
     /// something it only goes on while enough gas would be left for the swap and for the
-    /// search after it, so that giving a swap more gas can never make it fail.
+    /// search after it, so that giving a swap more gas can never make it fail. Until a cycle
+    /// has worked in full, three have failed or worked in part, or a round has found nothing
+    /// left, every stop for gas fails the swap instead (`_required`). The empty round ends
+    /// that rule before the follow, whose read is not in the reserve.
     /// @dev `payer` is whoever is swapping (zero for `arb` and `sweep`). If they have marked
     /// a token as synced with the pool manager, that is dealt with before the first cycle;
     /// see `_release`.
@@ -1429,15 +1442,16 @@ abstract contract ArbitrageLogic {
         for (uint256 number; number < MAX_ROUNDS; number++) {
             // Once something is earned, stop while there is still gas to keep it.
             if (profit != 0) {
-                if (gasleft() < floor) break;
+                if (_short(floor, failures, capped, before)) break;
             }
             // Pricing every venue again must not run out of gas. The first cycle is only
             // started with this much to spare, so it is always there after one failure.
             if (number != 0) {
-                if (gasleft() < _rescan(book.length)) break;
+                if (_short(_rescan(book.length), failures, capped, before)) break;
             }
             Plan memory plan = _best(book);
             if (plan.score == 0) {
+                failures = FAILURES_COVERED + 1;
                 // Nothing left here. The pool at `plan.index` (the venue, or the plain limit
                 // end of an exchanged plan) has moved and may have opened a gap with the
                 // pools it is compared with, so look from there next.
@@ -1454,27 +1468,25 @@ abstract contract ArbitrageLogic {
             // no swap is failed for bringing too little gas to try it.
             if (!_listedAtStart(number)) break;
             // A cycle is only started with its whole budget available, and enough beyond
-            // it to look again if it fails. Before a swap that also means enough for the
-            // swap and the search after it. Closing a gap is required until one cycle has
-            // worked or more than `FAILURES_COVERED` have failed: with a gap open and too
-            // little gas for that, the swap fails. After that the search just stops.
-            if (gasleft() < floor) {
-                if (_required(profit, failures, before)) {
-                    if (!capped) revert Starved();
-                }
+            // it to look again if it fails and, before a swap, to finish the swap.
+            if (_short(floor, failures, capped, before)) {
                 emit SearchCutShort(book[0].id);
                 break;
             }
             if (resync == UNRELEASED) resync = _release(payer);
-            uint256 gained = _attempt(_limitEnd(book, plan), plan);
+            (uint256 gained, bool piece) = _attempt(_limitEnd(book, plan), plan);
             if (gained == 0) {
                 failures++;
                 _fail(book, plan, payer);
                 continue;
             }
             profit += gained;
+            failures = piece ? failures + 1 : FAILURES_COVERED + 1;
             // Short of gas to ask again about what the cycle moved: stop with the profit.
-            if (!_reprice(book, plan)) break;
+            if (!_reprice(book, plan)) {
+                _starve(failures, capped, before);
+                break;
+            }
             // A venue on the twin is no longer a pool of this search's token.
             if (plan.venue != bytes32(0)) {
                 if (!_onTwin(book, plan.index)) next = plan.index;
@@ -1635,17 +1647,35 @@ abstract contract ArbitrageLogic {
         return resync;
     }
 
-    /// @dev The search before a swap must get past `FAILURES_COVERED` failed cycles, since
-    /// the swapper would gain from it standing aside and chooses the gas. The search after
-    /// it only has to make its first attempt: gas for more is not reserved, and requiring
-    /// it could make more gas fail where less succeeded.
-    function _required(uint256 profit, uint256 failures, bool before)
+    /// @dev The search before a swap must get past `FAILURES_COVERED` cycles that failed or
+    /// closed only part of the gap, since the swapper would gain from it standing aside and
+    /// chooses the gas. A cycle that worked in full, or a round with nothing left to try,
+    /// ends it at once by setting `failures` to the bound. The search after a swap only has
+    /// to make its first attempt, whatever it closes: gas for more is not reserved, and
+    /// requiring it could make more gas fail where less succeeded.
+    function _required(uint256 failures, bool before) internal pure returns (bool) {
+        return failures < (before ? FAILURES_COVERED + 1 : 1);
+    }
+
+    /// @dev Reverts `Starved` if the search is stopping for want of gas while closing a gap
+    /// is still required and the swap's own gas, not the hook's allowance, is the limit.
+    /// Every stop for gas goes through here, so that a swap can never stop quietly just short
+    /// of a check that, with a little more gas, would have failed it.
+    function _starve(uint256 failures, bool capped, bool before) internal pure {
+        if (capped) return;
+        if (_required(failures, before)) revert Starved();
+    }
+
+    /// @dev Whether the search must stop for want of `reserve` gas, after failing the swap
+    /// if closing a gap is still required (see `_starve`).
+    function _short(uint256 reserve, uint256 failures, bool capped, bool before)
         internal
-        pure
+        view
         returns (bool)
     {
-        if (profit != 0) return false;
-        return failures < (before ? FAILURES_COVERED + 1 : 1);
+        if (gasleft() >= reserve) return false;
+        _starve(failures, capped, before);
+        return true;
     }
 
     /// @dev A swap's failed cycle is set aside. `arb` and `sweep` set nothing aside, so that
@@ -1840,7 +1870,12 @@ abstract contract ArbitrageLogic {
     /// and can be made wrong on purpose. So the next try closes the whole gap, and each one
     /// after goes half as far. All the tries and the walk share `_plan(asking)`; when it runs out
     /// the cycle has failed.
-    function _attempt(bytes32 poolId, Plan memory plan) internal returns (uint256) {
+    /// @dev `piece` says the size that worked was not the whole of what the cycle could
+    /// close: the walk stopped short or failed and its size worked, or the size was a half or
+    /// less of the gap. The whole-gap size and an unsized plan's estimate count as full. The
+    /// search before a swap must not treat a partial cycle as closing the gap, or a gap
+    /// shaped to make cycles small could be left for a swap that brings just enough gas.
+    function _attempt(bytes32 poolId, Plan memory plan) internal returns (uint256, bool piece) {
         // The pool's price, read only if a third size is reached.
         uint160 current;
         uint256 whole = _plan(asking);
@@ -1849,13 +1884,15 @@ abstract contract ArbitrageLogic {
         // size is tried: an eighth of the whole gap, which crosses the fewest ticks of the
         // sizes that close a set share of it.
         bool smallest = strained;
+        // Whether the first try's size is a walk's that stopped short or failed.
+        bool short;
         if (!smallest) {
             if (_sizeable(plan)) {
                 bool declined;
-                (budget, declined) = _size(poolId, plan, budget);
+                (budget, declined, short) = _size(poolId, plan, budget);
                 // The walk found the best size there is and it cannot earn enough: no
                 // tries, and the cycle fails as one whose tries all failed.
-                if (declined) return 0;
+                if (declined) return (0, false);
             }
         }
         for (uint256 number; number < TRIES; number++) {
@@ -1881,7 +1918,8 @@ abstract contract ArbitrageLogic {
             ) returns (
                 uint256 profit
             ) {
-                return profit;
+                // The first size is the walk's, the second the whole gap, the rest smaller.
+                return (profit, number == 0 ? short : number > 1);
             } catch {
                 _raiseDrained();
             }
@@ -1900,29 +1938,32 @@ abstract contract ArbitrageLogic {
                 strained = true;
             }
         }
-        return 0;
+        return (0, false);
     }
 
     /// @dev The first try's size, from `size`. Its gas comes out of the budget, not out of
     /// the try's stipend, so the first try still gets a full share. If the walk fails or
-    /// runs out of gas the first try keeps the estimate.
+    /// runs out of gas the first try keeps the estimate, and is a partial size.
     function _size(bytes32 poolId, Plan memory plan, uint256 budget)
         internal
         virtual
-        returns (uint256, bool declined)
+        returns (uint256, bool declined, bool short)
     {
         uint256 available = gasleft();
         try IArbitrageSelf(address(this)).size{ gas: _hopped(SIZING_GAS) }(
             poolId, plan
         ) returns (
-            uint160 limit, uint256 spend, bool decline
+            uint160 limit, uint256 spend, bool decline, bool stopped
         ) {
             plan.limit = limit;
             plan.spend = spend;
             declined = decline;
-        } catch { }
+            short = stopped;
+        } catch {
+            short = true;
+        }
         uint256 used = available - gasleft();
-        return (used < budget ? budget - used : 0, declined);
+        return (used < budget ? budget - used : 0, declined, short);
     }
 
     /// @dev How many balances the pool manager has open across everyone, and the hook's
@@ -2966,7 +3007,7 @@ abstract contract ArbitrageLogic {
     function _walk(bytes32 poolId, Plan calldata plan)
         internal
         view
-        returns (uint160 limit, uint256 spend, uint256 steps, bool declined)
+        returns (uint160 limit, uint256 spend, uint256 steps, bool declined, bool short)
     {
         (Leg[] memory legs, uint256 focus) = _legs(poolId, plan);
         _load(legs, plan.gap, plan.full, focus);
@@ -2980,7 +3021,8 @@ abstract contract ArbitrageLogic {
             if (!_round(legs, walk, focus, round)) break;
         }
         steps = walk.steps;
-        return _answer(walk, plan, steps);
+        short = walk.short;
+        (limit, spend, steps, declined) = _answer(walk, plan, steps);
     }
 
     /// @dev One round of the walk: crosses a hole, or solves the legs within their ranges and
@@ -2994,6 +3036,7 @@ abstract contract ArbitrageLogic {
         // Short of gas for another step: what has been found is an under-trade.
         if (gasleft() < legs.length * SIZING_STEP_GAS + SIZING_TAIL_GAS) {
             walk.stopped = true;
+            walk.short = true;
             return false;
         }
         uint256 empty = _shapeAll(legs);
@@ -3001,6 +3044,7 @@ abstract contract ArbitrageLogic {
         (uint256 rate, uint256 depth, bool fits) = _compose(legs);
         if (!fits) {
             walk.stopped = true;
+            walk.short = true;
             return false;
         }
         if (rate <= Q96) return false;
@@ -3046,12 +3090,14 @@ abstract contract ArbitrageLogic {
     {
         if (round == SIZING_STEPS) {
             walk.stopped = true;
+            walk.short = true;
             return false;
         }
         _cross(leg);
         walk.steps++;
         if (leg.broken) {
             walk.stopped = true;
+            walk.short = true;
             return false;
         }
         return true;

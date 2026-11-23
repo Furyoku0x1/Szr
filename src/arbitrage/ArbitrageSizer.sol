@@ -25,14 +25,16 @@ abstract contract SizerPart is ArbitrageLogic {
     /// that range is the end of its leg. It
     /// is an under-trade, not a dead end: a cycle with a wrapped leg is never declined.
     /// `declined` is true when the walk reached its natural end and the best size there is
-    /// cannot earn the smallest profit; `_attempt` then tries no size at all.
+    /// cannot earn the smallest profit; `_attempt` then tries no size at all. `short` is true
+    /// when it stopped short of its natural end (its step cap, too little gas for another
+    /// step, legs that did not compose, a broken leg), so that the size is a partial one.
     function size(bytes32 poolId, Plan calldata plan)
         external
         view
         onlySelf
-        returns (uint160 limit, uint256 spend, bool declined)
+        returns (uint160 limit, uint256 spend, bool declined, bool short)
     {
-        (limit, spend,, declined) = _walk(poolId, plan);
+        (limit, spend,, declined, short) = _walk(poolId, plan);
     }
 }
 

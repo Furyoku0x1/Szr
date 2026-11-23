@@ -13,11 +13,13 @@ abstract contract SearchManyPart is ArbitrageLogic {
 
     /// @dev One search over several books, each counting profit in its own token. Every
     /// rule of `_search` holds across them as one: one allowance, one floor, and closing a
-    /// gap is required until a cycle in any token has worked or more than
-    /// `FAILURES_COVERED` have failed in all. Today a second gap in the same token is not
-    /// required once a cycle has worked either, so sending less gas skips nothing more than
-    /// it did. Each round takes the widest gap of any book: gaps are shares, so they
-    /// compare across tokens, while profits would need a price between them.
+    /// gap is required until a cycle in any token has worked in full, or the cycles that
+    /// failed plus those that closed only part of a gap, across all books, number more than
+    /// `FAILURES_COVERED`, or a round finds nothing left. Today a second gap in the same
+    /// token is not required once a cycle has worked either, so sending less gas skips
+    /// nothing more than it did. Each round takes the widest gap of any book: gaps are
+    /// shares, so they compare across tokens, while profits would need a price between
+    /// them.
     function searchMany(
         bytes32[] calldata centres,
         uint256 id,

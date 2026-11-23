@@ -181,6 +181,29 @@ contract ArbitrageProbe is ArbitrageApi {
         active = 0;
     }
 
+    /// Runs `_attempt` for a plan as a search would and says whether the size that worked
+    /// was a partial one. Like `tryCost`, the pool manager must be unlocked, and a cycle
+    /// that earned is retired so that it can be locked again. `fill` asks the wrapped pools.
+    function attemptPiece(
+        uint256 market,
+        address base,
+        bytes32 poolId,
+        Plan calldata plan,
+        bool fill
+    ) external returns (uint256 won, bool piece) {
+        active = market;
+        home = base;
+        _begin(market);
+        // A wrapped pool's answers are asked once at the start of a search. Left out, the
+        // sizing walk has none to read and reverts.
+        if (fill) {
+            if (asking != 0) _fill();
+        }
+        (won, piece) = _attempt(poolId, plan);
+        if (won != 0) _retire(won);
+        active = 0;
+    }
+
     /// The first sizing step a search runs, as `_attempt` runs it: how many it ran, the gas
     /// the walk's call took (the call, the encoding and a failure included), the boundaries
     /// the walk followed given the same gas, and whether the first try used the walk's size.
@@ -218,7 +241,8 @@ contract ArbitrageProbe is ArbitrageApi {
         book[0].id = poolId;
         uint256 start = gasleft();
         _release(payer);
-        if (_attempt(poolId, plan) != 0) revert();
+        (uint256 gained,) = _attempt(poolId, plan);
+        if (gained != 0) revert();
         _fail(book, plan, payer);
         used = start - gasleft();
         active = 0;
@@ -227,12 +251,12 @@ contract ArbitrageProbe is ArbitrageApi {
     function _size(bytes32 poolId, Plan memory plan, uint256 budget)
         internal
         override
-        returns (uint256 left, bool declined)
+        returns (uint256 left, bool declined, bool short)
     {
-        if (skipTries) return (0, false);
+        if (skipTries) return (0, false, false);
         Plan memory before = abi.decode(abi.encode(plan), (Plan));
-        (left, declined) = super._size(poolId, plan, budget);
-        if (sizingCalls++ != 0) return (left, declined);
+        (left, declined, short) = super._size(poolId, plan, budget);
+        if (sizingCalls++ != 0) return (left, declined, short);
         sizingGas = budget - left;
         walkInput = abi.encode(poolId, before);
         sizingDeclined = declined;
@@ -244,7 +268,7 @@ contract ArbitrageProbe is ArbitrageApi {
             sizingSteps = followed;
         } catch { }
         try this.size{ gas: SIZING_GAS }(poolId, before) returns (
-            uint160, uint256 again, bool
+            uint160, uint256 again, bool, bool
         ) {
             sizingCut = again != plan.spend;
         } catch (bytes memory reason) {
@@ -460,7 +484,7 @@ contract ArbitrageProbe is ArbitrageApi {
         _begin(market);
         _fill();
         this.walkGas(poolId, plan);
-        (uint256 left,) = super._size(poolId, plan, type(uint128).max);
+        (uint256 left,,) = super._size(poolId, plan, type(uint128).max);
         charged = type(uint128).max - left;
         inner = this.walkGas(poolId, plan);
         asking = 0;
@@ -499,7 +523,7 @@ contract ArbitrageProbe is ArbitrageApi {
         onlySelf
         returns (uint256 steps)
     {
-        (,, steps,) = _walk(poolId, plan);
+        (,, steps,,) = _walk(poolId, plan);
     }
 
     /// The gas the sizing walk is given, the most boundary events it follows, and the gas a
