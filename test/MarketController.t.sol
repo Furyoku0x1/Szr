@@ -392,9 +392,6 @@ contract MarketControllerTest is MarketsWorld {
     // The market, through the controller.
 
     function testImmediateCallsReachTheHook() public {
-        vm.prank(team);
-        controller.forward(abi.encodeCall(hook.setMinimumProfit, (id, address(backing), 7e15)));
-        assertEq(hook.minimumProfit(id, address(backing)), 7e15);
         PoolKey memory extra = _pair(address(backing), address(coin), 100, address(hook));
         vm.prank(team);
         controller.forward(abi.encodeCall(hook.createPool, (id, extra, uint160(1 << 96))));
@@ -413,7 +410,7 @@ contract MarketControllerTest is MarketsWorld {
     }
 
     function testOnlyTheCuratorForwardsAndOnlyAllowedCalls() public {
-        bytes memory profit = abi.encodeCall(hook.setMinimumProfit, (id, address(backing), 1));
+        bytes memory profit = abi.encodeCall(hook.setPricerGas, (id, 400_000));
         vm.prank(stranger);
         vm.expectRevert(IMarketController.NotCurator.selector);
         controller.forward(profit);
@@ -432,7 +429,7 @@ contract MarketControllerTest is MarketsWorld {
     function testAnotherMarketIsRefused() public {
         vm.startPrank(team);
         vm.expectRevert(IMarketController.WrongMarket.selector);
-        controller.forward(abi.encodeCall(hook.setMinimumProfit, (1, address(backing), 1)));
+        controller.forward(abi.encodeCall(hook.setPricerGas, (1, 400_000)));
         bytes memory other = abi.encodeCall(hook.setTokens, (1, _tokens(address(usd))));
         vm.expectRevert(IMarketController.WrongMarket.selector);
         controller.queue(other);
@@ -449,17 +446,17 @@ contract MarketControllerTest is MarketsWorld {
     /// would show here as the wrong kind.
     function testAllowedSelectorsAreTheHooksOwn() public {
         uint256 word = id;
-        bytes4[7] memory now_ = [
+        bytes4[6] memory now_ = [
             hook.setLeaders.selector,
             hook.setConnector.selector,
-            hook.setMinimumProfit.selector,
             hook.setPricerGas.selector,
             hook.createPool.selector,
             hook.addVenue.selector,
             hook.retrack.selector
         ];
-        bytes4[4] memory later = [
+        bytes4[5] memory later = [
             hook.setTokens.selector,
+            hook.setMinimumProfit.selector,
             hook.untrack.selector,
             hook.setLimits.selector,
             hook.nominateOwner.selector

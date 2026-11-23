@@ -166,6 +166,18 @@ contract MetricVaultForkTest is Test {
         assertEq(IERC20(WETH).balanceOf(address(vault)), 0, "nothing stays in the vault");
     }
 
+    function testQuoteWithdrawMatchesARealWithdrawal() public onlyFork {
+        _seed();
+        _deposit(1e21);
+        (uint256 q0, uint256 q1) = vault.quoteWithdraw(1e21);
+        (uint256 out0, uint256 out1) = _withdraw(1e21);
+        assertGt(out0, 0);
+        assertGt(out1, 0);
+        // One unit per bin per token: the vault seeds two bins.
+        assertApproxEqAbs(q0, out0, 2, "WETH");
+        assertApproxEqAbs(q1, out1, 2, "USDG");
+    }
+
     /// A sale and a buy back through the pool leave its fee in the bin, so a share costs and
     /// pays more WETH, and is worth more in all.
     function testASwapThroughMetricRaisesShareValue() public onlyFork {

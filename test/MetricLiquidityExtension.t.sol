@@ -119,7 +119,7 @@ contract SwapPool is MockLiquidityPool {
         uint128,
         bytes calldata,
         bytes calldata
-    ) external returns (int128 amount0, int128 amount1) {
+    ) public virtual returns (int128 amount0, int128 amount1) {
         uint256 amount = FixedPointMathLib.min(uint256(uint128(amountSpecified)), maxFill);
         SafeTransferLib.safeTransfer(zeroForOne ? token1 : token0, recipient, amount);
         _payBonus(recipient);
@@ -150,7 +150,7 @@ abstract contract MetricExtensionWorld is ExtensionWorld {
     TestAsset internal t1;
     uint256[4] internal none;
 
-    function setUp() public override {
+    function setUp() public virtual override {
         super.setUp();
         metricFactory = new MockMetricFactory();
         // Deployed from artifacts: embedding the creation code would push the test
@@ -194,6 +194,17 @@ abstract contract MetricExtensionWorld is ExtensionWorld {
         list[0] = each;
         list[1] = each;
         list[2] = each;
+    }
+
+    function _has(bytes memory data, bytes4 wanted) internal pure returns (bool) {
+        for (uint256 index; index + 4 <= data.length; index++) {
+            bytes4 word;
+            assembly ("memory-safe") {
+                word := mload(add(add(data, 32), index))
+            }
+            if (word == wanted) return true;
+        }
+        return false;
     }
 
     function _add() internal returns (uint256, uint256) {

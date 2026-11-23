@@ -336,6 +336,86 @@ contract MetricVaultTest is Test {
         assertEq(_held(2, -1), MIN);
     }
 
+    // Withdrawal quote.
+
+    function _assertQuoteIsPaid(MetricVault v, address who, uint256 shares) internal {
+        (uint256 q0, uint256 q1) = v.quoteWithdraw(shares);
+        vm.prank(who);
+        (uint256 out0, uint256 out1) = v.withdraw(shares, 0, 0, block.timestamp);
+        assertEq(out0, q0, "quote is the payment, token0");
+        assertEq(out1, q1, "quote is the payment, token1");
+    }
+
+    /// Token1's scale is 1000, and its bins sit in two positions, so dividing once per
+    /// position is what keeps the quote equal to the payment.
+    function testQuoteWithdrawEqualsThePaymentWithIdleAndTwoPositions() public {
+        _seed();
+        _deposit(alice, 1e18 + 12_345);
+        MetricVault.Change[] memory list = new MetricVault.Change[](2);
+        list[0] = MetricVault.Change(0, 1, -0.3e18 - 7);
+        list[1] = MetricVault.Change(1, 0, -0.4e18 - 11);
+        _rebalance(list);
+        (uint256 idle0, uint256 idle1) = vault.principal();
+        assertGt(idle0, 0);
+        assertGt(idle1, 0);
+        _assertQuoteIsPaid(vault, alice, 0.77e18 + 333);
+        _assertQuoteIsPaid(vault, alice, 0.23e18 + 12_012);
+    }
+
+    /// Bin 0 sits in both positions, so the second removal sees the first one's dust and the
+    /// quote can fall short of the payment by at most one unit per shared bin.
+    function testQuoteWithdrawIsALowerBoundWhenABinIsShared() public {
+        int16[][] memory ranges = new int16[][](2);
+        ranges[0] = _bins(0, 1);
+        ranges[1] = _bins(0);
+        uint256[][] memory shares = new uint256[][](2);
+        shares[0] = _list(1e18, 2e18);
+        shares[1] = _list(1e18);
+        vm.prank(curator);
+        vault.seed(ranges, shares, MAX, MAX, block.timestamp);
+        _deposit(alice, 1e18 + 12_345);
+        uint256 shared = 1;
+        (uint256 q0, uint256 q1) = vault.quoteWithdraw(0.77e18 + 333);
+        (uint256 out0, uint256 out1) = _withdraw(alice, 0.77e18 + 333);
+        assertLe(q0, out0, "token0 quote is not above the payment");
+        assertLe(q1, out1, "token1 quote is not above the payment");
+        assertLe(out0, q0 + shared, "token0 within the shared bins");
+        assertLe(out1, q1 + shared, "token1 within the shared bins");
+    }
+
+    function testQuoteWithdrawGuards() public {
+        vm.expectRevert(IHookVault.NotSeeded.selector);
+        vault.quoteWithdraw(1);
+        _seed();
+        vm.expectRevert(IHookVault.ZeroShares.selector);
+        vault.quoteWithdraw(0);
+    }
+
+    function testQuoteWithdrawShowsSkippedBinsOnAPoolWithALargeMinimum() public {
+        MetricVault big = _vaultOf(_pool(1e18, none));
+        address[2] memory users = [curator, alice];
+        for (uint256 i; i < users.length; i++) {
+            vm.startPrank(users[i]);
+            t0.approve(address(big), MAX);
+            t1.approve(address(big), MAX);
+            vm.stopPrank();
+        }
+        int16[][] memory ranges = new int16[][](1);
+        ranges[0] = _bins(1);
+        uint256[][] memory shares = new uint256[][](1);
+        shares[0] = _list(10e18);
+        vm.prank(curator);
+        big.seed(ranges, shares, MAX, MAX, block.timestamp);
+        vm.prank(alice);
+        big.deposit(5e18, MAX, MAX, block.timestamp);
+        (uint256 q0, uint256 q1) = big.quoteWithdraw(0.5e18);
+        assertEq(q0 + q1, 0, "a tenth of the deposit quotes nothing");
+        _assertQuoteIsPaid(big, alice, 0.5e18);
+        (q0,) = big.quoteWithdraw(2e18);
+        assertGt(q0, 0, "a larger withdrawal reaches the bin");
+        _assertQuoteIsPaid(big, alice, 2e18);
+    }
+
     // Pool rules.
 
     function testRefusesAPoolMetricDidNotMake() public {

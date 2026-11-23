@@ -92,6 +92,9 @@ abstract contract ArbitrageLogic {
     /// it prices the leaders of the searched pool's own group, the first leader of every
     /// other group, and Core. So what a swap costs depends on these two bounds and not on
     /// how many pools are tracked.
+    /// @dev How long a nominee may take a market after being named, so an old nomination
+    /// cannot be accepted long after the people who rely on the market last looked.
+    uint256 public constant NOMINATION_WINDOW = 7 days;
     uint256 public constant MAX_GROUPS = 8;
     uint256 public constant MAX_LEADERS = 3;
     /// @notice The most searches one wrapped venue can start, across all markets.
@@ -316,6 +319,7 @@ abstract contract ArbitrageLogic {
         address recipient;
         uint64 poolCount;
         address nominee;
+        uint40 nominatedAt;
     }
 
     /// @dev The way from a venue's partner token to the focus pool's partner token: no pool
@@ -535,6 +539,7 @@ abstract contract ArbitrageLogic {
 
     error InvalidHookAddress();
     error NotManager();
+    error NominationExpired();
     error NotPoolManager();
     error NotSelf();
     error Busy();

@@ -95,7 +95,9 @@ abstract contract AdminPart is ArbitrageLogic {
     /// to Liquidity's manager.
     function nominateOwner(uint256 id, address nominee) external onlyOwner(id) {
         if (id == SZR_MARKET) revert InvalidPool();
-        markets[id].nominee = nominee;
+        Settings storage own = markets[id];
+        own.nominee = nominee;
+        own.nominatedAt = nominee == address(0) ? 0 : uint40(block.timestamp);
         emit OwnerNominated(id, nominee);
     }
 
@@ -104,8 +106,10 @@ abstract contract AdminPart is ArbitrageLogic {
         Settings storage own = markets[id];
         if (own.nominee == address(0)) revert NotManager();
         if (msg.sender != own.nominee) revert NotManager();
+        if (block.timestamp > own.nominatedAt + NOMINATION_WINDOW) revert NominationExpired();
         own.owner = msg.sender;
         own.nominee = address(0);
+        own.nominatedAt = 0;
         emit OwnerSet(id, msg.sender);
     }
 

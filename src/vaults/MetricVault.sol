@@ -191,9 +191,9 @@ contract MetricVault is HookVault, IMetricModifyLiquidityCallback {
 
     /// @notice Shifts shares between bins: every removal runs first, into idle principal,
     /// then every addition is paid out of idle principal. The removals must return at least
-    /// `min0` and `min1` in all. Metric prices from its oracle, so no price is checked. A
-    /// pool is touched at most once a block, so the vault cannot be moved about inside one
-    /// block's price swings. Funds go only between bins and idle principal.
+    /// `min0` and `min1` in all. No price is checked, so the curator can sandwich their own
+    /// rebalance, bounded only by `min0` and `min1`. A pool is touched at most once a
+    /// block. Funds go only between bins and idle principal.
     function rebalance(Change[] calldata changes, uint256 min0, uint256 min1, uint256 deadline)
         external
         onlyCurator
@@ -416,11 +416,61 @@ contract MetricVault is HookVault, IMetricModifyLiquidityCallback {
         view
         returns (uint256 cost0, uint256 cost1)
     {
+        (uint256 bal0, uint256 bal1, uint256 total) = _binState(entry, slot);
+        cost0 = FixedPointMathLib.fullMulDivUp(bal0, units, total);
+        cost1 = FixedPointMathLib.fullMulDivUp(bal1, units, total);
+    }
+
+    /// @dev A bin's scaled balances and its total shares, as the pool stores them.
+    function _binState(Position storage entry, uint256 slot)
+        internal
+        view
+        returns (uint256 bal0, uint256 bal1, uint256 total)
+    {
         int256 bin = entry.bins[slot];
         uint256 raw = uint256(pool.extsload(keccak256(abi.encode(bin, BINS_SLOT))));
-        uint256 total = uint256(pool.extsload(keccak256(abi.encode(bin, TOTALS_SLOT))));
-        cost0 = FixedPointMathLib.fullMulDivUp(uint256(uint104(raw)), units, total);
-        cost1 = FixedPointMathLib.fullMulDivUp(uint256(uint104(raw >> 104)), units, total);
+        total = uint256(pool.extsload(keccak256(abi.encode(bin, TOTALS_SLOT))));
+        bal0 = uint256(uint104(raw));
+        bal1 = uint256(uint104(raw >> 104));
+    }
+
+    /// @notice What `withdraw(shares, ...)` would pay now. A bin too small to remove is
+    /// skipped: it returns nothing and its value stays with the other holders. A caller
+    /// should pass this as `min0` and `min1`, less any slippage they accept. It equals the
+    /// payment when no bin is shared between positions; otherwise it is a lower bound, up to
+    /// one scaled unit per shared bin per token below the payment, so a minimum taken from
+    /// it never reverts.
+    function quoteWithdraw(uint256 shares) external view returns (uint256 out0, uint256 out1) {
+        uint256 supply = totalSupply();
+        if (supply == 0) revert NotSeeded();
+        if (shares == 0) revert ZeroShares();
+        out0 = FixedPointMathLib.fullMulDiv(idle0, shares, supply);
+        out1 = FixedPointMathLib.fullMulDiv(idle1, shares, supply);
+        for (uint256 index; index < positions.length; index++) {
+            (uint256 got0, uint256 got1) = _quoteRemove(positions[index], shares, supply);
+            out0 += got0;
+            out1 += got1;
+        }
+    }
+
+    /// @dev The pool's rule for one removal call: each bin's value rounded down, summed
+    /// scaled, then converted to raw token units, rounded down.
+    function _quoteRemove(Position storage entry, uint256 shares, uint256 supply)
+        internal
+        view
+        returns (uint256 got0, uint256 got1)
+    {
+        uint256[] memory amounts = _removeAmounts(entry, shares, supply);
+        uint256 scaled0;
+        uint256 scaled1;
+        for (uint256 slot; slot < amounts.length; slot++) {
+            if (amounts[slot] == 0) continue;
+            (uint256 bal0, uint256 bal1, uint256 total) = _binState(entry, slot);
+            scaled0 += FixedPointMathLib.fullMulDiv(bal0, amounts[slot], total);
+            scaled1 += FixedPointMathLib.fullMulDiv(bal1, amounts[slot], total);
+        }
+        got0 = scaled0 / scale0;
+        got1 = scaled1 / scale1;
     }
 
     function _sum(uint256[] memory amounts) internal pure returns (uint256 total) {

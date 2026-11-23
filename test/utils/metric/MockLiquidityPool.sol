@@ -54,7 +54,7 @@ contract MockLiquidityPool is IMetricLiquidityPool {
         mode = newMode;
     }
 
-    function getImmutables() external view returns (MetricPoolImmutables memory imm) {
+    function getImmutables() public view virtual returns (MetricPoolImmutables memory imm) {
         imm.token0 = token0;
         imm.token1 = token1;
         imm.token0ScaleMultiplier = scale0;

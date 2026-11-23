@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import { ReentrancyGuard } from "solady/utils/ReentrancyGuard.sol";
 import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
 import { ArbitrageApi } from "../arbitrage/ArbitrageApi.sol";
 import { IMarketController, IVaultLink } from "../interfaces/IMarketController.sol";
@@ -17,7 +18,7 @@ import { IMarketController, IVaultLink } from "../interfaces/IMarketController.s
 /// weights and new vaults after the first) wait `CONTROL_DELAY` in a queue, so depositors
 /// can leave first. A queued item expires `GRACE` after it is ready, so an old one cannot be
 /// run long after the depositors last looked.
-contract MarketController is IMarketController {
+contract MarketController is ReentrancyGuard, IMarketController {
     uint256 public constant CONTROL_DELAY = 3 days;
     uint256 public constant GRACE = 7 days;
     // Gas a token may use to report a balance or to send, so one that burns gas cannot stop
@@ -115,7 +116,9 @@ contract MarketController is IMarketController {
     /// @dev A vault that cannot be paid keeps its share here as `pending`, which is left out
     /// of the next split and retried for that vault alone. The curator's part is booked at
     /// once, from the new money only.
-    function distribute(address[] calldata tokens) external {
+    /// @dev Guarded because a profit token that calls its receiver could otherwise re-enter
+    /// between `_pay`'s read of `pending` and its write.
+    function distribute(address[] calldata tokens) external nonReentrant {
         uint256 rest = BPS - totalWeight;
         for (uint256 index; index < tokens.length; index++) {
             address token = tokens[index];
@@ -256,7 +259,9 @@ contract MarketController is IMarketController {
         emit Queued(key, call, when);
     }
 
-    function execute(bytes calldata call) external onlyCurator live {
+    /// @dev Guarded with `distribute`: a profit token that calls its receiver could let a
+    /// curator's vault run a ready call in the middle of a split.
+    function execute(bytes calldata call) external onlyCurator live nonReentrant {
         bytes32 key = keccak256(call);
         uint256 when = readyAt[key];
         if (when == 0) revert NotQueued();
@@ -297,13 +302,26 @@ contract MarketController is IMarketController {
         if (abi.decode(call[4:36], (uint256)) != market) revert WrongMarket();
     }
 
+    /// @dev An empty leader list switches a market's profit off, so it waits like
+    /// `setMinimumProfit`. The list is decoded as the hook decodes it, never read at a fixed
+    /// offset, so a moved array offset cannot show this a non-empty list and the hook an
+    /// empty one. A call that does not decode reverts.
+    function _leadersKind(bytes calldata call) internal pure returns (uint8) {
+        (,,, bytes32[] memory poolIds) =
+            abi.decode(call[4:], (uint256, address, address, bytes32[]));
+        return poolIds.length == 0 ? DELAYED : IMMEDIATE;
+    }
+
     /// @dev What a selector may do. `setRecipient` is in none of these on purpose.
+    /// Not closed: a curator can still stop profit at once with `createPool` of an empty
+    /// pool and a one-leader `setLeaders` naming it, or with `setPricerGas` set too low for
+    /// the market's venues. Delaying every `setLeaders` would close the first.
     function _kind(bytes calldata call) internal pure returns (uint8) {
         if (call.length < 36) revert BadCall();
         bytes4 pick = bytes4(call[:4]);
-        if (pick == SETLEADERS_SIG) return IMMEDIATE;
+        if (pick == SETLEADERS_SIG) return _leadersKind(call);
         if (pick == SETCONNECTOR_SIG) return IMMEDIATE;
-        if (pick == SETMINIMUMPROFIT_SIG) return IMMEDIATE;
+        if (pick == SETMINIMUMPROFIT_SIG) return DELAYED;
         if (pick == SETPRICERGAS_SIG) return IMMEDIATE;
         if (pick == CREATEPOOL_SIG) return IMMEDIATE;
         if (pick == ADDVENUE_SIG) return IMMEDIATE;

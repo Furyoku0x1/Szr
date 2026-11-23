@@ -164,4 +164,32 @@ contract LiquidityExtensionsForkTest is Test {
         console.log("in: WETH wei, USDG units", in0, in1);
         console.log("out: WETH wei, USDG units", out0, out1);
     }
+
+    /// A bin below zero keeps its sign through the extension's storage reads: its value
+    /// matches what a removal returns, and the ledger matches too.
+    function testNegativeBinValueAndLedgerMatchRemoval() public onlyFork {
+        deal(USDG, address(ext), 100_000e6);
+        int256[] memory bins = new int256[](2);
+        bins[0] = -3;
+        bins[1] = -2;
+        vm.startPrank(manager);
+        ext.addPool(address(POOL));
+        (uint256 paid0, uint256 paid1) =
+            ext.addLiquidity(address(POOL), 9, bins, _shares(), MAX, MAX, block.timestamp);
+        assertGt(paid0 + paid1, 0, "the negative bins took tokens");
+        (uint256 value0, uint256 value1) = ext.positionValue(address(POOL), 9, bins);
+        (uint256 out0, uint256 out1) =
+            ext.removeLiquidity(address(POOL), 9, bins, _shares(), 0, 0, block.timestamp);
+        vm.stopPrank();
+        console.log("negative bins value: WETH wei, USDG units", value0, value1);
+        assertGt(value0 + value1, 0, "the bins hold value");
+        assertApproxEqAbs(value0, out0, 2, "token0 value");
+        assertApproxEqAbs(value1, out1, 2, "token1 value");
+        (uint256 in0, uint256 in1, uint256 ledgerOut0, uint256 ledgerOut1) =
+            ext.ledger(address(POOL), 9);
+        assertEq(in0, paid0, "in0");
+        assertEq(in1, paid1, "in1");
+        assertEq(ledgerOut0, out0, "out0");
+        assertEq(ledgerOut1, out1, "out1");
+    }
 }
