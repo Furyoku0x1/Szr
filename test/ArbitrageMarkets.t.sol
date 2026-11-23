@@ -45,6 +45,9 @@ abstract contract MarketsWorld is ArbitrageWorld {
         chosen[0] = address(backing);
         chosen[1] = address(usd);
         hook.setTokens(id, chosen);
+        // A market with two tokens needs a minimum for each before it is switched on.
+        hook.setMinimumProfit(id, address(usd), 1e15);
+        hook.setMinimumProfit(id, address(0), 1e15);
         vm.stopPrank();
         first = _create(address(backing), address(coin), 3_000);
         second = _create(address(backing), address(coin), 500);
@@ -445,6 +448,7 @@ contract ArbitrageProfitTokensTest is MarketsWorld {
         chosen[0] = address(backing);
         chosen[1] = address(other);
         vm.startPrank(team);
+        hook.setMinimumProfit(id, address(other), 1e15);
         hook.setTokens(id, chosen);
         hook.untrack(id, _id(odd));
         hook.retrack(_id(odd));
@@ -628,9 +632,10 @@ contract ArbitrageMarketScriptTest is MarketsWorld {
         }
         plan.groups = new OpenArbitrageMarket.Group[](1);
         plan.groups[0] = OpenArbitrageMarket.Group(address(usd), address(other), leaders);
-        plan.limits = new OpenArbitrageMarket.Limit[](1);
-        plan.limits[0] = OpenArbitrageMarket.Limit(address(usd), 1e15);
         OpenArbitrageMarket setup = new OpenArbitrageMarket();
+        plan.limits = new OpenArbitrageMarket.Limit[](2);
+        plan.limits[0] = OpenArbitrageMarket.Limit(address(backing), 1e15);
+        plan.limits[1] = OpenArbitrageMarket.Limit(address(usd), 1e15);
         uint256 opened = setup.run(plan);
         // The owner drops USD and trims the allowance to what WETH alone needs.
         address[] memory weth = new address[](1);

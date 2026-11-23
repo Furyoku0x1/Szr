@@ -36,7 +36,7 @@ contract V4LiquidityExtension is LiquidityExtension {
     event PositionAdded(uint256 indexed id, bytes32 indexed poolId, int24 lower, int24 upper);
     event Deployed(uint256 indexed id, uint256 amount0, uint256 amount1);
     event Withdrawn(uint256 indexed id, uint256 amount0, uint256 amount1);
-    event Collected(uint256 indexed id);
+    event Collected(uint256 indexed id, uint256 fees0, uint256 fees1);
 
     constructor(Liquidity liquidity_, address hook_) LiquidityExtension(liquidity_, hook_) { }
 
@@ -90,7 +90,6 @@ contract V4LiquidityExtension is LiquidityExtension {
     /// @notice Pulls a position's fees in with a zero-liquidity change.
     function collect(uint256 id) external nonReentrant onlyManager {
         _modify(id, 0, 0, 0, block.timestamp);
-        emit Collected(id);
     }
 
     function _modify(
@@ -103,7 +102,14 @@ contract V4LiquidityExtension is LiquidityExtension {
         if (block.timestamp > deadline) revert DeadlinePassed();
         if (id >= positionCount) revert UnknownPosition();
         bytes memory response = _unlock(KIND_MODIFY, abi.encode(id, change, bound0, bound1));
-        (amount0, amount1) = abi.decode(response, (uint256, uint256));
+        uint256 fees0;
+        uint256 fees1;
+        (amount0, amount1, fees0, fees1) =
+            abi.decode(response, (uint256, uint256, uint256, uint256));
+        // Fees realised by a deploy or withdraw are netted into the settlement, so they are
+        // reported here, once, for every action.
+        if (fees0 != 0) emit Collected(id, fees0, fees1);
+        else if (fees1 != 0) emit Collected(id, fees0, fees1);
     }
 
     function _unlockAction(uint256 kind, bytes memory payload)
@@ -132,7 +138,9 @@ contract V4LiquidityExtension is LiquidityExtension {
         // The whole delta settles at once: fees owed to us offset what an addition costs.
         _settle(entry.key.currency0, delta.amount0());
         _settle(entry.key.currency1, delta.amount1());
-        return abi.encode(amount0, amount1);
+        return abi.encode(
+            amount0, amount1, uint256(uint128(fees.amount0())), uint256(uint128(fees.amount1()))
+        );
     }
 
     /// @dev An addition may only cost, a removal may only return, and a collect moves no

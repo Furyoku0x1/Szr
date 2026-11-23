@@ -233,6 +233,9 @@ contract MarketsHandler is Test {
         hook.setConnector(id, theirs[2], true);
         hook.setConnector(id, theirs[0], true);
         uint32 gas = uint32(hook.minimumGasLimit(id));
+        // Every chosen token needs a minimum before the market is switched on.
+        hook.setMinimumProfit(id, address(usd), 1e15);
+        hook.setMinimumProfit(id, address(0), 1e15);
         hook.setLimits(id, address(weth), gas, 1e15, 1.0001e18);
         hook.setLimits(id, address(usd), gas, 1e15, 1.0001e18);
         hook.setLimits(id, address(0), gas, 1e15, 1.0001e18);

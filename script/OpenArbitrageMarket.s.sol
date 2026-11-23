@@ -79,6 +79,12 @@ contract OpenArbitrageMarket is Script {
         id = config.market;
         if (id == 0) id = config.hook.openMarket(config.recipient);
         _makeRoom(config, id);
+        // A market with several tokens cannot have a zero minimum for any of them, so every
+        // minimum is set before the tokens are chosen or the market is switched on.
+        for (uint256 index; index < config.limits.length; index++) {
+            config.hook
+                .setMinimumProfit(id, config.limits[index].base, config.limits[index].profit);
+        }
         if (config.tokens.length != 0) config.hook.setTokens(id, config.tokens);
         for (uint256 index; index < config.pools.length; index++) {
             if (_tracked(config, id, config.pools[index])) continue;

@@ -68,7 +68,7 @@ contract ArbitrageSplitTest is ArbitrageWorld {
 
     /// Every piece reads the slots the hook writes: each one's code, put in the hook's place,
     /// reads the same values from the hook's storage. Only `ArbitrageLogic` declares state, so
-    /// this holds for the whole layout; these four are spread across it.
+    /// this holds for the whole layout; these five are spread across it.
     function testEveryPieceReadsTheHooksStorage() public {
         uint256 opened = hook.openMarket(address(this));
         assertEq(opened, 2, "a second market");
@@ -91,6 +91,7 @@ contract ArbitrageSplitTest is ArbitrageWorld {
             assertEq(hook.shareRecipient(address(backing)), address(core), pieces[index]);
             assertEq(hook.minimumProfit(1, szrToken), 10e18, pieces[index]);
             assertTrue(hook.tracked(1, _id(mainPool)), pieces[index]);
+            assertEq(hook.swapGasCeiling(), 30_000_000, pieces[index]);
         }
         vm.etch(address(hook), real);
     }

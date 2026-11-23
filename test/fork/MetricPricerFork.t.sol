@@ -478,6 +478,65 @@ contract MetricPricerForkTest is Test {
         assertLt(_gapPips(), 10_000, "gap closed");
     }
 
+    /// The Metric pool is the first leader of its group and the plain pool the second, so a
+    /// sweep starts from Metric (`docs/specs/hook-wrapped-start.md`, part A). The search
+    /// that starts there closes the gap against the plain pool, and the first trade of the
+    /// cycle is in the plain pool, which carries the price limit.
+    function testSweepFromAMetricHeadClosesTheGap() public onlyFork {
+        _open(1, PRICER_GAS);
+        bytes32[] memory leaders = new bytes32[](2);
+        leaders[0] = PoolId.unwrap(wrapped[0].toId());
+        leaders[1] = PoolId.unwrap(hooked.toId());
+        vm.startPrank(OWNER);
+        arbitrage.setLimits(id, USDG, 0, 1e4, 1.0001e18);
+        arbitrage.setLeaders(id, USDG, address(weth), leaders);
+        arbitrage.setLimits(id, USDG, uint32(arbitrage.minimumGasLimit(id)), 1e4, 1.0001e18);
+        vm.stopPrank();
+        _openGapQuietly();
+        uint256 market0 = IERC20(USDG).balanceOf(TREASURY);
+        uint256 protocol0 = IERC20(USDG).balanceOf(PROTOCOL);
+        vm.recordLogs();
+        uint256 start = gasleft();
+        uint256 profit = arbitrage.sweep(id, USDG);
+        console.log("sweep from a Metric head, gas", start - gasleft());
+        console.log("sweep from a Metric head, profit USDG raw", profit);
+        assertGt(profit, 0, "the search from Metric earned");
+        _assertFirstTradeIsPlain(vm.getRecordedLogs());
+        _assertSplit(market0, protocol0);
+        _assertClean();
+        console.log("gap left, in pips", _gapPips());
+        assertLt(_gapPips(), 10_000, "gap closed");
+    }
+
+    /// The first swap the hook makes in the pool manager is in the plain pool, and the first
+    /// cycle names the plain pool as its limit end and Metric as its venue.
+    function _assertFirstTradeIsPlain(Vm.Log[] memory logs) internal view {
+        bytes32 hookSender = bytes32(uint256(uint160(address(arbitrage))));
+        bool sawSwap;
+        bool sawCycle;
+        for (uint256 i; i < logs.length; i++) {
+            if (logs[i].emitter == address(manager)) {
+                if (logs[i].topics[0] == IPoolManager.Swap.selector) {
+                    if (logs[i].topics[2] == hookSender) {
+                        if (!sawSwap) {
+                            assertEq(logs[i].topics[1], PoolId.unwrap(hooked.toId()), "plain");
+                        }
+                        sawSwap = true;
+                    }
+                }
+            }
+            if (logs[i].emitter != address(arbitrage)) continue;
+            if (logs[i].topics[0] != ArbitrageLogic.Arbitraged.selector) continue;
+            if (!sawCycle) {
+                assertEq(logs[i].topics[1], PoolId.unwrap(hooked.toId()), "limit end is plain");
+                assertEq(logs[i].topics[2], PoolId.unwrap(wrapped[0].toId()), "venue is Metric");
+            }
+            sawCycle = true;
+        }
+        assertTrue(sawSwap, "the hook swapped");
+        assertTrue(sawCycle, "a cycle ran");
+    }
+
     function testReverseGapIsClosed() public onlyFork {
         _open(1, PRICER_GAS);
         vm.recordLogs();

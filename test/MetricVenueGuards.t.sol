@@ -216,6 +216,7 @@ contract MetricVenueGuardsTest is MetricVenueSearchWorld {
         super.setUp();
         payFirst = new PayFirstRouter(manager);
         backing.approve(address(payFirst), type(uint256).max);
+        usd.approve(address(payFirst), type(uint256).max);
         coin.approve(address(payFirst), type(uint256).max);
     }
 
@@ -255,10 +256,11 @@ contract MetricVenueGuardsTest is MetricVenueSearchWorld {
     }
 
     function _payFirstDeltas() internal returns (int256 weth, int256 other) {
-        uint256 wethBefore = backing.balanceOf(address(this));
+        IERC20 pay = IERC20(_payToken());
+        uint256 wethBefore = pay.balanceOf(address(this));
         uint256 coinBefore = coin.balanceOf(address(this));
-        payFirst.swap(metricKey, Currency.unwrap(metricKey.currency0) == address(backing), 1e18);
-        weth = int256(backing.balanceOf(address(this))) - int256(wethBefore);
+        payFirst.swap(metricKey, Currency.unwrap(metricKey.currency0) == address(pay), 1e18);
+        weth = int256(pay.balanceOf(address(this))) - int256(wethBefore);
         other = int256(coin.balanceOf(address(this))) - int256(coinBefore);
     }
 
@@ -279,6 +281,7 @@ contract MetricVenueGuardsTest is MetricVenueSearchWorld {
     /// same, and with the trigger on and a gap the gap is closed before the fill with the
     /// router's payment waiting (which only works if the swapper is named as the payer).
     function testPayFirstSettlementDoesNotDependOnTheSearch() public {
+        _useQuotePool();
         (int256 plainWeth, int256 plainCoin) = _payFirstDeltas();
         uint256 snapshot = vm.snapshotState();
         _openGap();
@@ -366,6 +369,7 @@ contract MetricVenueGuardsTest is MetricVenueSearchWorld {
         list[0] = _id(first);
         list[1] = _id(costly);
         _leadList(list);
+        _useQuotePool();
         metric.setMode(6, BURN_FILL);
         _openGap();
         bool settled;
@@ -417,6 +421,7 @@ contract MetricVenueGuardsTest is MetricVenueSearchWorld {
     /// across where the search before the fill can start, so that some search runs out just
     /// after a failure while another cycle is due.
     function testATriggeredSearchIsNeverStarved() public {
+        // The two venues are built first: `_addVenue` copies the swapped pool's tokens.
         (PoolKey memory one,) = _addVenue(0x4445, 0, 1e17, address(new FlatPricer()));
         (PoolKey memory two,) = _addVenue(0x4446, 0, 1e17, address(new FlatPricer()));
         bytes32[] memory list = new bytes32[](3);
@@ -424,12 +429,13 @@ contract MetricVenueGuardsTest is MetricVenueSearchWorld {
         list[1] = _id(one);
         list[2] = _id(two);
         _leadList(list);
+        _useQuotePool();
         _openGap();
         for (uint256 cap = 9_400_000; cap <= 10_600_000; cap += 10_000) {
             uint256 snapshot = vm.snapshotState();
             venue.setTrigger(metricKey, id, address(backing), uint32(cap), true);
             vm.recordLogs();
-            _trade(metricKey, address(backing), 1e16);
+            _trade(metricKey, _payToken(), 1e16);
             Vm.Log[] memory logs = vm.getRecordedLogs();
             for (uint256 index; index < logs.length; index++) {
                 if (logs[index].emitter != address(hook)) continue;
@@ -458,6 +464,14 @@ contract MetricVenueGuardsTest is MetricVenueSearchWorld {
         both[1] = _id(two);
         _lead(address(backing), address(usd), both);
         _lead(address(usd), address(backing), both);
+        // A Metric pool of a third token, which neither trigger counts in.
+        TestAsset third = new TestAsset();
+        _approve(third);
+        // The pool manager holds some of it, as the Metric hook takes its input from there.
+        PoolKey memory shelf = _pair(address(third), address(coin), 3_000, address(0));
+        manager.initialize(shelf, uint160(1 << 96));
+        _provide(shelf, 1_000_000e18);
+        _useMetricPoolOf(address(third));
         // Only USD is worth closing a gap for.
         _limits(address(backing), 1e30);
         _limits(address(usd), 1);
@@ -467,7 +481,7 @@ contract MetricVenueGuardsTest is MetricVenueSearchWorld {
         _trade(one, address(usd), 50_000e18);
         _limits(address(usd), 1);
         vm.recordLogs();
-        _trade(metricKey, address(backing), 1e18);
+        _trade(metricKey, _payToken(), 1e18);
         (uint256 cycle, uint256 fill, uint256 cycles) = _firstCycleAndFill(vm.getRecordedLogs());
         assertGt(cycles, 0, "the gap was closed");
         assertLt(cycle, fill, "before the fill");
@@ -493,11 +507,13 @@ contract MetricVenueGuardsTest is MetricVenueSearchWorld {
         list[1] = _id(costly);
         list[2] = _id(dear);
         _leadList(list);
+        _useQuotePool();
         _openGap();
         BurnAfterRouter router = new BurnAfterRouter(manager);
         backing.approve(address(router), type(uint256).max);
+        usd.approve(address(router), type(uint256).max);
         coin.approve(address(router), type(uint256).max);
-        bool zeroForOne = Currency.unwrap(metricKey.currency0) == address(backing);
+        bool zeroForOne = Currency.unwrap(metricKey.currency0) == _payToken();
         bool settled;
         bool searched;
         for (uint256 gas = 2_500_000; gas <= 7_000_000; gas += 50_000) {

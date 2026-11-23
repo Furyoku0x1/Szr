@@ -182,7 +182,8 @@ contract ArbitrageSweepSzrTest is ArbitrageWorld {
     }
 }
 
-/// @dev A group whose head is a wrapped pool is skipped; the others are still searched.
+/// @dev A group whose head is a wrapped pool is searched from it, against the plain pools;
+/// the other groups are searched too.
 contract ArbitrageSweepWrappedTest is MarketsWorld {
     WrappedPool internal wrapper;
     WrappedPricer internal pricer;
@@ -212,7 +213,7 @@ contract ArbitrageSweepWrappedTest is MarketsWorld {
         return Currency.unwrap(outside.currency0) == address(backing) ? zero : one;
     }
 
-    function testWrappedHeadIsSkippedAndOtherGroupsAreSearched() public {
+    function testWrappedHeadIsComparedWithThePlainPoolsAndOtherGroupsAreSearched() public {
         PoolKey memory one = _create(address(backing), address(usd), 3_000);
         PoolKey memory two = _create(address(backing), address(usd), 500);
         _lead(address(backing), address(usd), _list(_id(one), _id(two)));
@@ -225,8 +226,8 @@ contract ArbitrageSweepWrappedTest is MarketsWorld {
         uint256 held = _held();
         uint256 profit = hook.sweep(id, address(backing));
         assertGt(profit, 0, "the USD group was searched");
-        assertEq(_held(), held, "the wrapped head was not a centre");
-        assertEq(hook.sweep(id, address(backing)), 0, "and the skipped gap stays");
+        assertTrue(_held() != held, "the wrapped head was compared with the plain pool");
+        assertEq(hook.sweep(id, address(backing)), 0, "and both gaps are closed");
         _assertNothingHeld();
     }
 

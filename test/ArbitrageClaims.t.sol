@@ -100,8 +100,12 @@ contract ArbitrageClaimsTest is MarketsWorld {
         list[0] = token;
         list[1] = address(backing);
         list[2] = address(usd);
-        vm.prank(team);
+        vm.startPrank(team);
+        hook.setMinimumProfit(market, token, 1e15);
+        hook.setMinimumProfit(market, address(backing), 1e15);
+        hook.setMinimumProfit(market, address(usd), 1e15);
         hook.setTokens(market, list);
+        vm.stopPrank();
     }
 
     function _claim(address who) internal view returns (uint256) {

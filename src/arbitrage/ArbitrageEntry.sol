@@ -12,22 +12,27 @@ abstract contract EntryPart is ArbitrageLogic {
 
     /// @notice Lets the hook of a wrapped venue ask for the searches that hook's owner chose
     /// for it (`setVenueTrigger`), around a swap that hook is filling inside the current
-    /// unlock. Each is what `sweep` runs, centred on each group's first leader, but within
-    /// this unlock and with the swap's `before` flag, so the search before a swap keeps the
-    /// larger gas floor that leaves room for the swap and the search after it. It is best
-    /// effort: with too little gas a search is skipped and reported, and a failed one is
-    /// undone and reported. Nothing here reverts once the caller is checked, so the
-    /// wrapper's swap never depends on it.
-    /// @dev Skipping cannot be used to avoid a gap, because the swapper trades the wrapped
-    /// venue's own price, not the pools a search closes gaps between. `sender` is the swap's
-    /// sender, whose waiting payment `_release` then credits, as for the hook's own pools; as
-    /// for those, a cycle that fails is set aside. A trigger whose market has stopped
+    /// unlock. A trigger runs one search from the swapped pool when that pool holds the
+    /// trigger's token, and otherwise one from each group's first leader, as `sweep` does.
+    /// Either way it runs within this unlock and with the swap's `before` flag, so the
+    /// search before a swap keeps the larger gas floor that leaves room for the swap and
+    /// the search after it. It is best effort: with too little gas a search is skipped and
+    /// reported, and a failed one is undone and reported. Nothing here reverts once the
+    /// caller is checked, so the wrapper's swap never depends on it.
+    /// @dev When the swapped pool holds the trigger's token, the search before the fill
+    /// closes gaps between the swapped pool and plain pools, so a swap that brings too
+    /// little gas keeps the value of that gap. This is accepted: triggers are best effort
+    /// by decision, and the same pool can be traded directly. `sender` is the swap's
+    /// sender, whose waiting payment `_release` then credits, as for the hook's own pools;
+    /// as for those, a cycle that fails is set aside. A trigger whose market has stopped
     /// tracking the pool, or no longer counts profit in its token, stays registered but is
     /// skipped.
     /// @dev A search only runs with `VENUE_RESERVE` to spare, and within the trigger's cap;
     /// see `_trigger`. A pay-after swap sized near the pool manager's whole holding of its
     /// input token can still fail `Drained` in the wrapper when the search before it traded
-    /// the wrapper first and moved that token out of the pool manager. This is accepted.
+    /// the wrapper and moved that token out of the pool manager. When the pool holds the
+    /// trigger's token, the search before the fill normally does trade the wrapper first.
+    /// This is accepted.
     function venueSearch(bytes32 poolId, bool before, address sender) external {
         if (msg.sender != address(keys[poolId].hooks)) revert NotTrusted();
         if (pricers[msg.sender] == address(0)) revert NotTrusted();

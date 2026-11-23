@@ -16,6 +16,9 @@ import { BalanceDelta } from "v4-core/types/BalanceDelta.sol";
 interface IArbitrageOwner {
     function setRecipient(uint256 id, address recipient) external;
     function sweep(uint256 id, address base) external returns (uint256);
+    function venueSearch(bytes32 poolId, bool before, address sender) external;
+    function setVenueTrigger(uint256 id, bytes32 poolId, address base, uint32 gasCap, bool on)
+        external;
 }
 
 /// @dev Stands in for one of Uniswap's aggregator hooks. Each pool on it wraps a
@@ -39,6 +42,9 @@ contract WrappedPool {
     PoolKey public target;
     address public arbitrage;
     uint256 public market;
+    /// While set, a swap asks the arbitrage hook for the searches registered for its pool,
+    /// before the fill and after it, as `MetricVenueHook` does.
+    bool public watching;
 
     constructor(IPoolManager poolManager) {
         manager = poolManager;
@@ -57,17 +63,34 @@ contract WrappedPool {
         market = id;
     }
 
+    /// Registers a trigger for `pool` in market `id` and starts asking for it on every swap.
+    function watch(PoolKey calldata pool, address hook, uint256 id, address base, uint32 cap)
+        external
+    {
+        arbitrage = hook;
+        watching = true;
+        IArbitrageOwner(hook).setVenueTrigger(id, PoolId.unwrap(pool.toId()), base, cap, true);
+    }
+
+    function _ask(PoolKey calldata pool, address sender, bool before) internal {
+        if (!watching) return;
+        try IArbitrageOwner(arbitrage)
+            .venueSearch(PoolId.unwrap(pool.toId()), before, sender) { }
+            catch { }
+    }
+
     function reservesOf(bytes32 poolId) external view returns (uint256, uint256) {
         return (reserves[poolId][0], reserves[poolId][1]);
     }
 
     function beforeSwap(
-        address,
+        address sender,
         PoolKey calldata pool,
         IPoolManager.SwapParams calldata params,
         bytes calldata
     ) external returns (bytes4, BeforeSwapDelta, uint24) {
         require(msg.sender == address(manager), "not the pool manager");
+        _ask(pool, sender, true);
         bool exactInput = params.amountSpecified < 0;
         (uint256 paid, uint256 given) = _fill(pool, params);
         manager.take(params.zeroForOne ? pool.currency0 : pool.currency1, address(this), paid);
@@ -90,6 +113,7 @@ contract WrappedPool {
             TestAsset(Currency.unwrap(output)).transfer(address(manager), 1);
             manager.settleFor(arbitrage);
         }
+        _ask(pool, sender, false);
         int128 specified = exactInput ? int128(int256(paid)) : -int128(int256(sent));
         int128 unspecified = exactInput ? -int128(int256(sent)) : int128(int256(paid));
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(specified, unspecified), 0);

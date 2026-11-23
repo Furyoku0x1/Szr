@@ -27,7 +27,10 @@ contract ArbitrageRememberedTest is MarketsWorld {
         deployCodeTo("PeekVenue.sol:PeekVenue", abi.encode(manager, hook), at);
         peek = PeekVenue(at);
         hook.setPricer(at, address(new FlatPricer()));
-        venue = _pair(address(backing), address(coin), 100, at);
+        // The venue holds USD, not WETH, which the trigger counts in. A wrapped pool that held
+        // WETH would be searched once, from itself (`docs/specs/hook-wrapped-start.md`, part
+        // B), and these tests are about the searches from each group's head.
+        venue = _pair(address(usd), address(coin), 100, at);
         manager.initialize(venue, uint160(1 << 96));
         vm.startPrank(team);
         hook.setLimits(id, address(backing), 0, 1e15, 1.0001e18);

@@ -57,6 +57,7 @@ abstract contract AdminPart is ArbitrageLogic {
             chosen[id].push(asset);
         }
         _requireWorkable(id, markets[id].gasLimit);
+        _requireMinimums(id);
         emit TokensSet(id, assets);
     }
 
@@ -353,6 +354,7 @@ abstract contract AdminPart is ArbitrageLogic {
         own.gasLimit = gas;
         own.edge = uint56(edge / EDGE_UNIT);
         minimumProfit[id][base] = profit;
+        _requireMinimums(id);
         emit LimitsSet(id, base, gas, profit, uint64(own.edge * EDGE_UNIT));
     }
 
@@ -360,6 +362,7 @@ abstract contract AdminPart is ArbitrageLogic {
     function setMinimumProfit(uint256 id, address base, uint128 profit) external onlyOwner(id) {
         Settings storage own = markets[id];
         minimumProfit[id][base] = profit;
+        _requireMinimums(id);
         emit LimitsSet(id, base, own.gasLimit, profit, uint64(own.edge * EDGE_UNIT));
     }
 
@@ -382,10 +385,16 @@ abstract contract AdminPart is ArbitrageLogic {
     /// @dev This holds as long as the gas reserved per step in this contract is no less
     /// than those steps really cost.
     function gasForSwap(uint256 id) external view returns (uint256) {
-        // Outside markets also read where each chosen token's book is centred, before the
-        // search and so outside its allowance.
-        uint256 centres = id == SZR_MARKET ? 0 : CENTRE_BASE + CENTRE_GAS * chosen[id].length;
-        return (_hopped(_minimumGasLimit(id)) + OVERHEAD_GAS + centres) * 64 / 63 * 64 / 63;
+        return _gasForSwap(id);
+    }
+
+    /// @notice Sets the most `gasForSwap` a market may have when it is switched on or
+    /// changed. Lowering it switches nothing off; a market above it is refused at its next
+    /// change. Zero would stop every market being switched on.
+    function setSwapGasCeiling(uint256 ceiling) external onlyOwner(SZR_MARKET) {
+        if (ceiling == 0) revert InvalidLimit();
+        swapGasCeiling = ceiling;
+        emit SwapGasCeilingSet(ceiling);
     }
 
     /// @notice The other token of a pool a market is searching, beside the one its profit

@@ -82,6 +82,42 @@ abstract contract MetricVenueSearchWorld is MarketsWorld {
     // helpers
     // ---------------------------------------------------------------------------------
 
+    /// Swaps through a Metric pool of coin and USD instead, which does not hold WETH, the
+    /// token the trigger counts profit in. Such a swap starts one search from the first
+    /// leader of every group, as `sweep` does; a pool that holds the trigger's token is
+    /// searched from itself instead (`ArbitrageWrappedStart.t.sol`, part B of
+    /// `docs/specs/hook-wrapped-start.md`).
+    function _useQuotePool() internal {
+        _useMetricPoolOf(address(usd));
+    }
+
+    /// The same with a Metric pool of coin and `other`.
+    function _useMetricPoolOf(address other) internal {
+        (address low, address high) =
+            other < address(coin) ? (other, address(coin)) : (address(coin), other);
+        metric = new MockMetricPool(address(factory), low, high, 1, 1, uint128(1 << 64));
+        factory.register(address(metric));
+        TestAsset(low).mint(address(metric), 1_000_000e18);
+        TestAsset(high).mint(address(metric), 1_000_000e18);
+        metricKey =
+            PoolKey(Currency.wrap(low), Currency.wrap(high), 0, 1, IHooks(address(venue)));
+        metricId = _id(metricKey);
+        venue.bind(metricKey, address(metric));
+        vm.startPrank(team);
+        hook.setLimits(id, address(backing), 0, 1e15, 1.0001e18);
+        hook.addVenue(id, metricKey);
+        vm.stopPrank();
+        _limits(address(backing), 1e15);
+        venue.setTrigger(metricKey, id, address(backing), CAP, true);
+    }
+
+    /// The token a trader pays into the Metric pool: the one that is not coin.
+    function _payToken() internal view returns (address) {
+        return Currency.unwrap(metricKey.currency0) == address(coin)
+            ? Currency.unwrap(metricKey.currency1)
+            : Currency.unwrap(metricKey.currency0);
+    }
+
     /// Sells coin into the first pool with the market switched off, so the gap stays open.
     function _openGap() internal {
         vm.prank(team);
@@ -130,7 +166,7 @@ abstract contract MetricVenueSearchWorld is MarketsWorld {
         vm.cool(address(manager));
         vm.cool(address(hook));
         vm.cool(address(venue));
-        bool zeroForOne = Currency.unwrap(metricKey.currency0) == address(backing);
+        bool zeroForOne = Currency.unwrap(metricKey.currency0) == _payToken();
         PoolSwapTest.TestSettings memory settings;
         IPoolManager.SwapParams memory params = IPoolManager.SwapParams(
             zeroForOne,
@@ -163,10 +199,11 @@ contract MetricVenueSearchTest is MetricVenueSearchWorld {
     /// A gap between two v4 pools that was open before the trader's swap is closed by the
     /// search ahead of the fill, so the trader fills after it has been closed.
     function testGapOpenBeforeTheSwapIsClosedBeforeTheFill() public {
+        _useQuotePool();
         _openGap();
         uint256 paid = backing.balanceOf(treasury);
         vm.recordLogs();
-        _trade(metricKey, address(backing), 1e18);
+        _trade(metricKey, _payToken(), 1e18);
         (uint256 cycle, uint256 fill, uint256 cycles) = _firstCycleAndFill(vm.getRecordedLogs());
         assertGt(cycles, 0, "a cycle ran");
         assertLt(cycle, fill, "closed before Metric filled");
@@ -177,6 +214,7 @@ contract MetricVenueSearchTest is MetricVenueSearchWorld {
     /// A gap the swap itself opens, here by Metric's pool trading in a hookless venue of
     /// the market, is closed by the search after the swap.
     function testGapTheSwapOpensIsClosedAfterIt() public {
+        _useQuotePool();
         hookless = _pair(address(backing), address(coin), 3_000, address(0));
         manager.initialize(hookless, uint160(1 << 96));
         _provide(hookless, 1_000_000e18);
@@ -201,7 +239,7 @@ contract MetricVenueSearchTest is MetricVenueSearchWorld {
         );
         uint256 paid = backing.balanceOf(treasury);
         vm.recordLogs();
-        _trade(metricKey, address(backing), 1e18);
+        _trade(metricKey, _payToken(), 1e18);
         (uint256 cycle, uint256 fill, uint256 cycles) = _firstCycleAndFill(vm.getRecordedLogs());
         assertGt(cycles, 0, "a cycle ran");
         assertGt(cycle, fill, "nothing was open before the fill");
@@ -245,6 +283,7 @@ contract MetricVenueSearchTest is MetricVenueSearchWorld {
 
     /// The swapper gets the same from the Metric pool whatever the searches do.
     function testSettlementDoesNotDependOnTheSearch() public {
+        _useQuotePool();
         _openGap();
         uint256 snapshot = vm.snapshotState();
         (int256 withWeth, int256 withCoin) = _swapperDeltas();
@@ -300,6 +339,7 @@ contract MetricVenueSearchTest is MetricVenueSearchWorld {
     /// With too little gas the search is skipped and reported, and the swap settles. More
     /// gas never turns a swap that settled into one that fails.
     function testLowGasSkipsTheSearchAndTheSwapStillSettles() public {
+        _useQuotePool();
         _openGap();
         bool settled;
         bool skipped;

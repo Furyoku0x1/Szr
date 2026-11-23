@@ -251,7 +251,10 @@ abstract contract ArbitrageLogic {
         uint256 twins;
     }
 
-    /// @dev The venue a search is centred on. `depth` is the SZR it takes to move that
+    /// @dev The pool a cycle is centred on, the end that carries the price limit. In an
+    /// ordinary plan that is the search's start pool. When the start pool is wrapped the
+    /// ends are exchanged and this is built from each plain candidate instead, so `id` is
+    /// never a wrapped pool. `depth` is the SZR it takes to move that
     /// pool's square-root price by its own size, read only once a gap is found. Many venues
     /// share a partner token, so the route to each partner is worked out once per scan and
     /// kept in `seen` and `routes`.
@@ -521,6 +524,9 @@ abstract contract ArbitrageLogic {
     /// each one's place in that list from one. A search asks each of them once.
     mapping(uint256 market => bytes32[]) internal wrappedIn;
     mapping(uint256 market => mapping(bytes32 poolId => uint256)) internal wrappedAt;
+    /// @notice The most `gasForSwap` a market may ask of a swap when it is switched on or
+    /// changed. Declared last, so that no slot above it moves.
+    uint256 public swapGasCeiling;
 
     error InvalidHookAddress();
     error NotManager();
@@ -555,6 +561,7 @@ abstract contract ArbitrageLogic {
     event RecipientSet(uint256 indexed market, address recipient);
     event ProfitTokenSet(address indexed asset, address recipient);
     event TokensSet(uint256 indexed market, address[] assets);
+    event SwapGasCeilingSet(uint256 ceiling);
     event PricerSet(address indexed wrapper, address indexed pricer);
     event PricerGasSet(uint256 indexed market, uint32 gas);
     /// @notice A market earned `amount` of `asset`, of which `protocolShare` went to the
@@ -645,6 +652,10 @@ abstract contract ArbitrageLogic {
         own.gasLimit = 8_000_000;
         own.edge = uint56(1.0001e18 / EDGE_UNIT);
         minimumProfit[SZR_MARKET][token] = 10e18;
+        // Sized for Robinhood Chain's 32M cap, with room for the router and for a swap that
+        // costs more than `SWAP_GAS`.
+        swapGasCeiling = 30_000_000;
+        emit SwapGasCeilingSet(30_000_000);
         // WETH is the first token profit may be counted in. Core counts the protocol's
         // share of it as backing when anyone calls `absorbBacking`.
         shareRecipient[backingAsset] = address(core);
@@ -740,10 +751,32 @@ abstract contract ArbitrageLogic {
         return shareRecipient[base] != address(0);
     }
 
-    /// @dev An allowance too small for the venues a search prices would leave it idle.
+    /// @dev An allowance too small for the venues a search prices would leave it idle, and a
+    /// reserve no transaction can carry would fail every swap that meets a gap.
     function _requireWorkable(uint256 id, uint256 gas) internal view {
         if (gas == 0) return;
         if (gas < _minimumGasLimit(id)) revert InvalidLimit();
+        if (_gasForSwap(id) > swapGasCeiling) revert InvalidLimit();
+    }
+
+    /// @dev A market that is on and counts in several tokens needs a minimum profit for each:
+    /// with none, a cycle too small to matter in one token could release the required rule
+    /// for a valuable gap in another. Checked after the change, so a revert undoes it.
+    function _requireMinimums(uint256 id) internal view {
+        if (markets[id].gasLimit == 0) return;
+        address[] storage list = chosen[id];
+        if (list.length < 2) return;
+        for (uint256 index; index < list.length; index++) {
+            if (minimumProfit[id][list[index]] == 0) revert InvalidLimit();
+        }
+    }
+
+    /// @dev What `gasForSwap` reports; see there.
+    function _gasForSwap(uint256 id) internal view returns (uint256) {
+        // Outside markets also read where each chosen token's book is centred, before the
+        // search and so outside its allowance.
+        uint256 centres = id == SZR_MARKET ? 0 : CENTRE_BASE + CENTRE_GAS * chosen[id].length;
+        return (_hopped(_minimumGasLimit(id)) + OVERHEAD_GAS + centres) * 64 / 63 * 64 / 63;
     }
 
     /// @dev Adds the partner to the list of groups, or removes it, as its leaders require.
@@ -927,7 +960,8 @@ abstract contract ArbitrageLogic {
         }
     }
 
-    /// @dev One trigger: a search centred on each group's first leader. All of a trigger's
+    /// @dev One trigger: a search centred on each group's first leader, or, when the swapped
+    /// wrapped pool holds the trigger's token, one search from that pool. All of a trigger's
     /// searches share one budget, the lowest of the market's gas allowance, the trigger's
     /// own cap, and what is available now less `VENUE_RESERVE`. So a market with many groups
     /// cannot cost a swap more than its allowance, and a search only starts when that much
@@ -945,15 +979,45 @@ abstract contract ArbitrageLogic {
         uint256 start = gasleft();
         uint256 needed = _needed(entry.market, entry.base, before);
         address[] memory list = groups[entry.market][entry.base];
-        for (uint256 index; index < list.length; index++) {
+        // A wrapped pool that holds the token is searched from itself, once; it is compared
+        // with the plain pools of every group (`_bestFromWrapped`).
+        address mine = _wrappedPartner(entry.market, poolId, entry.base);
+        uint256 length = mine == address(0) ? list.length : 1;
+        for (uint256 index; index < length; index++) {
             uint256 left = _budgetLeft(cap, start, needed);
             if (left < needed) {
                 emit VenueSearchSkipped(poolId, entry.market, before);
                 return;
             }
             remembered = bytes32(0);
-            _attemptHead(entry.market, entry.base, list[index], before, sender, left);
+            if (mine == address(0)) {
+                _attemptHead(
+                    entry.market, entry.base, list[index], bytes32(0), before, sender, left
+                );
+            } else {
+                _attemptHead(entry.market, entry.base, mine, poolId, before, sender, left);
+            }
         }
+    }
+
+    /// @dev The other token of a swapped wrapped pool of the market that holds `base`; zero
+    /// when the pool is not one, or does not hold it (the twin of an ether token included).
+    /// A pool of both ether tokens is never searched, so it is not one either.
+    function _wrappedPartner(uint256 id, bytes32 poolId, address base)
+        internal
+        view
+        returns (address)
+    {
+        if (wrappedAt[id][poolId] == 0) return address(0);
+        PoolKey storage key = keys[poolId];
+        address lower = Currency.unwrap(key.currency0);
+        address higher = Currency.unwrap(key.currency1);
+        if (_isEther(lower)) {
+            if (_isEther(higher)) return address(0);
+        }
+        if (lower == base) return higher;
+        if (higher == base) return lower;
+        return address(0);
     }
 
     /// @dev What a trigger's next search may use: what is left of its cap, and no more than
@@ -983,11 +1047,13 @@ abstract contract ArbitrageLogic {
         uint256 id,
         address base,
         address partner,
+        bytes32 head,
         bool before,
         address sender,
         uint256 gas
     ) internal {
-        bytes32 head = heads[id][base][partner];
+        // A zero head is the first leader of the partner's group.
+        if (head == bytes32(0)) head = heads[id][base][partner];
         // Capped, so that running short of gas ends the search quietly: it must never revert
         // `Starved` inside a triggered search.
         try IArbitrageSelf(address(this)).search{ gas: _hopped(gas) }(
@@ -1100,8 +1166,9 @@ abstract contract ArbitrageLogic {
         }
     }
 
-    /// @dev A leader that is a wrapped pool can be the centre, as it can in `sweep`; its
-    /// cycles then close on its price as the pricer reports it, and nothing is special-cased.
+    /// @dev A leader that is a wrapped pool can be the centre, as it can in `sweep`. Its
+    /// search compares it with plain pools only, each of which carries the price limit
+    /// (`_bestFromWrapped`).
     function _centreFor(uint256 id, address base, bytes32 poolId, PoolKey calldata pool)
         internal
         view
@@ -1268,7 +1335,7 @@ abstract contract ArbitrageLogic {
         home = run.bases[pick];
         if (run.resync == UNRELEASED) run.resync = _release(run.payer);
         Venue[] memory book = run.books[pick];
-        uint256 gained = _attempt(book[0].id, plan);
+        uint256 gained = _attempt(_limitEnd(book, plan), plan);
         if (gained == 0) {
             run.failures++;
             _fail(book, plan, run.payer);
@@ -1279,7 +1346,7 @@ abstract contract ArbitrageLogic {
         // The profit stays a credit, which later cycles through this token must leave alone.
         _setCredited(run.bases[pick], run.profits[pick]);
         if (!_reprice(book, plan)) return false;
-        _requoteOthers(run, pick, book[0].id, plan);
+        _requoteOthers(run, pick, _limitEnd(book, plan), plan);
         // A venue on the twin is no longer a pool of this book's token.
         if (plan.venue != bytes32(0)) {
             if (!_onTwin(book, plan.index)) run.nexts[pick] = plan.index;
@@ -1371,9 +1438,9 @@ abstract contract ArbitrageLogic {
             }
             Plan memory plan = _best(book);
             if (plan.score == 0) {
-                // Nothing left here. The venue last traded against has moved, which may
-                // have opened a gap between it and the pools it is compared with, so look
-                // from there next.
+                // Nothing left here. The pool at `plan.index` (the venue, or the plain limit
+                // end of an exchanged plan) has moved and may have opened a gap with the
+                // pools it is compared with, so look from there next.
                 if (next == book.length) break;
                 book = _book(book[next].id, book[next].partner, false);
                 next = book.length;
@@ -1399,7 +1466,7 @@ abstract contract ArbitrageLogic {
                 break;
             }
             if (resync == UNRELEASED) resync = _release(payer);
-            uint256 gained = _attempt(book[0].id, plan);
+            uint256 gained = _attempt(_limitEnd(book, plan), plan);
             if (gained == 0) {
                 failures++;
                 _fail(book, plan, payer);
@@ -1582,10 +1649,12 @@ abstract contract ArbitrageLogic {
     }
 
     /// @dev A swap's failed cycle is set aside. `arb` and `sweep` set nothing aside, so that
-    /// calling them cannot switch a pair off for swappers; the venue is passed over for the
-    /// rest of that search instead.
+    /// calling them cannot switch a pair off for swappers; the pool at `plan.index` is passed
+    /// over for the rest of that search instead. That is the venue in an ordinary plan and
+    /// the plain limit end in an exchanged one, whose venue is the wrapped start pool. The
+    /// pair is named limit end first either way, so both ends set it aside under one key.
     function _fail(Venue[] memory book, Plan memory plan, address payer) internal {
-        _bench(book[0].id, plan, payer != address(0));
+        _bench(_limitEnd(book, plan), plan, payer != address(0));
         if (payer == address(0)) book[plan.index].rate = 0;
     }
 
@@ -1641,7 +1710,7 @@ abstract contract ArbitrageLogic {
             address protocol = shareRecipient[home];
             // Checked for the whole profit before the try below, so that a drain is never
             // turned into a claim.
-            _funded(asset, profit);
+            _funded(asset, profit, true);
             if (protocol == address(core)) {
                 // Core cannot redeem a claim, so one minted to it would be stuck.
                 poolManager.take(asset, protocol, share);
@@ -1718,22 +1787,31 @@ abstract contract ArbitrageLogic {
     /// for, so an honest pool manager always has it. Only the profit token, SZR, ETH, WETH
     /// and the input token of a wrapped leg (see `_legLimit`) are ever asked about.
     function _take(Currency asset, address to, uint256 amount) internal {
-        _funded(asset, amount);
+        _funded(asset, amount, false);
         poolManager.take(asset, to, amount);
     }
 
-    function _funded(Currency asset, uint256 amount) internal view {
+    /// @dev At payout (`payout` true) a read that failed with at least half of its gas left
+    /// failed on purpose, as no call that ran out of gas leaves more than a 64th. That is
+    /// the named `Unsettled`, which undoes the search and lets the swap go on. Anywhere else,
+    /// and when little gas is left, the empty revert stays: it reads as too little gas.
+    function _funded(Currency asset, uint256 amount, bool payout) internal view {
         address id = Currency.unwrap(asset);
         uint256 held;
         if (id == address(0)) {
             held = address(poolManager).balance;
         } else {
-            // A failed read must not look like a shortage: it reverts empty, which reads as
-            // too little gas.
+            uint256 gas = gasleft();
             (bool ok, bytes memory data) =
                 id.staticcall(abi.encodeCall(IERC20Balance.balanceOf, (address(poolManager))));
-            if (!ok) revert();
-            if (data.length < 32) revert();
+            bool bad = !ok;
+            if (data.length < 32) bad = true;
+            if (bad) {
+                if (payout) {
+                    if (gasleft() >= gas / 2) revert Unsettled();
+                }
+                revert();
+            }
             held = abi.decode(data, (uint256));
         }
         if (held < amount) revert Drained();
@@ -2030,7 +2108,8 @@ abstract contract ArbitrageLogic {
     /// square-root gap. A leg that has moved that far has moved its price about twice the
     /// whole cycle's gap, so the optimum never reaches it. Without a limit a leg that cannot
     /// fill walks every empty bitmap word to the extreme price first, whatever the try's size.
-    /// A wrapped pool ignores price limits, so it keeps none (zero).
+    /// A wrapped pool ignores price limits, so it keeps none (zero). A wrapped pool is never
+    /// the first leg of a cycle (`_bestFromWrapped`), only a later one paid from a credit.
     /// @dev A wrapped pool's own hook takes the leg's input from the pool manager, where a
     /// failure would reach `_raiseDrained` wrapped and look like a failed cycle, benching it.
     /// So before such a leg the hook checks what it is owed in the input token: a positive
@@ -2048,7 +2127,7 @@ abstract contract ArbitrageLogic {
         if (pricers[address(pool.hooks)] != address(0)) {
             Currency asset = Currency.wrap(input);
             int256 credit = poolManager.currencyDelta(address(this), asset);
-            if (credit > 0) _funded(asset, uint256(credit));
+            if (credit > 0) _funded(asset, uint256(credit), false);
             return 0;
         }
         (uint160 price,,,) = poolManager.getSlot0(pool.toId());
@@ -2186,18 +2265,15 @@ abstract contract ArbitrageLogic {
             if (wraps) words[index] = _wrapped(ids[index], words[index]);
             _price(book[index], words[index], _twin(base));
         }
-        // A wrapped pool keeps no price of its own and ignores a price limit, so a search
-        // is never centred on one.
-        if (wraps) {
-            if (wrappers[poolId] != address(0)) book[0].rate = 0;
-        }
         if (!redeemable) return book;
         book[count].partner = backingAsset;
         _requote(book[count]);
     }
 
     /// @dev Which pools a search prices and the partner token of each: the pool itself,
-    /// the other leaders of its group, and the first leader of every other group.
+    /// the other leaders of its group, and the first leader of every other group. The pool
+    /// itself may be a wrapped pool; it is then the venue of every cycle and the other
+    /// pools carry the price limit (`_bestFromWrapped`).
     function _venues(bytes32 poolId, address partner)
         internal
         view
@@ -2435,6 +2511,10 @@ abstract contract ArbitrageLogic {
         // The pool searched is always the first entry.
         Venue memory own = book[0];
         if (own.rate == 0) return best;
+        // Only a market with a pricer has wrapped pools, so a plain one skips the read.
+        if (asking != 0) {
+            if (wrappers[own.id] != address(0)) return _bestFromWrapped(book);
+        }
         Focus memory focus;
         focus.id = own.id;
         focus.partner = own.partner;
@@ -2446,6 +2526,42 @@ abstract contract ArbitrageLogic {
         for (uint256 other = 1; other < book.length; other++) {
             _consider(best, focus, book[other], other);
         }
+    }
+
+    /// @dev A search that starts from a wrapped pool compares it with plain pools only, and
+    /// in each cycle the plain pool carries the price limit: the first trade of a cycle is
+    /// never in a wrapped pool, which ignores limits and whose input would be borrowed. So
+    /// the ends are exchanged: each other entry is the focus and the start pool is the
+    /// venue, with that entry's place as the plan's index. Passed over, never reverted on:
+    /// a wrapped entry, Core, an entry on the twin, and one with no price (it divides).
+    function _bestFromWrapped(Venue[] memory book) internal view returns (Plan memory best) {
+        Venue memory wrapped = book[0];
+        uint256 edge = markets[active].edge * EDGE_UNIT;
+        for (uint256 other = 1; other < book.length; other++) {
+            Venue memory end = book[other];
+            if (end.rate == 0) continue;
+            if (end.id == bytes32(0)) continue;
+            if (_onTwin(book, other)) continue;
+            if (wrappers[end.id] != address(0)) continue;
+            Focus memory focus;
+            focus.id = end.id;
+            focus.partner = end.partner;
+            focus.rate = end.rate;
+            focus.keep = end.keep;
+            focus.edge = edge;
+            // One venue is compared, so one route is ever kept.
+            focus.seen = new address[](1);
+            focus.routes = new Route[](1);
+            _consider(best, focus, wrapped, other);
+        }
+    }
+
+    /// @dev The pool a plan's first trade is in, the one that carries the price limit. An
+    /// ordinary plan's venue is never the start pool, so a plan whose venue is the start
+    /// pool is an exchanged one (`_bestFromWrapped`) and its limit end is at `plan.index`.
+    function _limitEnd(Venue[] memory book, Plan memory plan) internal pure returns (bytes32) {
+        if (plan.venue == book[0].id) return book[plan.index].id;
+        return book[0].id;
     }
 
     function _consider(Plan memory best, Focus memory focus, Venue memory venue, uint256 index)

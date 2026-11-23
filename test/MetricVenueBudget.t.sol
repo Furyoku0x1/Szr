@@ -68,7 +68,10 @@ contract MetricVenueBudgetTest is MarketsWorld {
         meter = MeterHook(address(uint160(0x5555 << 144 | 1 << 7)));
         deployCodeTo("MetricVenueBudget.t.sol:MeterHook", abi.encode(hook), address(meter));
         hook.setPricer(address(meter), address(new NoPricer()));
-        meterKey = _pair(address(backing), address(coin), 100, address(meter));
+        // The pool holds USD, not WETH, which the trigger counts in: a swap in a wrapped pool
+        // that held WETH would be searched once, from the pool itself (part B of
+        // `docs/specs/hook-wrapped-start.md`), and this test is about one search per group.
+        meterKey = _pair(address(usd), address(coin), 100, address(meter));
         manager.initialize(meterKey, uint160(1 << 96));
         vm.prank(team);
         hook.setLimits(id, address(backing), 0, 1e15, 1.0001e18);
@@ -113,7 +116,7 @@ contract MetricVenueBudgetTest is MarketsWorld {
     }
 
     function _meterSwap() internal returns (uint256) {
-        bool zeroForOne = Currency.unwrap(meterKey.currency0) == address(backing);
+        bool zeroForOne = Currency.unwrap(meterKey.currency0) == address(usd);
         PoolSwapTest.TestSettings memory settings;
         swapper.swap(
             meterKey,

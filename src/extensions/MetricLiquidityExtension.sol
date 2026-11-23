@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import { SafeCastLib } from "solady/utils/SafeCastLib.sol";
 import { FixedPointMathLib } from "solady/utils/FixedPointMathLib.sol";
 import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
 import { IMetricFactory } from "../interfaces/metric/IMetricFactory.sol";
@@ -42,10 +41,10 @@ contract MetricLiquidityExtension is
 
     /// @dev What a position cost and returned, in token units, as the events report it.
     struct Ledger {
-        uint128 in0;
-        uint128 in1;
-        uint128 out0;
-        uint128 out1;
+        uint256 in0;
+        uint256 in1;
+        uint256 out0;
+        uint256 out1;
     }
 
     uint256 internal constant BINS_SLOT = 4;
@@ -114,8 +113,8 @@ contract MetricLiquidityExtension is
         if (paid0 > max0) revert AboveMaximum();
         if (paid1 > max1) revert AboveMaximum();
         Ledger storage book = ledger[pool][salt];
-        book.in0 += SafeCastLib.toUint128(paid0);
-        book.in1 += SafeCastLib.toUint128(paid1);
+        book.in0 += paid0;
+        book.in1 += paid1;
         emit MetricAdded(pool, salt, paid0, paid1);
     }
 
@@ -135,8 +134,8 @@ contract MetricLiquidityExtension is
         if (got0 < min0) revert BelowMinimum();
         if (got1 < min1) revert BelowMinimum();
         Ledger storage book = ledger[pool][salt];
-        book.out0 += SafeCastLib.toUint128(got0);
-        book.out1 += SafeCastLib.toUint128(got1);
+        book.out0 += got0;
+        book.out1 += got1;
         emit MetricRemoved(pool, salt, got0, got1);
     }
 

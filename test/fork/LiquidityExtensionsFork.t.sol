@@ -156,7 +156,7 @@ contract LiquidityExtensionsForkTest is Test {
         vm.prank(manager);
         (uint256 got0, uint256 got1) =
             ext.removeLiquidity(address(POOL), 3, _bins(), _shares(), 0, 0, block.timestamp);
-        (uint128 in0, uint128 in1, uint128 out0, uint128 out1) = ext.ledger(address(POOL), 3);
+        (uint256 in0, uint256 in1, uint256 out0, uint256 out1) = ext.ledger(address(POOL), 3);
         assertEq(in0, paid0, "in0");
         assertEq(in1, paid1, "in1");
         assertEq(out0, got0, "out0");

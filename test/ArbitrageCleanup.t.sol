@@ -86,6 +86,29 @@ contract ArbitrageCleanupTest is WrapWorld {
         assertTrue(hook.tracked(1, _id(locker.key(position))), "tracked with a pricer");
     }
 
+    /// Listing a wrapped pool through `track` grows what a swap must bring, so it is refused
+    /// once SZR's market, which is on, would pass the ceiling (`_wrap` checks it).
+    function testTrackRefusesAWrappedPoolPastTheSwapCeiling() public {
+        WrappedPool foreign =
+            WrappedPool(payable(address(uint160(0xBEEF << 24 | 1 << 7 | 1 << 3))));
+        deployCodeTo("WrappedPool.sol:WrappedPool", abi.encode(manager), address(foreign));
+        TestAsset other = new TestAsset();
+        _approve(other);
+        Liquidity.PoolConfig memory config = _config();
+        config.partner = address(other);
+        config.hooks = IHooks(address(foreign));
+        uint256 position =
+            locker.addPool(config, FeeCollector.AssetConfig(1e18, 20_000e18, 1e12));
+        hook.setPricer(address(foreign), address(new WrappedPricer(foreign)));
+        hook.setLimits(1, address(szr), 100_000_000, 10e18, 1.0001e18);
+        hook.setSwapGasCeiling(hook.gasForSwap(1));
+        vm.expectRevert(ArbitrageLogic.InvalidLimit.selector);
+        hook.track(position);
+        hook.setSwapGasCeiling(type(uint256).max);
+        hook.track(position);
+        assertTrue(hook.tracked(1, _id(locker.key(position))), "tracked under the ceiling");
+    }
+
     // ----- A3: who may receive a profit token's share -----
 
     /// Core can only count WETH, so any other token sent to it would be locked. ETH is paid

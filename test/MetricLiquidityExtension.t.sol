@@ -30,6 +30,8 @@ contract SwapPool is MockLiquidityPool {
     // Asks for one unit of the output token in the callback, and reports more output than sent.
     bool public askOutput;
     bool public overReport;
+    // Extra token0 sent and reported on every removal, to push a running total past 2^128.
+    uint256 public bigOut;
     // Another pool to call the extension back during a swap.
     SwapPool public poke;
 
@@ -81,7 +83,13 @@ contract SwapPool is MockLiquidityPool {
         bytes calldata extensionData
     ) public override returns (uint256, uint256) {
         _payBonus(msg.sender);
-        return super.removeLiquidity(owner, salt, deltas, extensionData);
+        (uint256 one, uint256 two) = super.removeLiquidity(owner, salt, deltas, extensionData);
+        if (bigOut != 0) SafeTransferLib.safeTransfer(token0, msg.sender, bigOut);
+        return (one + bigOut, two);
+    }
+
+    function setBigOut(uint256 amount) external {
+        bigOut = amount;
     }
 
     function setOverAsk(uint256 extra) external {
@@ -509,7 +517,7 @@ contract MetricLiquidityExtensionTest is MetricExtensionWorld {
     }
 
     function _book(uint80 salt) internal view returns (uint256[4] memory out) {
-        (uint128 in0, uint128 in1, uint128 out0, uint128 out1) =
+        (uint256 in0, uint256 in1, uint256 out0, uint256 out1) =
             mext.ledger(address(pool), salt);
         out = [uint256(in0), in1, out0, out1];
     }
@@ -533,6 +541,21 @@ contract MetricLiquidityExtensionTest is MetricExtensionWorld {
         book = _book(1);
         assertEq(book[0], paid0 + more0, "in adds up");
         assertEq(book[1], paid1 + more1);
+    }
+
+    function testLedgerHoldsTotalsPastTwoToThe128() public {
+        _add();
+        uint256 big = uint256(1) << 127;
+        t0.mint(address(pool), 2 * big);
+        pool.setBigOut(big);
+        (uint256 first,) = mext.removeLiquidity(
+            address(pool), 1, _bins(), _shares(1e17), 0, 0, block.timestamp
+        );
+        (uint256 second,) = mext.removeLiquidity(
+            address(pool), 1, _bins(), _shares(1e17), 0, 0, block.timestamp
+        );
+        assertGt(first + second, type(uint128).max, "past the old counter");
+        assertEq(_book(1)[2], first + second, "out0 is the sum");
     }
 
     function testTwoSaltsKeepSeparateLedgers() public {
