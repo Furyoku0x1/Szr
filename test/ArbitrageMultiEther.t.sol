@@ -29,6 +29,7 @@ contract ArbitrageMultiEtherTest is WrapWorld {
     function _books(PoolKey memory pool) internal returns (address[] memory bases) {
         ArbitrageProbe probe = _probeInHook();
         (, bases,) = probe.centresOf(id, _id(pool), pool);
+        assertTrue(probe.centresAgree(id, _id(pool), pool), "the same books as before");
     }
 
     /// A pool of ETH and WETH opens no book, in either token.

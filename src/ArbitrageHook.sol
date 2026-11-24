@@ -53,7 +53,9 @@ import { SizerPart } from "./arbitrage/ArbitrageSizer.sol";
 /// short before a later swap. Such a swap must pay first or be split. In that state more
 /// gas can fail a swap that less gas passes, because a search with more gas reaches a
 /// further cycle that meets the shortage. So "more gas never makes a swap fail" holds when
-/// nothing earlier in the unlock is unpaid.
+/// nothing earlier in the unlock is unpaid. It holds for each hooked swap, not for a whole
+/// transaction: a transaction with several hooked swaps spends its gas across their searches,
+/// and the rule is promised only for ordinary pools.
 /// v4 skips hook callbacks for the hook's own swaps.
 /// @dev The code is split over this contract and four modules, so that each fits the
 /// 24,576 bytes many chains allow. This contract holds all the state and the address the pool
@@ -123,11 +125,9 @@ contract ArbitrageHook is EntryPart {
     function _moduleFor(bytes4 sig) internal view returns (address) {
         if (sig == SearchPart.search.selector) return searchModule;
         if (sig == SearchManyPart.searchMany.selector) return manyModule;
-        if (sig == SearchPart.arb.selector) return searchModule;
-        if (sig == SearchPart.sweep.selector) return searchModule;
         if (sig == SearchPart.unlockCallback.selector) return searchModule;
-        if (sig == SearchPart.askFrame.selector) return searchModule;
         if (sig == CyclePart.execute.selector) return cycleModule;
+        if (sig == CyclePart.retire.selector) return cycleModule;
         if (sig == SizerPart.size.selector) return sizerModule;
         return adminModule;
     }

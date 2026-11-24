@@ -112,6 +112,34 @@ contract ArbitrageGasTest is ArbitrageWorld {
         assertLt(best, allowance * venues, "ranking within its allowance");
     }
 
+    /// With the searched pool emptied, every venue takes the stand-in branch of `_consider`
+    /// (the rest of the cycle's depth is read for each), which is the most ranking costs.
+    /// It must still fit the allowance the floors were built on (docs/specs/hook-hole-edge.md).
+    function testScanCostStaysWithinItsAllowanceWithTheFocusEmptied() public {
+        PoolKey memory last = _fillGroups();
+        _trade(last, address(szr), 3_000e18);
+        provider.modifyLiquidity(
+            last,
+            IPoolManager.ModifyLiquidityParams(
+                TickMath.minUsableTick(60), TickMath.maxUsableTick(60), -int256(poolUnits), 0
+            ),
+            ""
+        );
+        deployCodeTo("ArbitrageProbe.sol:ArbitrageProbe", abi.encode(locker), address(hook));
+        vm.cool(address(manager));
+        vm.cool(address(hook));
+        vm.cool(address(core));
+        ArbitrageProbe probe = ArbitrageProbe(payable(address(hook)));
+        (, uint256 best, uint256 venues, uint256 allowance,) = probe.scanCost(_id(last));
+        assertEq(venues, 11, "the most venues");
+        assertLt(best, allowance * venues, "ranking within its allowance");
+        emit log_named_uint("ranking with the focus emptied", best);
+        emit log_named_uint("its allowance", allowance * venues);
+        assertTrue(
+            probe.planFrom(_id(last), _partnerOf(last)).standin, "on the stand-in branch"
+        );
+    }
+
     /// A pool that leads nothing in a full group prices one venue more than a leader does,
     /// which is the most there can be.
     function testScanCostStaysWithinItsAllowanceForAPoolThatDoesNotLead() public {
@@ -192,8 +220,9 @@ contract ArbitrageGasTest is ArbitrageWorld {
         _addHooked(address(usd), 100);
         uint256 few = _noGapCost();
         assertLt(few, 420_000, "six pools, all leaders");
-        // The limit the drained-pool guard was held to, enforced from here on.
-        assertLe(few, 252_000, "six pools, no gap, gas");
+        // The figure after the gas audit (docs/specs/hook-gas-2026-11-23.md), 245,150, and the
+        // same small margin as before: 211 gas. It was 252,000 before the audit.
+        assertLe(few, 245_361, "six pools, no gap, gas");
         emit log_named_uint("no-gap swap gas, six pools", few);
         poolUnits = 1_000e18;
         for (uint256 index; index < 60; index++) {
@@ -467,9 +496,11 @@ contract ArbitrageGasTest is ArbitrageWorld {
         revert("no try");
     }
 
-    /// One transaction that swaps through two hooked pools runs four searches. With gaps
-    /// open on both, more gas must never make it fail.
-    function testMoreGasNeverMakesTwoHookedSwapsFail() public {
+    /// One transaction that swaps through two hooked pools runs four searches. The promise
+    /// that more gas never makes a swap fail is per hooked swap, not per transaction. With
+    /// gaps open on both of these ordinary pools it happens to be monotonic here, which is
+    /// what this shows; it is not promised in general.
+    function testMoreGasMayFailOneOfTwoHookedSwapsButNotInOrdinaryPools() public {
         PoolKey memory wethPool = _addHooked(address(backing), 500);
         hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);

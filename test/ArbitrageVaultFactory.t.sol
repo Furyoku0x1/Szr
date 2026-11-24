@@ -8,6 +8,7 @@ import { MockLiquidityPool } from "./utils/metric/MockLiquidityPool.sol";
 import { ArbitrageVaultFactory } from "../src/factories/ArbitrageVaultFactory.sol";
 import { ArbitrageVault } from "../src/vaults/ArbitrageVault.sol";
 import { MetricVault } from "../src/vaults/MetricVault.sol";
+import { IHookVault } from "../src/interfaces/IHookVault.sol";
 import { MarketController } from "../src/vaults/MarketController.sol";
 import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
@@ -115,6 +116,45 @@ contract ArbitrageVaultFactoryTest is MarketsWorld {
         assertEq(address(MetricVault(loose).pool()), address(metricPool));
         assertEq(factory.vaultCount(), 2);
         assertTrue(factory.isVault(loose));
+    }
+
+    /// The deployer stores the vault's creation code and creates from it, so a vault it
+    /// makes must run exactly the code a direct deployment with the same arguments does.
+    function testTheMetricDeployerMakesTheSameRuntimeCodeAsADirectDeployment() public {
+        address made = _controller();
+        vm.prank(curator);
+        address viaFactory = factory.createMetricVault(made, address(metricPool), 500, stranger);
+        bytes memory args = abi.encode(
+            address(metricFactory), address(metricPool), made, uint16(500), stranger
+        );
+        address direct = deployCode("MetricVault.sol:MetricVault", args);
+        assertGt(viaFactory.code.length, 0, "deployed");
+        assertEq(keccak256(viaFactory.code), keccak256(direct.code), "same runtime code");
+    }
+
+    /// A vault that refuses its arguments says why, through the deployer and the factory.
+    function testBothDeployersBubbleTheVaultsOwnError() public {
+        address made = _controller();
+        vm.prank(curator);
+        vm.expectRevert(IHookVault.InvalidFee.selector);
+        factory.createArbitrageVault(made, first, 2_001);
+        vm.prank(curator);
+        vm.expectRevert(IHookVault.InvalidFee.selector);
+        factory.createMetricVault(made, address(metricPool), 2_001, stranger);
+    }
+
+    /// Depositors compare the deployers' `codeHash` with the code they audited.
+    function testCodeHashIsTheKeccakOfEachVaultsCreationCode() public {
+        assertEq(
+            factory.arbitrageDeployer().codeHash(),
+            keccak256(vm.getCode("ArbitrageVault.sol:ArbitrageVault")),
+            "arbitrage"
+        );
+        assertEq(
+            factory.metricDeployer().codeHash(),
+            keccak256(vm.getCode("MetricVault.sol:MetricVault")),
+            "metric"
+        );
     }
 
     function testEventsNameWhatWasMade() public {

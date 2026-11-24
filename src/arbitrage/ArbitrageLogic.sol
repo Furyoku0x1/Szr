@@ -36,9 +36,13 @@ interface IERC20Balance {
     function balanceOf(address account) external view returns (uint256);
 }
 
+/// @dev `SZR_MARKET`, readable without a call to the hook by contracts that only name it.
+uint256 constant SZR_MARKET_ID = 1;
+
 /// @dev What the hook calls on itself. Each call is a real call back into the hook, so its gas
 /// cap and its revert frame hold, and its `fallback` sends it on to the module that has the
-/// code. Declared here because the logic contract has none of these functions.
+/// code. Declared here because the logic contract has none of these functions. `askFrame` is
+/// the exception: the hook runs it itself, so its self-call has no hop to a module.
 interface IArbitrageSelf {
     function search(
         bytes32 poolId,
@@ -70,6 +74,8 @@ interface IArbitrageSelf {
         returns (uint160 limit, uint256 spend, bool declined, bool short);
 
     function askFrame(address pricer, bytes32 poolId) external;
+
+    function retire(uint256 profit) external;
 }
 
 /// @notice Everything the arbitrage hook is made of except its entry points: the constants, the
@@ -79,10 +85,6 @@ interface IArbitrageSelf {
 /// limit that many chains have. The hook keeps the state and reaches the modules by
 /// delegatecall; see `docs/specs/hook-split.md`.
 abstract contract ArbitrageLogic {
-    using StateLibrary for IPoolManager;
-    using TransientStateLibrary for IPoolManager;
-    using PoolIdLibrary for PoolKey;
-    using CurrencyLibrary for Currency;
     using StateLibrary for IPoolManager;
     using TransientStateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
@@ -177,6 +179,11 @@ abstract contract ArbitrageLogic {
     /// @dev How far above the smallest profit a cycle's estimate must be to be tried, in
     /// percent.
     uint256 internal constant PLAN_MARGIN = 125;
+    /// @dev A stand-in plan is made only for a focus pool with less than one in this many
+    /// of the rest of the cycle's depth. Pools of ordinary depth stay clear of it: at
+    /// a tenth, the real estimate is at least an eleventh of the stand-in's, so only a gap
+    /// worth under about eleven times the gate can hide.
+    uint256 internal constant STANDIN_RATIO = 10;
     /// @dev A square-root price gap beyond this (a 16x price difference) is a broken or
     /// manipulated venue, not something to arbitrage.
     uint256 internal constant MAX_EDGE = 4e18;
@@ -197,7 +204,13 @@ abstract contract ArbitrageLogic {
     uint256 internal constant Q96 = 1 << 96;
     uint256 internal constant Q192 = 1 << 192;
     address internal constant UNRELEASED = address(1);
-    /// @dev Where remembered venues are kept in transient storage, four words each.
+    /// @dev While a sweep or a trigger runs its heads, `REUSE_SLOT` is set, and `ANSWERED_SLOT`
+    /// holds the market whose pricers the run has asked, or zero.
+    uint256 internal constant REUSE_SLOT = uint256(keccak256("ArbitrageHook.reuse"));
+    uint256 internal constant ANSWERED_SLOT = uint256(keccak256("ArbitrageHook.answered"));
+    /// @dev Where a swap's books are kept for the search after it (see `_keepCentres`).
+    uint256 internal constant CENTRES_SLOT = uint256(keccak256("ArbitrageHook.centres"));
+    /// @dev Where remembered venues are kept in transient storage, three words each.
     uint256 internal constant REMEMBER_SLOT = uint256(keccak256("ArbitrageHook.remembered"));
     /// @dev Where, in transient storage, a search over several books keeps what each book
     /// has earned and not yet been paid out, per token (`_credited`).
@@ -271,6 +284,8 @@ abstract contract ArbitrageLogic {
         address[] seen;
         Route[] routes;
         uint256 known;
+        // Whether the search started from this pool, the only one a stand-in is made for.
+        bool start;
     }
 
     /// @dev `gap` is how far apart the prices were, beyond fees, when the cycle failed.
@@ -356,6 +371,8 @@ abstract contract ArbitrageLogic {
         uint256 fullSpend;
         bool buying;
         uint256 score;
+        // A plan made against an empty focus pool, sized by the rest of the cycle alone.
+        bool standin;
     }
 
     /// @dev The books a swap opens (`_centres`): where each is centred, its token, and its
@@ -443,7 +460,7 @@ abstract contract ArbitrageLogic {
 
     /// @notice SZR's own market, the first one. Its profit token is always SZR, it alone
     /// has Core redemption as a venue, and it retires its profit instead of paying it out.
-    uint256 public constant SZR_MARKET = 1;
+    uint256 public constant SZR_MARKET = SZR_MARKET_ID;
     /// @notice The share of every other market's profit that goes to the protocol, in
     /// percent. The rest goes to the market's own recipient, in the same token.
     uint256 public constant PROTOCOL_SHARE = 30;
@@ -959,6 +976,7 @@ abstract contract ArbitrageLogic {
         _begin(active);
         (uint256 book, uint256 scan,) =
             _reserves(_venueCount(active, home), asking, _listed(active, asking));
+        _reuseAnswers(true);
         for (uint256 index; index < list.length; index++) {
             bytes32 head = heads[active][home][list[index]];
             if (gasleft() < book + scan) {
@@ -968,6 +986,13 @@ abstract contract ArbitrageLogic {
             _begin(active);
             profit += _search(head, list[index], true, false, address(0));
         }
+        _reuseAnswers(false);
+    }
+
+    /// @dev Starts or ends a run of heads that share the pricers' answers.
+    function _reuseAnswers(bool on) internal {
+        _keepInMind(ANSWERED_SLOT, 0);
+        _keepInMind(REUSE_SLOT, on ? 1 : 0);
     }
 
     /// @dev One trigger: a search centred on each group's first leader, or, when the swapped
@@ -993,13 +1018,15 @@ abstract contract ArbitrageLogic {
         // with the plain pools of every group (`_bestFromWrapped`).
         address mine = _wrappedPartner(entry.market, poolId, entry.base);
         uint256 length = mine == address(0) ? list.length : 1;
+        _reuseAnswers(true);
         for (uint256 index; index < length; index++) {
             uint256 left = _budgetLeft(cap, start, needed);
             if (left < needed) {
                 emit VenueSearchSkipped(poolId, entry.market, before);
-                return;
+                break;
             }
             remembered = bytes32(0);
+            _forgetCentres();
             if (mine == address(0)) {
                 _attemptHead(
                     entry.market, entry.base, list[index], bytes32(0), before, sender, left
@@ -1008,6 +1035,7 @@ abstract contract ArbitrageLogic {
                 _attemptHead(entry.market, entry.base, mine, poolId, before, sender, left);
             }
         }
+        _reuseAnswers(false);
     }
 
     /// @dev The other token of a swapped wrapped pool of the market that holds `base`; zero
@@ -1108,13 +1136,59 @@ abstract contract ArbitrageLogic {
         bool before,
         address sender
     ) internal {
-        Centres memory found = _centres(id, poolId, pool);
+        // The search after the swap uses the books the one before it listed, unless the
+        // pool's books changed in between, which nothing can do while a swap is running.
+        Centres memory found;
+        if (before) {
+            found = _centres(id, poolId, pool);
+        } else {
+            found = _recallCentres(poolId);
+            if (found.count == 0) found = _centres(id, poolId, pool);
+        }
+        if (before) _forgetCentres();
         if (found.count == 0) return;
         if (found.count == 1) {
-            return
-                _guard(found.centres[0], id, found.bases[0], found.partners[0], before, sender);
+            _guard(found.centres[0], id, found.bases[0], found.partners[0], before, sender);
+        } else {
+            _guardMany(poolId, id, found.centres, found.bases, found.partners, before, sender);
         }
-        _guardMany(poolId, id, found.centres, found.bases, found.partners, before, sender);
+        if (before) _keepCentres(poolId, found);
+    }
+
+    /// @dev Where a swap's books are kept in transient storage for the search after it: the
+    /// pool they are for (zero when none), their number, and three words per book.
+    /// Cleared wherever `remembered` is, by `_forgetCentres`.
+    function _keepCentres(bytes32 poolId, Centres memory found) internal {
+        uint256 slot = CENTRES_SLOT;
+        _keepInMind(slot + 1, found.count);
+        for (uint256 index; index < found.count; index++) {
+            _keepInMind(slot + 2 + index * 3, uint256(found.centres[index]));
+            _keepInMind(slot + 3 + index * 3, uint256(uint160(found.bases[index])));
+            _keepInMind(slot + 4 + index * 3, uint256(uint160(found.partners[index])));
+        }
+        _keepInMind(slot, uint256(poolId));
+    }
+
+    function _forgetCentres() internal {
+        _keepInMind(CENTRES_SLOT, 0);
+    }
+
+    /// @dev The books kept for `poolId`, taken out of storage so they are used once; empty
+    /// (no centres array) when none are kept for it.
+    function _recallCentres(bytes32 poolId) internal returns (Centres memory found) {
+        uint256 slot = CENTRES_SLOT;
+        if (_recall(slot) != uint256(poolId)) return found;
+        _forgetCentres();
+        uint256 count = _recall(slot + 1);
+        found.centres = new bytes32[](count);
+        found.bases = new address[](count);
+        found.partners = new address[](count);
+        found.count = count;
+        for (uint256 index; index < count; index++) {
+            found.centres[index] = bytes32(_recall(slot + 2 + index * 3));
+            found.bases[index] = address(uint160(_recall(slot + 3 + index * 3)));
+            found.partners[index] = address(uint160(_recall(slot + 4 + index * 3)));
+        }
     }
 
     /// @dev Where each of a swap's books is centred. For a token the pool holds, on the pool
@@ -1130,12 +1204,24 @@ abstract contract ArbitrageLogic {
         view
         returns (Centres memory found)
     {
-        uint256 length = chosen[id].length;
+        address[] storage list = chosen[id];
+        uint256 length = list.length;
         found.centres = new bytes32[](length);
         found.bases = new address[](length);
         found.partners = new address[](length);
-        _addCentres(id, poolId, pool, true, found);
-        _addCentres(id, poolId, pool, false, found);
+        // Each token's centre is read once, and both passes below sort the same answers.
+        address[] memory tokens = new address[](length);
+        bytes32[] memory spots = new bytes32[](length);
+        address[] memory others = new address[](length);
+        for (uint256 index; index < length; index++) {
+            address base = list[index];
+            tokens[index] = base;
+            // A chosen token always has a rank, so only its approval needs reading.
+            if (shareRecipient[base] == address(0)) continue;
+            (spots[index], others[index]) = _centreFor(id, base, poolId, pool);
+        }
+        _addCentres(poolId, tokens, spots, others, true, found);
+        _addCentres(poolId, tokens, spots, others, false, found);
         bytes32[] memory centres = found.centres;
         address[] memory bases = found.bases;
         address[] memory partners = found.partners;
@@ -1147,31 +1233,30 @@ abstract contract ArbitrageLogic {
         }
     }
 
-    /// @dev Adds the books centred on the pool itself (`own`) or on a leader.
+    /// @dev Adds the books centred on the pool itself (`own`) or on a leader, from the
+    /// centres `_centres` read.
     function _addCentres(
-        uint256 id,
         bytes32 poolId,
-        PoolKey calldata pool,
+        address[] memory tokens,
+        bytes32[] memory spots,
+        address[] memory others,
         bool own,
         Centres memory found
     ) internal view {
-        address[] storage list = chosen[id];
-        for (uint256 index; index < list.length; index++) {
-            address base = list[index];
-            // A chosen token always has a rank, so only its approval needs reading.
-            if (shareRecipient[base] == address(0)) continue;
+        for (uint256 index; index < tokens.length; index++) {
+            bytes32 centre = spots[index];
+            if (centre == bytes32(0)) continue;
+            address base = tokens[index];
             if (_isEther(base)) {
                 if (found.sawEther) continue;
             }
-            (bytes32 centre, address partner) = _centreFor(id, base, poolId, pool);
-            if (centre == bytes32(0)) continue;
             bool onPool = centre == poolId;
             if (onPool != own) continue;
             if (_isEther(base)) found.sawEther = true;
             uint256 count = found.count;
             found.centres[count] = centre;
             found.bases[count] = base;
-            found.partners[count] = partner;
+            found.partners[count] = others[index];
             found.count = count + 1;
         }
     }
@@ -1333,8 +1418,7 @@ abstract contract ArbitrageLogic {
             home = run.bases[index];
             Plan memory plan = _best(run.books[index]);
             if (plan.score == 0) continue;
-            bool wider = best.score == 0 ? true : plan.gap > best.gap;
-            if (!wider) continue;
+            if (!_wider(best, plan)) continue;
             best = plan;
             pick = index;
         }
@@ -1426,10 +1510,11 @@ abstract contract ArbitrageLogic {
     /// otherwise it reverts with `Starved`, which fails the swap.
     /// @dev `before` marks the search that runs ahead of a swap. Once it has earned
     /// something it only goes on while enough gas would be left for the swap and for the
-    /// search after it, so that giving a swap more gas can never make it fail. Until a cycle
-    /// has worked in full, three have failed or worked in part, or a round has found nothing
-    /// left, every stop for gas fails the swap instead (`_required`). The empty round ends
-    /// that rule before the follow, whose read is not in the reserve.
+    /// search after it, so that giving a swap more gas can never make it fail. That holds
+    /// for one hooked swap, not for a transaction of several, and for ordinary pools. Until
+    /// a cycle has worked in full, three have failed or worked in part, or a round has found
+    /// nothing left, every stop for gas fails the swap instead (`_required`). The empty
+    /// round ends that rule before the follow, whose read is not in the reserve.
     /// @dev `payer` is whoever is swapping (zero for `arb` and `sweep`). If they have marked
     /// a token as synced with the pool manager, that is dealt with before the first cycle;
     /// see `_release`.
@@ -1505,7 +1590,7 @@ abstract contract ArbitrageLogic {
     /// @dev Pays out what a search earned, then marks the swapper's token again if the
     /// search had to clear it.
     function _settle(uint256 profit, address resync) internal returns (uint256) {
-        _retire(profit);
+        IArbitrageSelf(address(this)).retire(profit);
         _resync(resync);
         return profit;
     }
@@ -1539,11 +1624,12 @@ abstract contract ArbitrageLogic {
         focus.twins = head >> 128;
         _requote(focus);
         for (uint256 index = 1; index < book.length; index++) {
-            slot += 4;
+            slot += 3;
             book[index].id = bytes32(_recall(slot));
             book[index].partner = address(uint160(_recall(slot + 1)));
-            book[index].rate = _recall(slot + 2);
-            book[index].keep = _recall(slot + 3);
+            uint256 priced = _recall(slot + 2);
+            book[index].rate = uint192(priced);
+            book[index].keep = priced >> 192;
         }
     }
 
@@ -1558,11 +1644,12 @@ abstract contract ArbitrageLogic {
         Venue memory focus = book[0];
         _keepInMind(slot, book.length | focus.twins << 128);
         for (uint256 index = 1; index < book.length; index++) {
-            slot += 4;
+            slot += 3;
             _keepInMind(slot, uint256(book[index].id));
             _keepInMind(slot + 1, uint256(uint160(book[index].partner)));
-            _keepInMind(slot + 2, book[index].rate);
-            _keepInMind(slot + 3, book[index].keep);
+            // A rate is at most `MAX_RATE` (2^152) and a keep at most `WAD` (under 2^60), so
+            // both fit one word.
+            _keepInMind(slot + 2, book[index].rate | book[index].keep << 192);
         }
         remembered = focus.id;
     }
@@ -1697,7 +1784,7 @@ abstract contract ArbitrageLogic {
         emit CycleFailed(poolId, plan.venue);
         if (!aside) return;
         benched[_pair(active, home, poolId, plan.venue, plan.buying)] =
-            Bench(uint64(block.timestamp + BENCH_TIME), uint192(plan.gap));
+            Bench(uint64(block.timestamp + BENCH_TIME), plan.standin ? 0 : uint192(plan.gap));
     }
 
     function _traded(address asset) internal view returns (bool) {
@@ -1718,70 +1805,6 @@ abstract contract ArbitrageLogic {
     function _listedAtStart(uint256 round) internal view returns (bool) {
         if (round != 0) return true;
         return _listed();
-    }
-
-    /// @dev SZR's market retires its profit at Core. Every other market's is paid out.
-    function _retire(uint256 profit) internal {
-        if (active != SZR_MARKET) return _payOut(profit);
-        _take(Currency.wrap(token), address(this), profit);
-        _requireSettled(token);
-        core.donateSzr(profit);
-    }
-
-    /// @dev Splits a market's profit between the protocol and the market, in the token it
-    /// was counted in. If the protocol's recipient cannot receive the token (a blocklist, for
-    /// instance), its share is minted as a pool-manager claim instead, so one recipient cannot
-    /// stop every market counting in that token. The recipient redeems a claim by calling
-    /// `unlock` on the pool manager and, inside it, `burn` then `take`, or by transferring
-    /// the claim to something that can. The market's own share has no such fallback, and
-    /// neither does a share owed to Core, which could never redeem the claim.
-    function _payOut(uint256 profit) internal {
-        // Rounded up, so that no profit is too small for the protocol to share in.
-        uint256 share = (profit * PROTOCOL_SHARE + 99) / 100;
-        if (home == address(0)) {
-            _payNative(profit, share);
-        } else {
-            Currency asset = Currency.wrap(home);
-            address protocol = shareRecipient[home];
-            // Checked for the whole profit before the try below, so that a drain is never
-            // turned into a claim.
-            _funded(asset, profit, true);
-            if (protocol == address(core)) {
-                // Core cannot redeem a claim, so one minted to it would be stuck.
-                poolManager.take(asset, protocol, share);
-            } else {
-                try poolManager.take(asset, protocol, share) { }
-                catch {
-                    poolManager.mint(protocol, asset.toId(), share);
-                    emit ShareHeld(home, protocol, share);
-                }
-            }
-            // Some tokens refuse a transfer of nothing.
-            if (profit != share) {
-                poolManager.take(asset, markets[active].recipient, profit - share);
-            }
-        }
-        _requireSettled(home);
-        emit ProfitPaid(active, home, profit, share);
-    }
-
-    /// @dev Native ETH profit leaves only as WETH, so no recipient's code runs in the middle
-    /// of a search. Unlike `_payOut` it has no claim fallback: the ETH is already taken by the
-    /// hook, so none can be minted. WETH has no blocklist in its current implementation, but
-    /// it is an upgradeable proxy, so that is not a promise.
-    function _payNative(uint256 profit, uint256 share) internal {
-        _take(Currency.wrap(address(0)), address(this), profit);
-        // A failed wrap is a named error: an empty revert would be read as too little gas.
-        try IWrapped(backingAsset).deposit{ value: profit }() { }
-        catch {
-            revert Unsettled();
-        }
-        SafeTransferLib.safeTransfer(backingAsset, shareRecipient[address(0)], share);
-        if (profit != share) {
-            SafeTransferLib.safeTransfer(
-                backingAsset, markets[active].recipient, profit - share
-            );
-        }
     }
 
     function _isEther(address asset) internal view returns (bool) {
@@ -1903,6 +1926,7 @@ abstract contract ArbitrageLogic {
         for (uint256 number; number < TRIES; number++) {
             if (budget < ATTEMPT_GAS) break;
             if (number == 1) {
+                if (_repeats(plan)) continue;
                 plan.limit = plan.full;
                 plan.spend = plan.fullSpend;
             }
@@ -1944,6 +1968,14 @@ abstract contract ArbitrageLogic {
             }
         }
         return (0, false);
+    }
+
+    /// @dev A stand-in whose walk found no size already tries the whole gap at its first
+    /// size, so the second size would repeat it.
+    function _repeats(Plan memory plan) internal pure returns (bool) {
+        if (!plan.standin) return false;
+        if (plan.limit != plan.full) return false;
+        return plan.spend == plan.fullSpend;
     }
 
     /// @dev The first try's size, from `size`. Its gas comes out of the budget, not out of
@@ -2421,13 +2453,21 @@ abstract contract ArbitrageLogic {
     /// not the gas to ask, which is no reason to undo what the cycle earned.
     function _reprice(Venue[] memory book, Plan memory plan) internal returns (bool) {
         if (asking != 0) {
-            if (!_refresh(plan.venue)) return false;
-            if (!_refresh(plan.links[0])) return false;
-            if (!_refresh(plan.links[1])) return false;
+            if (!_refreshed(plan)) {
+                // A pool this cycle traded is stale in the cache: no later head may use it.
+                _keepInMind(ANSWERED_SLOT, 0);
+                return false;
+            }
         }
         _requote(book[0]);
         _requoteAt(book, plan.index);
         return true;
+    }
+
+    function _refreshed(Plan memory plan) internal returns (bool) {
+        if (!_refresh(plan.venue)) return false;
+        if (!_refresh(plan.links[0])) return false;
+        return _refresh(plan.links[1]);
     }
 
     /// @dev A pool's price and fee in the form of the first storage word of a v4 pool. For
@@ -2465,6 +2505,17 @@ abstract contract ArbitrageLogic {
     /// number. Anything it cannot afford to ask fails the search `Starved`, so that a swap
     /// that brought too little gas fails as `InsufficientGas` and never reads "no price".
     function _fill() internal {
+        // A later head of a sweep or a trigger uses the answers the first head's search
+        // asked for: a cycle's own `_reprice` has refreshed what it traded, and a head that
+        // failed took its writes with it, so `ANSWERED_SLOT` only names this market when
+        // the answers under `searching` were asked in this run.
+        // An answer can move without the hook trading the pool (two keys over one outside
+        // pool, say), and a later head then keeps the stale one for the run, where before it
+        // asked again. That costs a failed cycle or a missed gap at worst: `execute` checks
+        // the profit.
+        if (_recall(REUSE_SLOT) != 0) {
+            if (_recall(ANSWERED_SLOT) == active) return;
+        }
         searching++;
         bytes32[] storage list = wrappedIn[active];
         uint256 count = list.length;
@@ -2472,13 +2523,15 @@ abstract contract ArbitrageLogic {
         for (uint256 index; index < count; index++) {
             if (!_refresh(list[index])) revert Starved();
         }
+        _keepInMind(ANSWERED_SLOT, active);
     }
 
     /// @dev Asks a pool's pricer again and replaces what the cache holds. Only the pools of
     /// the market's list are asked. False, with nothing changed, when the gas left does not
     /// cover the pricer's allowance and the frame around it, which has to be started with
-    /// enough for the pricer to get all of `asking` through three calls' holdbacks of a 64th: the
-    /// self-call, the hook's hop to its module, and the call to the pricer.
+    /// enough for the pricer to get all of `asking` through the holdbacks of a 64th. `askFrame`
+    /// now runs on the hook itself, so only two calls hold back (the self-call and the call
+    /// to the pricer); the check still allows for three, and is merely conservative.
     function _refresh(bytes32 poolId) internal returns (bool) {
         if (poolId == bytes32(0)) return true;
         if (poolId == WRAP) return true;
@@ -2548,7 +2601,7 @@ abstract contract ArbitrageLogic {
         uint24 fee;
         uint24 levy;
         (venue.rate, fee, levy) = _unpack(word, base < venue.partner);
-        venue.keep = _keep(_swapFee(fee, levy));
+        venue.keep = _keepFast(_swapFee(fee, levy));
     }
 
     /// @dev Prices every other venue against the focus pool and keeps the cycle expected
@@ -2561,17 +2614,26 @@ abstract contract ArbitrageLogic {
         if (asking != 0) {
             if (wrappers[own.id] != address(0)) return _bestFromWrapped(book);
         }
-        Focus memory focus;
-        focus.id = own.id;
-        focus.partner = own.partner;
-        focus.rate = own.rate;
-        focus.keep = own.keep;
-        focus.edge = markets[active].edge * EDGE_UNIT;
-        focus.seen = new address[](book.length);
-        focus.routes = new Route[](book.length);
+        Focus memory focus = _focus(own, markets[active].edge * EDGE_UNIT, book.length);
+        focus.start = true;
         for (uint256 other = 1; other < book.length; other++) {
             _consider(best, focus, book[other], other);
         }
+    }
+
+    /// @dev The pool a cycle is priced from, with room for `routes` routes to be kept.
+    function _focus(Venue memory venue, uint256 edge, uint256 routes)
+        internal
+        pure
+        returns (Focus memory focus)
+    {
+        focus.id = venue.id;
+        focus.partner = venue.partner;
+        focus.rate = venue.rate;
+        focus.keep = venue.keep;
+        focus.edge = edge;
+        focus.seen = new address[](routes);
+        focus.routes = new Route[](routes);
     }
 
     /// @dev A search that starts from a wrapped pool compares it with plain pools only, and
@@ -2589,15 +2651,8 @@ abstract contract ArbitrageLogic {
             if (end.id == bytes32(0)) continue;
             if (_onTwin(book, other)) continue;
             if (wrappers[end.id] != address(0)) continue;
-            Focus memory focus;
-            focus.id = end.id;
-            focus.partner = end.partner;
-            focus.rate = end.rate;
-            focus.keep = end.keep;
-            focus.edge = edge;
             // One venue is compared, so one route is ever kept.
-            focus.seen = new address[](1);
-            focus.routes = new Route[](1);
+            Focus memory focus = _focus(end, edge, 1);
             _consider(best, focus, wrapped, other);
         }
     }
@@ -2622,7 +2677,13 @@ abstract contract ArbitrageLogic {
         if (route.links[0] != bytes32(0)) {
             rate = FixedPointMathLib.fullMulDiv(rate, route.rate, Q96);
         }
-        uint256 keep = venue.keep * focus.keep / WAD * route.keep / WAD;
+        uint256 keep;
+        // Each keep is at most WAD, so the products here stay below 1e54, under 2^180. The
+        // rates met below are bounded too: `rate` by `MAX_CYCLE_RATE` (2^180), `focus.rate`
+        // by `MAX_RATE` (2^152), so no product through `fullMulDiv` is near 2^256.
+        unchecked {
+            keep = venue.keep * focus.keep / WAD * route.keep / WAD;
+        }
         if (rate == 0) return;
         if (rate > MAX_CYCLE_RATE) return;
         if (keep < MIN_CYCLE_KEEP) return;
@@ -2655,9 +2716,43 @@ abstract contract ArbitrageLogic {
         if (buying) {
             if (_borrowsWrapped(venue.id, route)) return;
         }
-        Plan memory candidate =
-            Plan(edge - WAD, index, venue.id, route.links, 0, 0, 0, 0, buying, 0);
-        _offer(best, focus, candidate, target, _cycleDepth(focus, venue, route));
+        // `edge` is a ratio above one, at least WAD, so the subtraction cannot underflow.
+        Plan memory candidate;
+        unchecked {
+            candidate =
+                Plan(edge - WAD, index, venue.id, route.links, 0, 0, 0, 0, buying, 0, false);
+        }
+        if (!_offer(best, focus, candidate, target, _cycleDepth(focus, venue, route), false)) {
+            return;
+        }
+        _standIn(best, focus, venue, route, candidate, target);
+    }
+
+    /// @dev The estimate missed the gate. If the focus pool is thin, it may be hiding a gap
+    /// (an empty pool past a range edge, dust, a pulled position): the rest of the cycle has
+    /// depth, so a plan is made as if the focus had as much, and the sizing walk finds the
+    /// real amount. Only for the pool a search started from; a venue or link with no depth
+    /// is never planned against, because its price can be pushed anywhere for free.
+    function _standIn(
+        Plan memory best,
+        Focus memory focus,
+        Venue memory venue,
+        Route memory route,
+        Plan memory candidate,
+        uint256 target
+    ) internal view {
+        if (!focus.start) return;
+        // A failed stand-in benches stand-ins only (its bench has no gap, so it never blocks a
+        // real plan), and none is made while any bench on the pair is active.
+        bytes32 key = _pair(active, home, focus.id, candidate.venue, candidate.buying);
+        if (block.timestamp < benched[key].until) return;
+        uint256 others =
+            venue.id == bytes32(0) ? MAX_DEPTH : _depth(venue.id, venue.rate, venue.rate);
+        if (route.links[0] != bytes32(0)) others = _harmonic(others, route.depth);
+        // Above a tenth of `others` the real estimate is at least an eleventh of the
+        // stand-in's, so only a gap worth under about eleven times the gate can hide.
+        if (focus.depth * STANDIN_RATIO >= others) return;
+        _offer(best, focus, candidate, target, others, true);
     }
 
     /// @dev Whether a buy would run a wrapped leg whose input the hook does not yet hold: a
@@ -2726,8 +2821,10 @@ abstract contract ArbitrageLogic {
         }
         bytes32 near = _connector(backingAsset, to);
         bytes32 far = _connector(from, backingAsset);
-        // A missing pool has no price, which leaves the route's rate at zero.
+        // A missing pool has no price, which leaves the route's rate at zero, and the other
+        // pool need not be priced.
         _hop(route, 0, near, backingAsset < to);
+        if (near == bytes32(0)) return route;
         _hop(route, 1, far, from < backingAsset);
     }
 
@@ -2771,6 +2868,11 @@ abstract contract ArbitrageLogic {
         internal
         view
     {
+        // No pool is no price: the route has no rate, and nothing is read.
+        if (poolId == bytes32(0)) {
+            route.rate = 0;
+            return;
+        }
         (uint256 rate, uint256 keep) = _quote(poolId, baseFirst);
         route.links[slot] = poolId;
         route.rates[slot] = rate;
@@ -2826,24 +2928,27 @@ abstract contract ArbitrageLogic {
         Focus memory focus,
         Plan memory candidate,
         uint256 target,
-        uint256 depth
-    ) internal view {
-        if (depth == 0) return;
+        uint256 depth,
+        bool standin
+    ) internal view returns (bool missed) {
+        if (depth == 0) return true;
         uint256 gap = candidate.gap;
         uint256 score = FixedPointMathLib.fullMulDiv(
             FixedPointMathLib.fullMulDiv(gap, gap, WAD), depth, WAD
         );
-        if (score == 0) return;
+        if (score == 0) return true;
         // The estimate has to clear the smallest profit with room to spare. A cycle
         // estimated just above it mostly returns just below, and fails at every size.
-        if (score < uint256(minimumProfit[active][home]) * PLAN_MARGIN / 100) return;
-        if (score <= best.score) return;
+        if (score < uint256(minimumProfit[active][home]) * PLAN_MARGIN / 100) return true;
+        if (!_outranks(best, standin, score)) return false;
         Bench memory bench =
             benched[_pair(active, home, focus.id, candidate.venue, candidate.buying)];
         if (block.timestamp < bench.until) {
-            if (gap / BENCH_ESCAPE < bench.gap) return;
+            if (gap / BENCH_ESCAPE < bench.gap) return false;
         }
-        uint256 share = FixedPointMathLib.fullMulDiv(depth, WAD, focus.depth);
+        // A stand-in takes the whole cycle's depth as the focus pool's own.
+        uint256 own = standin ? depth : focus.depth;
+        uint256 share = FixedPointMathLib.fullMulDiv(depth, WAD, own);
         uint256 stop = candidate.buying
             ? focus.rate + FixedPointMathLib.fullMulDiv(target - focus.rate, share, WAD)
             : focus.rate - FixedPointMathLib.fullMulDiv(focus.rate - target, share, WAD);
@@ -2857,11 +2962,33 @@ abstract contract ArbitrageLogic {
         // estimate, and times the focus pool's own depth for closing the gap there alone.
         best.spend =
             _spend(focus, candidate.buying, FixedPointMathLib.fullMulDiv(gap, depth, WAD));
-        best.fullSpend = _spend(
-            focus, candidate.buying, FixedPointMathLib.fullMulDiv(gap, focus.depth, WAD)
-        );
+        best.fullSpend =
+            _spend(focus, candidate.buying, FixedPointMathLib.fullMulDiv(gap, own, WAD));
         best.buying = candidate.buying;
         best.score = score;
+        best.standin = standin;
+        return false;
+    }
+
+    /// @dev Whether a plan from another book replaces the best so far: a real plan always
+    /// does over a stand-in, and otherwise the wider gap does.
+    function _wider(Plan memory best, Plan memory plan) internal pure returns (bool) {
+        if (best.score == 0) return true;
+        if (best.standin != plan.standin) return !plan.standin;
+        return plan.gap > best.gap;
+    }
+
+    /// @dev Whether a candidate replaces the best plan so far. A real plan always outranks a
+    /// stand-in, whatever their scores, so a search's required attempt is never spent on a
+    /// stand-in while a real gap is skipped.
+    function _outranks(Plan memory best, bool standin, uint256 score)
+        internal
+        pure
+        returns (bool)
+    {
+        if (best.score == 0) return true;
+        if (best.standin != standin) return !standin;
+        return score > best.score;
     }
 
     /// @dev The most the first leg may pay in for a trade of `amount` SZR, with a quarter
@@ -2932,7 +3059,7 @@ abstract contract ArbitrageLogic {
         uint24 fee;
         uint24 levy;
         (rate, fee, levy) = _unpack(_word(poolId), baseFirst);
-        keep = _keep(_swapFee(fee, levy));
+        keep = _keepFast(_swapFee(fee, levy));
     }
 
     /// @dev A pool's first storage word holds, from the low end: the square-root price (160
@@ -2961,6 +3088,18 @@ abstract contract ArbitrageLogic {
         uint256 backward = levy >> 12;
         uint256 larger = forward > backward ? forward : backward;
         return uint24(larger + fee - larger * fee / 1e6);
+    }
+
+    /// @dev The square root of the share a trade keeps after `fee`, in WAD. The four common
+    /// tiers are constants, each equal to what `_keep` gives, since this runs for every
+    /// venue of every search. Only the book and the routes use it: the sizing walk keeps the
+    /// `sqrt` of `_keep`, because its cost is part of what fits in `SIZING_GAS`.
+    function _keepFast(uint24 fee) internal pure returns (uint256) {
+        if (fee == 3000) return 998498873309329277;
+        if (fee == 500) return 999749968742185057;
+        if (fee == 10000) return 994987437106619954;
+        if (fee == 100) return 999949998749937496;
+        return _keep(fee);
     }
 
     function _keep(uint24 fee) internal pure returns (uint256) {
@@ -3118,7 +3257,10 @@ abstract contract ArbitrageLogic {
         view
         returns (uint160, uint256, uint256, bool)
     {
-        if (walk.total == 0) return (plan.limit, plan.spend, steps, false);
+        if (walk.total == 0) {
+            // A stand-in whose walk ran to its end with nothing to trade met an empty pool.
+            return (plan.limit, plan.spend, steps, plan.standin && !walk.stopped);
+        }
         bool poor = walk.predicted < int256(uint256(minimumProfit[active][home]));
         if (poor) {
             return (plan.limit, plan.spend, steps, !walk.stopped);

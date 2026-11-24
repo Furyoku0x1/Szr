@@ -56,7 +56,7 @@ abstract contract SearchManyPart is ArbitrageLogic {
             home = bases[index];
             // Cleared first: paying the profit out leaves its token owed nothing.
             _setCredited(bases[index], 0);
-            _retire(run.profits[index]);
+            IArbitrageSelf(address(this)).retire(run.profits[index]);
         }
         _clearCredit();
         _resync(run.resync);

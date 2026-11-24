@@ -129,11 +129,21 @@ contract VaultEndToEndForkTest is Test {
         arbitrage.setPricer(at, address(pricer));
     }
 
+    /// Adds `amount` to `who`'s balance by a transfer from a new account. USDG packs other
+    /// data into a used account's balance word (the pool manager's, for one), so `deal`
+    /// can't find the slot there; a new account's word holds only its balance.
+    function _topUp(address token, address who, uint256 amount) internal {
+        address donor = vm.randomAddress();
+        deal(token, donor, amount);
+        vm.prank(donor);
+        assertTrue(IERC20(token).transfer(who, amount));
+    }
+
     /// The pool manager must hold what Metric asks for, as it does from everyone else's
     /// deposits on the real chain.
     function _fund() internal {
         deal(address(weth), address(manager), weth.balanceOf(address(manager)) + 3_000e18);
-        deal(USDG, address(manager), IERC20(USDG).balanceOf(address(manager)) + 5_000_000e6);
+        _topUp(USDG, address(manager), 5_000_000e6);
         address[3] memory who = [TRADER, CURATOR, HOLDER];
         for (uint256 i; i < who.length; i++) {
             deal(address(weth), who[i], 50e18);

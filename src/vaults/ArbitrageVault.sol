@@ -14,6 +14,7 @@ import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
 import { Currency } from "v4-core/types/Currency.sol";
 import { BalanceDelta } from "v4-core/types/BalanceDelta.sol";
 import { ArbitrageApi } from "../arbitrage/ArbitrageApi.sol";
+import { SZR_MARKET_ID } from "../arbitrage/ArbitrageLogic.sol";
 import { IMarketController } from "../interfaces/IMarketController.sol";
 import { HookVault } from "./HookVault.sol";
 
@@ -108,7 +109,7 @@ contract ArbitrageVault is HookVault, IUnlockCallback {
         )
     {
         // SZR's market belongs to Liquidity, and its pools hold SZR.
-        if (marketId <= arbitrageHook.SZR_MARKET()) revert InvalidPair();
+        if (marketId <= SZR_MARKET_ID) revert InvalidPair();
         if (arbitrageHook.market(marketId).owner == address(0)) revert InvalidPair();
         if (token0 == arbitrageHook.token()) revert InvalidPair();
         if (token1 == arbitrageHook.token()) revert InvalidPair();

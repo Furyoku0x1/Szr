@@ -72,11 +72,21 @@ contract MetricVenueHookForkTest is Test {
         // The pool manager must hold the input when Metric asks for it, as it does on
         // mainnet from everyone else's deposits.
         deal(WETH, address(MANAGER), IERC20(WETH).balanceOf(address(MANAGER)) + 3_000e18);
-        deal(USDG, address(MANAGER), IERC20(USDG).balanceOf(address(MANAGER)) + 5_000_000e6);
+        _topUp(USDG, address(MANAGER), 5_000_000e6);
         deal(WETH, address(this), 1_000e18);
         deal(USDG, address(this), 1_000_000e6);
         IERC20(WETH).approve(address(router), type(uint256).max);
         IERC20(USDG).approve(address(router), type(uint256).max);
+    }
+
+    /// Adds `amount` to `who`'s balance by a transfer from a new account. USDG packs other
+    /// data into a used account's balance word (the pool manager's, for one), so `deal`
+    /// can't find the slot there; a new account's word holds only its balance.
+    function _topUp(address token, address who, uint256 amount) internal {
+        address donor = vm.randomAddress();
+        deal(token, donor, amount);
+        vm.prank(donor);
+        assertTrue(IERC20(token).transfer(who, amount));
     }
 
     modifier onlyFork() {
@@ -215,14 +225,16 @@ contract MetricVenueHookForkTest is Test {
 
     /// Walks the limit of a 100 WETH sale down from just over Metric's sell price. At first
     /// nothing can fill, then only a part can, then all of it; the live price moves from
-    /// block to block, so the zone is found rather than named. The part must revert.
+    /// block to block, so the zone is found rather than named. The part must revert. The
+    /// walk reaches 500 ppm below the mid in root price, since the sell price alone sat
+    /// 190 ppm below it on 2026-11-23; it stops at the first fill.
     function testLimitStopsALargeSaleShort() public onlyFork {
         (uint160 mid,,,) = MANAGER.getSlot0(key.toId());
         bytes memory incomplete =
             _wrapped(abi.encodeWithSelector(MetricVenueHook.Incomplete.selector));
         bool sawPartial;
         bool filled;
-        for (uint256 factor = 10_000_000; factor > 9_998_000; factor -= 2) {
+        for (uint256 factor = 10_000_000; factor > 9_995_000; factor -= 2) {
             try this.swapExternal(true, -100e18, uint160(uint256(mid) * factor / 10_000_000)) {
                 filled = true;
                 break;
@@ -278,8 +290,8 @@ contract MetricVenueHookForkTest is Test {
         hook.bind(k, address(pool));
         (, bool flipped,,,) = hook.bindings(k.toId());
         assertTrue(flipped);
-        deal(qqq, address(MANAGER), IERC20(qqq).balanceOf(address(MANAGER)) + 10_000e18);
-        deal(USDG, address(MANAGER), IERC20(USDG).balanceOf(address(MANAGER)) + 5_000_000e6);
+        _topUp(qqq, address(MANAGER), 10_000e18);
+        _topUp(USDG, address(MANAGER), 5_000_000e6);
         deal(qqq, address(this), 1_000e18);
         IERC20(qqq).approve(address(router), type(uint256).max);
 

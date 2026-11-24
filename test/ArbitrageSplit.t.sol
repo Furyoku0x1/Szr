@@ -117,12 +117,10 @@ contract ArbitrageSplitTest is ArbitrageWorld {
         _stub(split.sizerModule(), 4);
         _stub(split.adminModule(), 5);
         assertEq(_tag(SearchPart.search.selector), 1, "search");
-        assertEq(_tag(SearchPart.arb.selector), 1, "arb");
-        assertEq(_tag(SearchPart.sweep.selector), 1, "sweep");
         assertEq(_tag(SearchPart.unlockCallback.selector), 1, "unlockCallback");
-        assertEq(_tag(SearchPart.askFrame.selector), 1, "askFrame");
         assertEq(_tag(SearchManyPart.searchMany.selector), 2, "searchMany");
         assertEq(_tag(CyclePart.execute.selector), 3, "execute");
+        assertEq(_tag(CyclePart.retire.selector), 3, "retire");
         assertEq(_tag(SizerPart.size.selector), 4, "size");
         assertEq(_tag(AdminPart.setLimits.selector), 5, "setLimits");
         assertEq(_tag(AdminPart.market.selector), 5, "market");
@@ -141,6 +139,12 @@ contract ArbitrageSplitTest is ArbitrageWorld {
         // `venueSearch` is the hook's own: a caller that is no wrapper is refused by it.
         vm.expectRevert(ArbitrageLogic.NotTrusted.selector);
         hook.venueSearch(_id(usdPool), true, address(this));
+        // `arb`, `sweep` and `askFrame` are the hook's own too: they ran here, not in a stub.
+        vm.expectRevert(ArbitrageLogic.UnknownPool.selector);
+        hook.arb(bytes32(uint256(1)));
+        assertEq(hook.sweep(1, address(0)), 0, "sweep ran on the hook");
+        vm.expectRevert(ArbitrageLogic.NotSelf.selector);
+        hook.askFrame(address(this), bytes32(0));
         vm.expectRevert(ArbitrageLogic.NotPoolManager.selector);
         hook.afterSwap(
             address(this),
@@ -161,11 +165,22 @@ contract ArbitrageSplitTest is ArbitrageWorld {
 
     function testRevertsAreBubbledFromTheModuleUnchanged() public {
         vm.expectRevert(ArbitrageLogic.NotSelf.selector);
-        hook.askFrame(address(this), bytes32(0));
+        hook.retire(1);
         address szrToken = hook.token();
         vm.expectRevert(ArbitrageLogic.NotManager.selector);
         vm.prank(alice);
         hook.setLimits(1, szrToken, 1, 1, 1.0001e18);
+    }
+
+    /// `retire` is for the hook's own searches: an outsider is refused, and a revert of the
+    /// retire itself (here a pool manager short of ETH to take) comes out of the hook's hop
+    /// to the module as it was raised, for `_judge` to read.
+    function testRetireRefusesOutsidersAndBubblesItsRevertsUnchanged() public {
+        vm.expectRevert(ArbitrageLogic.NotSelf.selector);
+        hook.retire(1);
+        vm.prank(address(hook));
+        vm.expectRevert(ArbitrageLogic.Drained.selector);
+        hook.retire(type(uint128).max);
     }
 
     // ----- the modules alone -----
@@ -188,8 +203,6 @@ contract ArbitrageSplitTest is ArbitrageWorld {
         CyclePart cycle = CyclePart(split.cycleModule());
         SizerPart sizer = SizerPart(split.sizerModule());
         vm.expectRevert(ArbitrageLogic.NotSelf.selector);
-        searching.askFrame(address(this), bytes32(0));
-        vm.expectRevert(ArbitrageLogic.NotSelf.selector);
         searching.search(bytes32(0), 1, address(0), address(0), true, true, address(0));
         vm.expectRevert(ArbitrageLogic.NotSelf.selector);
         many.searchMany(
@@ -197,6 +210,8 @@ contract ArbitrageSplitTest is ArbitrageWorld {
         );
         vm.expectRevert(ArbitrageLogic.NotSelf.selector);
         cycle.execute(bytes32(0), plan);
+        vm.expectRevert(ArbitrageLogic.NotSelf.selector);
+        cycle.retire(1);
         vm.expectRevert(ArbitrageLogic.NotSelf.selector);
         sizer.size(bytes32(0), plan);
     }
@@ -275,7 +290,7 @@ contract ArbitrageSplitTest is ArbitrageWorld {
         ArbitrageLogic.Plan memory plan;
         bytes32[] memory centres = new bytes32[](8);
         address[] memory bases = new address[](8);
-        bytes[5] memory calls = [
+        bytes[4] memory calls = [
             abi.encodeCall(
                 IArbitrageSelf.search,
                 (bytes32(0), 1, address(0), address(0), true, true, alice)
@@ -284,12 +299,11 @@ contract ArbitrageSplitTest is ArbitrageWorld {
                 IArbitrageSelf.searchMany, (centres, 1, bases, bases, true, true, alice)
             ),
             abi.encodeCall(IArbitrageSelf.execute, (bytes32(0), plan)),
-            abi.encodeCall(IArbitrageSelf.size, (bytes32(0), plan)),
-            abi.encodeCall(IArbitrageSelf.askFrame, (address(0), bytes32(0)))
+            abi.encodeCall(IArbitrageSelf.size, (bytes32(0), plan))
         ];
-        address[5] memory targets = [modules[0], modules[1], modules[2], modules[3], modules[0]];
-        uint256[5] memory caps = [uint256(1_500_000), 1_500_000, 1_500_000, 400_000, 300_000];
-        for (uint256 index; index < 5; index++) {
+        address[4] memory targets = [modules[0], modules[1], modules[2], modules[3]];
+        uint256[4] memory caps = [uint256(1_500_000), 1_500_000, 1_500_000, 400_000];
+        for (uint256 index; index < 4; index++) {
             vm.cool(address(hook));
             vm.cool(targets[index]);
             uint256 given = hopper.hopped(caps[index]);

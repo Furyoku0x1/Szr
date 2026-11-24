@@ -79,6 +79,7 @@ contract ArbitrageMultiBooksTest is MultiWorld {
     function _books() internal returns (address[] memory bases, bytes32[] memory centres) {
         ArbitrageProbe probe = _probeInHook();
         (, bases, centres) = probe.centresOf(id, _id(stable), stable);
+        assertTrue(probe.centresAgree(id, _id(stable), stable), "the same books as before");
     }
 
     function _at(address[] memory bases, address token) internal pure returns (uint256) {

@@ -135,11 +135,21 @@ contract MetricPricerForkTest is Test {
         arbitrage.setPricer(at, address(pricers[pricers.length - 1]));
     }
 
+    /// Adds `amount` to `who`'s balance by a transfer from a new account. USDG packs other
+    /// data into a used account's balance word (the pool manager's, for one), so `deal`
+    /// can't find the slot there; a new account's word holds only its balance.
+    function _topUp(address token, address who, uint256 amount) internal {
+        address donor = vm.randomAddress();
+        deal(token, donor, amount);
+        vm.prank(donor);
+        assertTrue(IERC20(token).transfer(who, amount));
+    }
+
     /// The pool manager must hold the input Metric asks for, as it does from everyone
     /// else's deposits on the real chain.
     function _fund() internal {
         deal(address(weth), address(manager), weth.balanceOf(address(manager)) + 3_000e18);
-        deal(USDG, address(manager), IERC20(USDG).balanceOf(address(manager)) + 5_000_000e6);
+        _topUp(USDG, address(manager), 5_000_000e6);
         deal(address(weth), TRADER, 20e18);
         deal(USDG, TRADER, 100_000e6);
         vm.startPrank(TRADER);
@@ -312,9 +322,11 @@ contract MetricPricerForkTest is Test {
         return FullMath.mulDiv(FullMath.mulDiv(liq, Q96, 1), up - root, root) / up;
     }
 
-    /// A real swap through the wrapped pool, and its output.
+    /// A real swap through the wrapped pool, and its output. The trader is given the input,
+    /// since the sizes follow the live bin (40% of it was 71 WETH on 2026-11-23).
     function _fill(bool zeroForOne, uint256 amount) internal returns (uint256 out) {
         address tokenOut = zeroForOne ? USDG : address(weth);
+        _topUp(zeroForOne ? address(weth) : USDG, TRADER, amount);
         uint256 before = IERC20(tokenOut).balanceOf(TRADER);
         assertTrue(_swap(wrapped[0], zeroForOne, amount, 30_000_000), "swap fills");
         out = IERC20(tokenOut).balanceOf(TRADER) - before;
@@ -336,28 +348,36 @@ contract MetricPricerForkTest is Test {
                 FullMath.mulDiv(FullMath.mulDiv(bin.y * f / 100, Q96, root), Q96, root);
             uint256 sellPred = _predict(true, sellIn);
             uint256 sellReal = _fill(true, sellIn);
-            _compare("sell WETH, percent of bin", f, sellPred, sellReal);
+            _compare("sell WETH, percent of bin", f, sellIn, sellPred, sellReal);
             (root,,,,) = pricers[0].price(wrapped[0]);
             // Buying WETH with USDG: the size that pays out f% of the bin's WETH.
             uint256 buyIn =
                 FullMath.mulDiv(FullMath.mulDiv(bin.x * f / 100, root, Q96), root, Q96);
             uint256 buyPred = _predict(false, buyIn);
             uint256 buyReal = _fill(false, buyIn);
-            _compare("buy WETH, percent of bin", f, buyPred, buyReal);
+            _compare("buy WETH, percent of bin", f, buyIn, buyPred, buyReal);
             (root,,,,) = pricers[0].price(wrapped[0]);
         }
     }
 
-    function _compare(string memory label, uint256 pct, uint256 predicted, uint256 real)
-        internal
-    {
+    /// Within 5 ppm, plus what one raw unit of input is worth: when the bin holds little of
+    /// the token that comes out, a percent of it is a dust swap (11,000 raw USDG units on
+    /// 2026-11-23), and rounding the input to whole units is what remains.
+    function _compare(
+        string memory label,
+        uint256 pct,
+        uint256 amountIn,
+        uint256 predicted,
+        uint256 real
+    ) internal {
         console.log(label, pct);
+        console.log("   amount in, raw", amountIn);
         console.log("   predicted out, real out", predicted, real);
         uint256 gap = predicted > real ? predicted - real : real - predicted;
         console.log("   off by parts per million", gap * 1e6 / real);
         console.log("   predicted under real:", predicted <= real);
         assertLe(predicted, real, "predicted never above real");
-        assertLe(gap * 1e6 / real, 5, "within 5 ppm");
+        assertLe(gap * 1e6 / real, 5 + 1e6 / amountIn, "within 5 ppm and a unit of input");
     }
 
     // ---------------------------------------------------------------------------------
@@ -371,6 +391,15 @@ contract MetricPricerForkTest is Test {
         uint256 small = venue > own ? own : venue;
         // Prices are the roots squared: a gap in the roots counts twice.
         return (big - small) * 2e6 / small;
+    }
+
+    /// Every wrapper fronts the same Metric pool, so a later cycle in one swap may take
+    /// any of them (the second of two took the next wrapper on 2026-11-23).
+    function _isWrapped(bytes32 venue) internal view returns (bool) {
+        for (uint256 i; i < wrapped.length; i++) {
+            if (venue == PoolId.unwrap(wrapped[i].toId())) return true;
+        }
+        return false;
     }
 
     function _arbCount(Vm.Log[] memory logs, bool afterSwap) internal view returns (uint256 n) {
@@ -391,7 +420,7 @@ contract MetricPricerForkTest is Test {
                 assertTrue(topic != ArbitrageLogic.SearchCutShort.selector, "cut short");
                 continue;
             }
-            assertEq(logs[i].topics[2], PoolId.unwrap(wrapped[0].toId()), "against Metric");
+            assertTrue(_isWrapped(logs[i].topics[2]), "against Metric");
             if (afterSwap == (i > swapAt)) n++;
         }
     }

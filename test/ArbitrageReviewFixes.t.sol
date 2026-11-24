@@ -138,6 +138,28 @@ contract ArbitrageReadFailTest is ReviewWorld {
         assertTrue(_has(data, ArbitrageLogic.InsufficientGas.selector), "InsufficientGas");
     }
 
+    /// The retire itself runs out of gas (the token's read burns what it is given), through
+    /// the real split hook. Uncapped, the swap brought too little and fails whole. Capped,
+    /// the hook's own allowance was the limit, so the search is undone with no reason and
+    /// the swap goes on.
+    function testRetireOutOfGasIsInsufficientGasUncappedAndUndoneCapped() public {
+        ink.arm(address(hook), 2);
+        (bool ok, bytes memory data) = _swapWithGas(inkPool, address(coin), 50_000e18, _ample());
+        assertFalse(ok, "uncapped swap fails");
+        assertTrue(_has(data, ArbitrageLogic.InsufficientGas.selector), "InsufficientGas");
+        // A smaller allowance, which a swap with plenty of gas then does not exceed.
+        uint32 smaller = uint32(hook.minimumGasLimit(id));
+        vm.prank(team);
+        hook.setLimits(id, address(ink), smaller, 1e15, 1.0001e18);
+        vm.recordLogs();
+        (ok,) = _swapWithGas(inkPool, address(coin), 50_000e18, 30_000_000);
+        (bool seen, bytes4 reason, uint256 paid) = _undone();
+        assertTrue(ok, "capped swap passes");
+        assertTrue(seen, "search undone");
+        assertEq(reason, bytes4(0), "with an empty reason");
+        assertEq(paid, 0, "nothing paid");
+    }
+
     /// A healthy token with the gas tuned so that the payout's read itself runs short:
     /// every gas value either passes or fails without `Unsettled`, and some do fail.
     function testHealthyPayoutNeverReadsAsUnsettledAtAnyGas() public {

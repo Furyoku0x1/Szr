@@ -2,10 +2,13 @@
 pragma solidity 0.8.30;
 
 import { ArbitrageApi } from "../../src/arbitrage/ArbitrageApi.sol";
-import { ArbitrageLogic } from "../../src/arbitrage/ArbitrageLogic.sol";
+import { ArbitrageLogic, IArbitrageSelf } from "../../src/arbitrage/ArbitrageLogic.sol";
 import { Liquidity } from "../../src/Liquidity.sol";
 import { Currency } from "v4-core/types/Currency.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
+import { PoolId } from "v4-core/types/PoolId.sol";
+import { StateLibrary } from "v4-core/libraries/StateLibrary.sol";
+import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 
 /// @dev The hook with its scan exposed, so tests can measure what the gas constants assume.
@@ -13,6 +16,8 @@ import { TickMath } from "v4-core/libraries/TickMath.sol";
 /// before it was split, so it can reach the internals. It runs the hook's setup itself and
 /// skips the checks that only the hook has (its address, its modules).
 contract ArbitrageProbe is ArbitrageApi {
+    using StateLibrary for IPoolManager;
+
     /// While set, no cycle is sized by the walk, so the first try uses the plan's estimate
     /// as it did before the walk existed. For tests of what the other sizes do.
     bool public declineSizing;
@@ -72,6 +77,119 @@ contract ArbitrageProbe is ArbitrageApi {
         return (used, found.bases, found.centres);
     }
 
+    /// Whether the one-pass listing of `_centres` gives the books the two-pass listing of
+    /// before 2026-11-23 did, the same books in the same order.
+    function centresAgree(uint256 market, bytes32 poolId, PoolKey calldata pool)
+        external
+        view
+        returns (bool)
+    {
+        Centres memory found = _centres(market, poolId, pool);
+        uint256 length = chosen[market].length;
+        uint256 count;
+        bool sawEther;
+        for (uint256 pass; pass < 2; pass++) {
+            for (uint256 index; index < length; index++) {
+                address base = chosen[market][index];
+                if (shareRecipient[base] == address(0)) continue;
+                if (_isEther(base)) {
+                    if (sawEther) continue;
+                }
+                (bytes32 centre, address partner) = _centreFor(market, base, poolId, pool);
+                if (centre == bytes32(0)) continue;
+                if ((centre == poolId) != (pass == 0)) continue;
+                if (_isEther(base)) sawEther = true;
+                if (count >= found.count) return false;
+                if (found.bases[count] != base) return false;
+                if (found.centres[count] != centre) return false;
+                if (found.partners[count] != partner) return false;
+                count++;
+            }
+        }
+        return count == found.count;
+    }
+
+    /// What `_keepCentres` and `_recallCentres` do with a swap's books: they give back the
+    /// same books, once; `_forgetCentres` clears them; and books kept for one pool are
+    /// not given for another.
+    function centresRoundTrip(uint256 market, bytes32 poolId, PoolKey calldata pool)
+        external
+        returns (bool same, bool once, bool forgotten, bool keyed)
+    {
+        Centres memory found = _centres(market, poolId, pool);
+        _keepCentres(poolId, found);
+        Centres memory back = _recallCentres(poolId);
+        same = back.count == found.count;
+        for (uint256 index; index < found.count; index++) {
+            if (back.centres[index] != found.centres[index]) same = false;
+            if (back.bases[index] != found.bases[index]) same = false;
+            if (back.partners[index] != found.partners[index]) same = false;
+        }
+        once = _recallCentres(poolId).centres.length == 0;
+        _keepCentres(poolId, found);
+        _forgetCentres();
+        forgotten = _recallCentres(poolId).centres.length == 0;
+        _keepCentres(poolId, found);
+        keyed = _recallCentres(bytes32(uint256(poolId) + 1)).centres.length == 0;
+        _forgetCentres();
+    }
+
+    /// Whether the book a search leaves for the one after the swap, packed into transient
+    /// storage, comes back exactly: every venue's pool, partner, rate and keep.
+    function rememberRoundTrip(uint256 market, address base, bytes32 poolId, address partner)
+        external
+        returns (bool same, uint256 venues)
+    {
+        active = market;
+        home = base;
+        _begin(market);
+        Venue[] memory book = _book(poolId, partner, true);
+        _remember(book);
+        Venue[] memory back = _open(poolId, partner, address(1));
+        venues = book.length;
+        same = back.length == book.length;
+        for (uint256 index = 1; same && index < book.length; index++) {
+            if (back[index].id != book[index].id) same = false;
+            if (back[index].partner != book[index].partner) same = false;
+            if (back[index].rate != book[index].rate) same = false;
+            if (back[index].keep != book[index].keep) same = false;
+        }
+        asking = 0;
+        active = 0;
+    }
+
+    /// The plan `_consider` makes in SZR's market for a focus of price `focusRate` against
+    /// the venue `venueId` at `venueRate`, with the given keeps and a depth too large to
+    /// hold any gap back: its gap, direction and score (zero when it made none).
+    function considered(
+        bytes32 venueId,
+        uint256 focusRate,
+        uint256 venueRate,
+        uint256 focusKeep,
+        uint256 venueKeep
+    ) external returns (uint256 gap, bool buying, uint256 score) {
+        active = SZR_MARKET;
+        home = token;
+        Focus memory focus;
+        focus.rate = focusRate;
+        focus.keep = focusKeep;
+        focus.depth = 1e30;
+        focus.seen = new address[](1);
+        focus.routes = new Route[](1);
+        Venue memory venue;
+        venue.id = venueId;
+        venue.rate = venueRate;
+        venue.keep = venueKeep;
+        Plan memory best;
+        _consider(best, focus, venue, 1);
+        active = 0;
+        return (best.gap, best.buying, best.score);
+    }
+
+    function keepOf(uint24 fee) external pure returns (uint256) {
+        return _keepFast(fee);
+    }
+
     /// The constants `gasForSwap` is built from.
     function swapGasConstants()
         external
@@ -127,7 +245,7 @@ contract ArbitrageProbe is ArbitrageApi {
         active = market;
         home = address(0);
         uint256 start = gasleft();
-        _payOut(profit);
+        IArbitrageSelf(address(this)).retire(profit);
         used = start - gasleft();
         reserved = RETIRE_GAS;
         active = 0;
@@ -142,7 +260,7 @@ contract ArbitrageProbe is ArbitrageApi {
         active = market;
         home = asset;
         uint256 start = gasleft();
-        _payOut(profit);
+        IArbitrageSelf(address(this)).retire(profit);
         used = start - gasleft();
         reserved = RETIRE_GAS;
         active = 0;
@@ -307,6 +425,92 @@ contract ArbitrageProbe is ArbitrageApi {
         Walk memory walk;
         more = _round(legs, walk, 0, 0);
         return (more, walk.total, walk.steps);
+    }
+
+    /// The plan of the best cycle from `centre` in SZR's market, and the plan `_bestOf`
+    /// picks among the books of all of `centres` (each paired with `partner`), with the
+    /// book it picks. These run the real book, ranking and ordering code.
+    function planFrom(bytes32 centre, address partner) external returns (Plan memory plan) {
+        active = SZR_MARKET;
+        home = token;
+        _begin(SZR_MARKET);
+        plan = _best(_book(centre, partner, true));
+        asking = 0;
+        active = 0;
+    }
+
+    function pickAmong(bytes32[] calldata centres, address partner)
+        external
+        returns (uint256 pick, Plan memory best)
+    {
+        active = SZR_MARKET;
+        home = token;
+        _begin(SZR_MARKET);
+        Many memory run;
+        run.books = new Venue[][](centres.length);
+        run.bases = new address[](centres.length);
+        for (uint256 index; index < centres.length; index++) {
+            run.books[index] = _book(centres[index], partner, index == 0);
+            run.bases[index] = token;
+        }
+        (pick, best) = _bestOf(run);
+        asking = 0;
+        active = 0;
+    }
+
+    /// Whether a candidate with `score` replaces `best` within one book, and whether a plan
+    /// replaces `best` across books. Real plans must always come first.
+    function outranks(Plan memory best, bool standin, uint256 score)
+        external
+        pure
+        returns (bool)
+    {
+        return _outranks(best, standin, score);
+    }
+
+    function wider(Plan memory best, Plan memory plan) external pure returns (bool) {
+        return _wider(best, plan);
+    }
+
+    /// The depth of the rest of a cycle that is only the venue `venueId`, as a stand-in
+    /// would use, in SZR's market.
+    function othersOf(bytes32 venueId) external returns (uint256) {
+        (Venue memory venue,) = _venueOf(venueId);
+        return _depth(venue.id, venue.rate, venue.rate);
+    }
+
+    /// Whether a stand-in plan is made for a focus of `depth` and square-root price `rate`
+    /// against the venue `venueId`, for a 10% gap that the focus's own depth leaves short of
+    /// the gate, in SZR's market. `start` is whether the search started from the focus.
+    function standInMade(bytes32 venueId, uint256 depth, uint256 rate, bool start)
+        external
+        returns (bool)
+    {
+        (Venue memory venue, uint256 target) = _venueOf(venueId);
+        Focus memory focus;
+        focus.rate = rate;
+        focus.keep = WAD;
+        focus.depth = depth;
+        focus.start = start;
+        Plan memory candidate;
+        candidate.gap = WAD / 10;
+        candidate.venue = venueId;
+        candidate.buying = true;
+        Plan memory best;
+        Route memory route;
+        _standIn(best, focus, venue, route, candidate, target);
+        return best.score != 0 && best.standin;
+    }
+
+    function _venueOf(bytes32 venueId) internal returns (Venue memory venue, uint256 target) {
+        active = SZR_MARKET;
+        home = token;
+        (uint160 price,,,) = poolManager.getSlot0(PoolId.wrap(venueId));
+        bool szrFirst = Currency.unwrap(keys[venueId].currency0) == token;
+        venue.id = venueId;
+        venue.rate = szrFirst ? price : Q192 / price;
+        venue.keep = WAD;
+        target = venue.rate;
     }
 
     /// What a pricer answers to one ask through `askFrame` given `gas`, as the hook reads

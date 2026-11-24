@@ -569,8 +569,14 @@ contract MetricProbeTest is Test {
     // P4: a swap from a contract, inside a v4 unlock, paying with the pool manager's funds
     // ---------------------------------------------------------------------------------
 
+    /// Adds `amount` to `who`'s balance by a transfer from a new account. USDG packs other
+    /// data into a used account's balance word (the pool manager's, for one), so `deal`
+    /// can't find the slot there; a new account's word holds only its balance.
     function _topUp(address token, address who, uint256 amount) internal {
-        deal(token, who, IERC20(token).balanceOf(who) + amount);
+        address donor = vm.randomAddress();
+        deal(token, donor, amount);
+        vm.prank(donor);
+        assertTrue(IERC20(token).transfer(who, amount));
     }
 
     /// The prober holds enough of both tokens to repay what it takes from the pool manager,
@@ -749,7 +755,8 @@ contract MetricProbeTest is Test {
             console.log("P5 stop-loss beforeRemoveLiquidity, if wired, reverts with:");
             console.logBytes(why);
         }
-        (uint128 anchor,,,,) = IMetricVelocity(imm.extension3).priceVelocityState(address(POOL));
+        (uint128 anchor,,,, uint64 maxChange) =
+            IMetricVelocity(imm.extension3).priceVelocityState(address(POOL));
         vm.prank(address(POOL));
         bytes4 fine = IMetricExtension(imm.extension3)
             .beforeSwap(address(this), address(this), true, 1e16, 0, 0, 0, 0, anchor, "");
@@ -776,6 +783,12 @@ contract MetricProbeTest is Test {
             );
         console.log("P5 velocity guard, a mid price 10% off the anchor, ok:", ok);
         console.logBytes(reason);
+        // A limit of zero turns the guard off; this pool's was set to zero on 2026-11-23
+        // (`MaxChangePerBlockSet`, block 121511483).
+        if (maxChange == 0) {
+            assertTrue(ok, "a guard that is off should let 10% through");
+            return;
+        }
         assertFalse(ok, "10% in one block should trip the guard");
     }
 

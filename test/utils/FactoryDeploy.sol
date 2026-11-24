@@ -17,7 +17,10 @@ library FactoryDeploy {
         bytes memory vaultCode = VM.getCode("ArbitrageVault.sol:ArbitrageVault");
         address arbitrage =
             VM.deployCode("VaultDeployers.sol:ArbitrageVaultDeployer", abi.encode(vaultCode));
-        address metric = VM.deployCode("VaultDeployers.sol:MetricVaultDeployer");
+        address metric = VM.deployCode(
+            "VaultDeployers.sol:MetricVaultDeployer",
+            abi.encode(VM.getCode("MetricVault.sol:MetricVault"))
+        );
         return ArbitrageVaultFactory(
             VM.deployCode(
                 "ArbitrageVaultFactory.sol:ArbitrageVaultFactory",

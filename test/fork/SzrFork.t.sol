@@ -192,13 +192,13 @@ contract SzrForkTest is Test {
         if (!live) return vm.skip(true);
         uint256 one = hook.quoteSellExactIn(1e18).netWethOut;
         assertGt(one, 0);
+        // Only tokens outside the hook's own inventory can be sold, less one wei. Holders
+        // sell at the floor, so this shrinks over time (below 100M on 2026-11-19).
+        uint256 circulating = old.totalSupply() - old.balanceOf(address(hook)) - 1;
         // The same price per token at every size: no slippage and no sell fee.
         assertApproxEqAbs(hook.quoteSellExactIn(1_000_000e18).netWethOut, one * 1_000_000, 1e6);
-        assertApproxEqAbs(
-            hook.quoteSellExactIn(100_000_000e18).netWethOut, one * 100_000_000, 1e8
-        );
-        // Only tokens outside the hook's own inventory can be sold, less one wei.
-        uint256 circulating = old.totalSupply() - old.balanceOf(address(hook)) - 1;
+        uint256 most = circulating / 1e18;
+        assertApproxEqAbs(hook.quoteSellExactIn(most * 1e18).netWethOut, one * most, most);
         assertGt(hook.quoteSellExactIn(circulating).netWethOut, 0);
         vm.expectRevert();
         hook.quoteSellExactIn(circulating + 1);

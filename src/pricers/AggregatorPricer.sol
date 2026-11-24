@@ -59,9 +59,10 @@ contract AggregatorPricer is IVenuePricer {
     {
         require(!_isNative(pool.currency0), "ETH");
         require(!_isNative(pool.currency1), "ETH");
-        IOutsidePool outside = IOutsidePool(aggregator.poolIdToExternalPool(pool.toId()));
+        PoolId id = pool.toId();
+        IOutsidePool outside = IOutsidePool(aggregator.poolIdToExternalPool(id));
         uint160 root = _root(outside, pool);
-        uint256 total = uint256(outside.fee()) + _cut(pool.toId());
+        uint256 total = uint256(outside.fee()) + _cut(id);
         require(total < PIPS, "fee");
         return (root, uint24(total), outside.liquidity(), root, root);
     }
