@@ -315,6 +315,38 @@ contract BasketModesTest is BasketWorld {
         emit log_named_uint("pusher's loss", before - afterwards);
     }
 
+    /// A full-range leg on a 0.01% pool with tick spacing 1 ends exactly at v4's price bounds.
+    /// Conversions must still work there in both directions, and so must every entry point.
+    function test_fullRangeOnSpacingOneConverts() public {
+        for (uint8 mode = TO_UNIT; mode <= TO_STOCKS; mode++) {
+            PausableAsset stock = _asset();
+            PoolKey memory pool = _bare(stock);
+            pool.fee = 100;
+            pool.tickSpacing = 1;
+            manager.initialize(pool, uint160(1 << 96));
+            _provide(pool, TickMath.MIN_TICK, TickMath.MAX_TICK, DEPTH);
+            Basket.Leg[] memory legs = new Basket.Leg[](1);
+            legs[0] = Basket.Leg(pool, TickMath.MIN_TICK, TickMath.MAX_TICK);
+            Basket basket = Basket(factory.create("Basket", "BSKT", address(usd), mode, legs));
+            _approveAll(basket, address(this));
+            uint128[] memory seed = new uint128[](1);
+            seed[0] = SEED;
+            basket.start(seed, SHARES, _unbounded(2), block.timestamp);
+            _trade(pool, address(usd), SWAP);
+            _trade(pool, address(stock), SWAP);
+            vm.warp(block.timestamp + 1);
+            _collect(basket);
+            assertEq(basket.convertedAt(), block.timestamp, "converted");
+            usd.mint(alice, 1e30);
+            vm.startPrank(alice);
+            usd.approve(address(basket), type(uint256).max);
+            basket.depositUnit(1e18, type(uint256).max, block.timestamp);
+            basket.redeemUnit(1e18, 0, block.timestamp);
+            vm.stopPrank();
+            basket.payProtocol(0, block.timestamp);
+        }
+    }
+
     /// A pool of `stock` and the unit token at price one with no liquidity of its own.
     function _bare(PausableAsset stock) internal returns (PoolKey memory pool) {
         (address zero, address one) = address(usd) < address(stock)

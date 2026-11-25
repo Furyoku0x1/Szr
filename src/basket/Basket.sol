@@ -496,6 +496,10 @@ contract Basket is ERC20, ReentrancyGuard, IUnlockCallback {
         (uint160 price,,,) = poolManager.getSlot0(pool.toId());
         uint160 edge =
             TickMath.getSqrtPriceAtTick(zeroForOne ? entry.tickLower : entry.tickUpper);
+        // A full-range leg on a fine tick spacing ends exactly at v4's bounds, which v4 refuses
+        // as a limit; one step inside is the same edge for any swap.
+        if (edge == TickMath.MIN_SQRT_PRICE) edge++;
+        if (edge == TickMath.MAX_SQRT_PRICE) edge--;
         if (zeroForOne) {
             if (price <= edge) return;
         } else {
