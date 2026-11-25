@@ -38,7 +38,14 @@ abstract contract ExtensionWorld is MarketsWorld {
         super.setUp();
         vm.etch(address(backing), address(new WrappingAsset()).code);
         vm.deal(address(this), 1e30);
-        ext = new V4LiquidityExtension(locker, address(hook));
+        // Deployed from artifacts, as the Metric world's extension is, so that test contracts
+        // built on this world don't embed its creation code.
+        ext = V4LiquidityExtension(
+            payable(deployCode(
+                    "V4LiquidityExtension.sol:V4LiquidityExtension",
+                    abi.encode(locker, address(hook))
+                ))
+        );
         backing.mint(address(ext), HELD);
         coin.mint(address(ext), HELD);
         usd.mint(address(ext), HELD);

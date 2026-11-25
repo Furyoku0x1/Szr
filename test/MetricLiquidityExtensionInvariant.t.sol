@@ -11,7 +11,8 @@ import { PoolKey } from "v4-core/types/PoolKey.sol";
 /// @dev The manager funds, adds and removes bins, swaps through Metric and v4, wraps, gives to
 /// Core and calls the market; strangers try every entry point, both Metric callbacks, and the
 /// pool calls the extension back outside any call the extension made. Calls that fail are
-/// fine. A stranger's call that succeeds is recorded so the invariant reports it. The
+/// fine. A stranger's call that succeeds is recorded so the invariant reports it, except
+/// `donate`, which anyone may call: a donor gives pool tokens and WETH in its own action. The
 /// modify-liquidity callback's out-of-turn path is not exercised by the pool, since the mock
 /// never makes that call.
 contract MetricExtensionHandler is Test {
@@ -81,6 +82,33 @@ contract MetricExtensionHandler is Test {
         uint256 eth = bound(amount, 0, 10e18);
         dealt += eth;
         vm.deal(address(mext), address(mext).balance + eth);
+    }
+
+    /// Anyone may give a pool token, WETH or ETH. A gift that is allowed must arrive whole;
+    /// one that isn't is skipped, since the giver would keep what was minted for it.
+    function donate(uint256 which, uint256 amount) external {
+        address giver = address(0xD0D0);
+        uint256 pick = which % 4;
+        address asset = pick == 3 ? address(0) : address(coins[pick]);
+        if (!mext.donatable(asset)) {
+            if (asset != mext.weth()) return;
+        }
+        bool ok;
+        if (asset == address(0)) {
+            uint256 eth = bound(amount, 0, 10e18);
+            dealt += eth;
+            vm.deal(giver, eth);
+            vm.prank(giver);
+            (ok,) = address(mext).call{ value: eth }(abi.encodeCall(mext.donate, (asset, eth)));
+        } else {
+            uint256 gift = bound(amount, 0, 1_000e18);
+            coins[pick].mint(giver, gift);
+            vm.prank(giver);
+            coins[pick].approve(address(mext), gift);
+            vm.prank(giver);
+            (ok,) = address(mext).call(abi.encodeCall(mext.donate, (asset, gift)));
+        }
+        assertTrue(ok, "an allowed donation failed");
     }
 
     /// A call that is valid by construction for the current manager, so it must succeed.
@@ -387,11 +415,12 @@ contract MetricLiquidityExtensionInvariantTest is MetricExtensionWorld {
         start0 = t0.balanceOf(address(pool));
         start1 = t1.balanceOf(address(pool));
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](4);
+        bytes4[] memory selectors = new bytes4[](5);
         selectors[0] = MetricExtensionHandler.fund.selector;
         selectors[1] = MetricExtensionHandler.act.selector;
         selectors[2] = MetricExtensionHandler.certain.selector;
         selectors[3] = MetricExtensionHandler.work.selector;
+        selectors[4] = MetricExtensionHandler.donate.selector;
         targetSelector(FuzzSelector(address(handler), selectors));
     }
 

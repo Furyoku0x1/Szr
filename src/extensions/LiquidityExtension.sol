@@ -58,6 +58,8 @@ abstract contract LiquidityExtension is ReentrancyGuard, Multicallable, IUnlockC
     address public immutable weth;
     address public immutable hook;
     mapping(bytes32 poolId => bool registered) public routeRegistered;
+    /// Tokens of a registered route or pool, which anyone may give through `donate`.
+    mapping(address asset => bool) public donatable;
     bytes32 internal expected;
 
     error ZeroAddress();
@@ -83,6 +85,7 @@ abstract contract LiquidityExtension is ReentrancyGuard, Multicallable, IUnlockC
     event Unwrapped(uint256 amount);
     event MarketOpened(uint256 indexed marketId);
     event MarketCalled(bytes4 indexed selector);
+    event Donated(address indexed donor, address indexed asset, uint256 amount);
 
     constructor(Liquidity liquidity_, address hook_) {
         if (address(liquidity_) == address(0)) revert ZeroAddress();
@@ -101,7 +104,8 @@ abstract contract LiquidityExtension is ReentrancyGuard, Multicallable, IUnlockC
         _;
     }
 
-    /// @dev Only WETH (an unwrap) and the pool manager (a take) may send ETH.
+    /// @dev Plain ETH is taken only from WETH (an unwrap) and the pool manager (a take). A
+    /// donor sends ETH through `donate`.
     receive() external payable {
         if (msg.sender == weth) return;
         if (msg.sender == address(poolManager)) return;
@@ -114,7 +118,28 @@ abstract contract LiquidityExtension is ReentrancyGuard, Multicallable, IUnlockC
         (uint160 price,,,) = poolManager.getSlot0(poolId);
         if (price == 0) revert UnknownPool();
         routeRegistered[PoolId.unwrap(poolId)] = true;
+        _allowDonations(Currency.unwrap(pool.currency0), Currency.unwrap(pool.currency1));
         emit RouteRegistered(PoolId.unwrap(poolId));
+    }
+
+    /// @notice Gives this contract tokens for its positions. It is a gift: the donor gets no
+    /// shares and no claim, and the tokens leave only as any other balance does. Only WETH
+    /// and the tokens of a registered route or pool are taken. ETH comes as `msg.value`, with
+    /// `asset` zero, and stays ETH.
+    function donate(address asset, uint256 amount) external payable nonReentrant {
+        if (asset != weth) {
+            if (!donatable[asset]) revert InvalidAsset();
+        }
+        if (asset == address(0)) {
+            if (msg.value != amount) revert TransferAmountMismatch();
+        } else {
+            if (msg.value != 0) revert UnexpectedEther();
+            uint256 beforeBalance = _balance(asset);
+            SafeTransferLib.safeTransferFrom(asset, msg.sender, address(this), amount);
+            // A token that takes a fee on transfer could not be used in a position either.
+            if (_balance(asset) != beforeBalance + amount) revert TransferAmountMismatch();
+        }
+        emit Donated(msg.sender, asset, amount);
     }
 
     /// @notice One exact-input swap through a registered route, paid from this contract's
@@ -263,6 +288,11 @@ abstract contract LiquidityExtension is ReentrancyGuard, Multicallable, IUnlockC
         uint256 beforeBalance = _balance(asset);
         poolManager.take(currency, address(this), amount);
         if (_balance(asset) != beforeBalance + amount) revert TransferAmountMismatch();
+    }
+
+    function _allowDonations(address one, address two) internal {
+        donatable[one] = true;
+        donatable[two] = true;
     }
 
     function _balance(address asset) internal view returns (uint256) {

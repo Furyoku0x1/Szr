@@ -10,7 +10,8 @@ import { PoolKey } from "v4-core/types/PoolKey.sol";
 
 /// @dev The manager funds, swaps, deploys, withdraws, wraps, gives to Core and calls the
 /// market; strangers try every entry point. Calls that fail are fine. A stranger's call that
-/// succeeds is recorded so the invariant reports it.
+/// succeeds is recorded so the invariant reports it, except `donate`, which anyone may call:
+/// a donor gives pool tokens, WETH and ETH in its own action.
 contract ExtensionHandler is Test {
     V4LiquidityExtension internal ext;
     address internal manager;
@@ -54,6 +55,33 @@ contract ExtensionHandler is Test {
         uint256 eth = bound(amount, 0, 10e18);
         dealt += eth;
         vm.deal(address(ext), address(ext).balance + eth);
+    }
+
+    /// Anyone may give a pool token, WETH or ETH. A gift that is allowed must arrive whole;
+    /// one that isn't is skipped, since the giver would keep what was minted for it.
+    function donate(uint256 which, uint256 amount) external {
+        address giver = address(0xD0D0);
+        uint256 pick = which % 4;
+        address asset = pick == 3 ? address(0) : address(coins[pick]);
+        if (!ext.donatable(asset)) {
+            if (asset != ext.weth()) return;
+        }
+        bool ok;
+        if (asset == address(0)) {
+            uint256 eth = bound(amount, 0, 10e18);
+            dealt += eth;
+            vm.deal(giver, eth);
+            vm.prank(giver);
+            (ok,) = address(ext).call{ value: eth }(abi.encodeCall(ext.donate, (asset, eth)));
+        } else {
+            uint256 gift = bound(amount, 0, 1_000e18);
+            coins[pick].mint(giver, gift);
+            vm.prank(giver);
+            coins[pick].approve(address(ext), gift);
+            vm.prank(giver);
+            (ok,) = address(ext).call(abi.encodeCall(ext.donate, (asset, gift)));
+        }
+        assertTrue(ok, "an allowed donation failed");
     }
 
     /// A call that is valid by construction for the current manager, so it must succeed.
@@ -188,6 +216,8 @@ contract LiquidityExtensionInvariantTest is ExtensionWorld {
         PoolKey memory open = _openPool(address(backing), address(coin), 3_000);
         _route(open);
         _route(first);
+        // An ETH route, so that ETH is donatable and the donor's ETH gifts are fuzzed.
+        _route(_openPool(address(0), address(coin), 3_000));
         ext.addPosition(open, -600, 600);
         ext.addPosition(first, -600, 600);
         TestAsset[3] memory coins = [coin, usd, TestAsset(address(backing))];
@@ -213,10 +243,11 @@ contract LiquidityExtensionInvariantTest is ExtensionWorld {
         }
         ethOutside = _allowedHeld(address(0));
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](3);
+        bytes4[] memory selectors = new bytes4[](4);
         selectors[0] = ExtensionHandler.fund.selector;
         selectors[1] = ExtensionHandler.act.selector;
         selectors[2] = ExtensionHandler.certain.selector;
+        selectors[3] = ExtensionHandler.donate.selector;
         targetSelector(FuzzSelector(address(handler), selectors));
     }
 

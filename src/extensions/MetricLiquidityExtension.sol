@@ -95,6 +95,7 @@ contract MetricLiquidityExtension is
             imm.token0ScaleMultiplier,
             imm.token1ScaleMultiplier
         );
+        _allowDonations(imm.token0, imm.token1);
         emit MetricPoolAdded(pool);
     }
 
