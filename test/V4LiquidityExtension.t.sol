@@ -4,8 +4,11 @@ pragma solidity 0.8.30;
 import { MarketsWorld } from "./ArbitrageMarkets.t.sol";
 import { WrappingAsset } from "./utils/ArbitrageNative.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
+import { MockMetricFactory } from "./utils/metric/MockMetricPool.sol";
+import { IMetricFactory } from "../src/interfaces/metric/IMetricFactory.sol";
 import { V4LiquidityExtension } from "../src/extensions/V4LiquidityExtension.sol";
 import { LiquidityExtension } from "../src/extensions/LiquidityExtension.sol";
+import { MetricSwapping } from "../src/extensions/MetricSwapping.sol";
 import { Vm } from "forge-std/Vm.sol";
 import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { IHooks } from "v4-core/interfaces/IHooks.sol";
@@ -28,6 +31,7 @@ contract HookStub {
 /// given the real token's `deposit` and `withdraw`.
 abstract contract ExtensionWorld is MarketsWorld {
     V4LiquidityExtension internal ext;
+    MockMetricFactory internal metricFactory;
     uint256 internal constant HELD = 1_000_000e18;
     uint160 internal constant FLOOR = TickMath.MIN_SQRT_PRICE + 1;
     uint160 internal constant CEILING = TickMath.MAX_SQRT_PRICE - 1;
@@ -38,12 +42,13 @@ abstract contract ExtensionWorld is MarketsWorld {
         super.setUp();
         vm.etch(address(backing), address(new WrappingAsset()).code);
         vm.deal(address(this), 1e30);
+        metricFactory = new MockMetricFactory();
         // Deployed from artifacts, as the Metric world's extension is, so that test contracts
         // built on this world don't embed its creation code.
         ext = V4LiquidityExtension(
             payable(deployCode(
                     "V4LiquidityExtension.sol:V4LiquidityExtension",
-                    abi.encode(locker, address(hook))
+                    abi.encode(locker, address(hook), address(metricFactory))
                 ))
         );
         backing.mint(address(ext), HELD);
@@ -377,14 +382,14 @@ contract V4LiquidityExtensionTest is ExtensionWorld {
     function testConstructorRefusesAHookOfAnotherLiquidity() public {
         HookStub other = new HookStub(address(coin));
         vm.expectRevert(LiquidityExtension.InvalidHook.selector);
-        new V4LiquidityExtension(locker, address(other));
+        new V4LiquidityExtension(locker, address(other), IMetricFactory(address(metricFactory)));
     }
 
     function testRefusesSzrForeignHooksUnregisteredAndBadTicks() public {
         // An SZR pair belongs to Liquidity.
         PoolKey memory mainKey = locker.key(0);
         _route(mainKey);
-        vm.expectRevert(V4LiquidityExtension.InvalidPool.selector);
+        vm.expectRevert(MetricSwapping.InvalidPool.selector);
         ext.addPosition(mainKey, LOWER, UPPER);
         // A pool on a hook that is not the arbitrage hook.
         address foreign = address(uint160(0xBEEF << 24 | 1 << 7));
@@ -397,7 +402,7 @@ contract V4LiquidityExtensionTest is ExtensionWorld {
         );
         manager.initialize(odd, uint160(1 << 96));
         _route(odd);
-        vm.expectRevert(V4LiquidityExtension.InvalidPool.selector);
+        vm.expectRevert(MetricSwapping.InvalidPool.selector);
         ext.addPosition(odd, LOWER, UPPER);
         // A pool that was never registered.
         PoolKey memory open = _pair(address(backing), address(coin), 100, address(0));

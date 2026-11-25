@@ -3,6 +3,7 @@ pragma solidity 0.8.30;
 
 import { MetricExtensionWorld } from "./MetricLiquidityExtension.t.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
+import { IMetricFactory } from "../src/interfaces/metric/IMetricFactory.sol";
 import { LiquidityExtension } from "../src/extensions/LiquidityExtension.sol";
 import { V4LiquidityExtension } from "../src/extensions/V4LiquidityExtension.sol";
 import { MetricLiquidityExtension } from "../src/extensions/MetricLiquidityExtension.sol";
@@ -27,7 +28,9 @@ contract LiquidityExtensionDonationsTest is MetricExtensionWorld {
     uint256 internal constant GIFT = 1_000e18;
 
     function testADonatedV4PositionIsPaidForByTheDonorAlone() public {
-        V4LiquidityExtension fresh = new V4LiquidityExtension(locker, address(hook));
+        V4LiquidityExtension fresh = new V4LiquidityExtension(
+            locker, address(hook), IMetricFactory(address(metricFactory))
+        );
         PoolKey memory pool = _openPool(address(backing), address(coin), 3_000);
         fresh.registerRoute(pool);
         _give(LiquidityExtension(payable(address(fresh))), coin, GIFT);

@@ -2,14 +2,15 @@
 pragma solidity 0.8.30;
 
 import { Test } from "forge-std/Test.sol";
-import { ExtensionWorld } from "./V4LiquidityExtension.t.sol";
+import { MetricExtensionWorld, SwapPool } from "./MetricLiquidityExtension.t.sol";
 import { TestAsset } from "./utils/TestAsset.sol";
 import { Liquidity } from "../src/Liquidity.sol";
 import { V4LiquidityExtension } from "../src/extensions/V4LiquidityExtension.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 
-/// @dev The manager funds, swaps, deploys, withdraws, wraps, gives to Core and calls the
-/// market; strangers try every entry point. Calls that fail are fine. A stranger's call that
+/// @dev The manager funds, swaps on v4 and Metric, deploys, withdraws, wraps, gives to Core
+/// and calls the market; strangers try every entry point, and strangers and the Metric pool
+/// call the Metric swap callback out of turn. Calls that fail are fine. A stranger's call that
 /// succeeds is recorded so the invariant reports it, except `donate`, which anyone may call:
 /// a donor gives pool tokens, WETH and ETH in its own action.
 contract ExtensionHandler is Test {
@@ -20,6 +21,7 @@ contract ExtensionHandler is Test {
     TestAsset[3] internal coins;
     address internal szr;
     PoolKey[2] internal pools;
+    SwapPool internal metricPool;
     // The last slot takes the old manager after the handover.
     address[3] internal strangers = [address(0x5757), address(0xA11CE), address(0xB0B0)];
     uint256[] public markets;
@@ -34,7 +36,8 @@ contract ExtensionHandler is Test {
         TestAsset[3] memory coins_,
         address szr_,
         PoolKey memory one,
-        PoolKey memory two
+        PoolKey memory two,
+        SwapPool metricPool_
     ) {
         ext = ext_;
         manager = manager_;
@@ -43,6 +46,7 @@ contract ExtensionHandler is Test {
         szr = szr_;
         pools[0] = one;
         pools[1] = two;
+        metricPool = metricPool_;
     }
 
     function marketCount() external view returns (uint256) {
@@ -94,11 +98,11 @@ contract ExtensionHandler is Test {
     }
 
     function act(uint256 kind, uint256 seed, uint256 amount) external {
-        if (kind % 13 == 12) {
+        if (kind % 14 == 13) {
             _handOver();
             return;
         }
-        bytes memory data = _call(kind % 13, seed, bound(amount, 1, 5_000e18));
+        bytes memory data = _call(kind % 14, seed, bound(amount, 1, 5_000e18));
         if (seed % 3 == 0) {
             vm.prank(strangers[(seed >> 8) % 3]);
             (bool ok,) = address(ext).call(data);
@@ -113,7 +117,7 @@ contract ExtensionHandler is Test {
             if (ok) strangerSuccesses++;
             return;
         }
-        if (kind % 13 == 8) _open();
+        if (kind % 14 == 8) _open();
         vm.prank(manager);
         address(ext).call(data);
     }
@@ -171,7 +175,52 @@ contract ExtensionHandler is Test {
             address[3] memory assets = [address(coins[2]), szr, address(coins[0])];
             return abi.encodeCall(ext.toCore, (assets[(seed >> 48) % 3], amount));
         }
+        if (kind == 12) {
+            return abi.encodeCall(
+                ext.swapMetric, (address(metricPool), zeroForOne, amount, 0, 0, block.timestamp)
+            );
+        }
         return abi.encodeCall(ext.marketCall, (_market(kind, id, target)));
+    }
+
+    /// A Metric swap the manager can afford and the pool can fill, so it must succeed.
+    function swapOnMetric(uint256 seed, uint256 amount) external {
+        _swapOnMetric(seed, amount);
+    }
+
+    function _swapOnMetric(uint256 seed, uint256 amount) internal {
+        bool zeroForOne = seed % 2 == 0;
+        (address input, address output) = zeroForOne
+            ? (metricPool.token0(), metricPool.token1())
+            : (metricPool.token1(), metricPool.token0());
+        uint256 most = TestAsset(input).balanceOf(address(ext));
+        uint256 room = TestAsset(output).balanceOf(address(metricPool));
+        if (room < most) most = room;
+        if (most == 0) return;
+        uint256 size = bound(amount, 1, most);
+        vm.prank(manager);
+        (bool ok,) = address(ext)
+            .call(
+                abi.encodeCall(
+                    ext.swapMetric,
+                    (address(metricPool), zeroForOne, size, size, 0, block.timestamp)
+                )
+            );
+        assertTrue(ok, "the manager's valid Metric swap failed");
+    }
+
+    /// The Metric swap callback pays only the pool being called, and only while it is.
+    /// Foundry clears transient storage between the handler's calls, so a pool calling back
+    /// while another swap is active is tested inside one swap, in
+    /// `V4LiquidityExtensionMetricTest`.
+    function callBack(uint256 seed) external {
+        vm.prank(strangers[seed % 3]);
+        (bool ok,) =
+            address(ext).call(abi.encodeCall(ext.metricOmmSwapCallback, (1e18, 1e18, "")));
+        if (ok) strangerSuccesses++;
+        try metricPool.callBack(address(ext)) {
+            strangerSuccesses++;
+        } catch { }
     }
 
     /// The owner calls the extension must refuse, and one it may forward.
@@ -200,12 +249,13 @@ contract ExtensionHandler is Test {
 
 /// @dev Whatever the manager and strangers do, every unit of each asset stays with the
 /// extension, the pool manager, Core, Liquidity, WETH (for ETH), the treasury that takes the
-/// hook's share of market profit, and the test's own LP and swapper accounts, only the
+/// hook's share of market profit, the Metric pool, the idle Metric extension, and the test's
+/// own LP and swapper accounts, only the
 /// current manager changes state, and every market the extension opens keeps the extension
 /// as owner and recipient.
-contract LiquidityExtensionInvariantTest is ExtensionWorld {
+contract LiquidityExtensionInvariantTest is MetricExtensionWorld {
     ExtensionHandler internal handler;
-    address[11] internal allowed;
+    address[13] internal allowed;
     address[4] internal assets;
     // What the supply of each asset held outside the allowed set at the start.
     uint256[4] internal outside;
@@ -220,9 +270,10 @@ contract LiquidityExtensionInvariantTest is ExtensionWorld {
         _route(_openPool(address(0), address(coin), 3_000));
         ext.addPosition(open, -600, 600);
         ext.addPosition(first, -600, 600);
+        ext.addPool(address(pool));
         TestAsset[3] memory coins = [coin, usd, TestAsset(address(backing))];
         handler = new ExtensionHandler(
-            ext, address(this), locker, coins, address(szr), open, first
+            ext, address(this), locker, coins, address(szr), open, first, pool
         );
         allowed = [
             address(ext),
@@ -235,7 +286,9 @@ contract LiquidityExtensionInvariantTest is ExtensionWorld {
             address(provider),
             address(swapper),
             address(backing),
-            treasury
+            treasury,
+            address(mext),
+            address(pool)
         ];
         assets = [address(coin), address(usd), address(backing), address(szr)];
         for (uint256 a; a < assets.length; a++) {
@@ -243,11 +296,13 @@ contract LiquidityExtensionInvariantTest is ExtensionWorld {
         }
         ethOutside = _allowedHeld(address(0));
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](4);
+        bytes4[] memory selectors = new bytes4[](6);
         selectors[0] = ExtensionHandler.fund.selector;
         selectors[1] = ExtensionHandler.act.selector;
         selectors[2] = ExtensionHandler.certain.selector;
         selectors[3] = ExtensionHandler.donate.selector;
+        selectors[4] = ExtensionHandler.callBack.selector;
+        selectors[5] = ExtensionHandler.swapOnMetric.selector;
         targetSelector(FuzzSelector(address(handler), selectors));
     }
 

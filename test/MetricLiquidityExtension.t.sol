@@ -6,6 +6,7 @@ import { TestAsset } from "./utils/TestAsset.sol";
 import { MockMetricFactory } from "./utils/metric/MockMetricPool.sol";
 import { MockLiquidityPool, Donor } from "./utils/metric/MockLiquidityPool.sol";
 import { LiquidityExtension } from "../src/extensions/LiquidityExtension.sol";
+import { MetricSwapping } from "../src/extensions/MetricSwapping.sol";
 import { MetricLiquidityExtension } from "../src/extensions/MetricLiquidityExtension.sol";
 import { IMetricFactory } from "../src/interfaces/metric/IMetricFactory.sol";
 import {
@@ -144,7 +145,6 @@ abstract contract MetricExtensionWorld is ExtensionWorld {
     uint256 internal constant MIN = 1e9;
 
     MetricLiquidityExtension internal mext;
-    MockMetricFactory internal metricFactory;
     SwapPool internal pool;
     TestAsset internal t0;
     TestAsset internal t1;
@@ -152,7 +152,6 @@ abstract contract MetricExtensionWorld is ExtensionWorld {
 
     function setUp() public virtual override {
         super.setUp();
-        metricFactory = new MockMetricFactory();
         // Deployed from artifacts: embedding the creation code would push the test
         // contract over the size limit.
         mext = MetricLiquidityExtension(
@@ -275,18 +274,18 @@ contract MetricLiquidityExtensionTest is MetricExtensionWorld {
 
     function testCallbacksRefuseAnyoneButTheCalledPool() public {
         // Not during a call at all.
-        vm.expectRevert(MetricLiquidityExtension.NotPool.selector);
+        vm.expectRevert(MetricSwapping.NotPool.selector);
         mext.metricOmmModifyLiquidityCallback(1, 1, "");
-        vm.expectRevert(MetricLiquidityExtension.NotPool.selector);
+        vm.expectRevert(MetricSwapping.NotPool.selector);
         mext.metricOmmSwapCallback(1, 1, "");
         // Another pool the extension has added is refused too: only the recorded one pays.
         SwapPool other = _pool(address(t0), address(t1), none);
         mext.addPool(address(other));
         vm.prank(address(other));
-        vm.expectRevert(MetricLiquidityExtension.NotPool.selector);
+        vm.expectRevert(MetricSwapping.NotPool.selector);
         mext.metricOmmModifyLiquidityCallback(1, 1, "");
         vm.prank(address(other));
-        vm.expectRevert(MetricLiquidityExtension.NotPool.selector);
+        vm.expectRevert(MetricSwapping.NotPool.selector);
         mext.metricOmmSwapCallback(1, 1, "");
     }
 
@@ -298,7 +297,7 @@ contract MetricLiquidityExtensionTest is MetricExtensionWorld {
                 abi.encode(address(t0), address(t1), MIN, none)
             )
         );
-        vm.expectRevert(MetricLiquidityExtension.InvalidPool.selector);
+        vm.expectRevert(MetricSwapping.InvalidPool.selector);
         mext.addPool(address(foreign));
         // An extension around removal could hold every withdrawal back.
         uint256[4] memory before = [uint256(0), 0, 1, 0];
@@ -315,9 +314,9 @@ contract MetricLiquidityExtensionTest is MetricExtensionWorld {
         // SZR pairs belong to Liquidity, on either side.
         SwapPool szrFirst = _pool(address(szr), address(t1), none);
         SwapPool szrSecond = _pool(address(t0), address(szr), none);
-        vm.expectRevert(MetricLiquidityExtension.SzrPool.selector);
+        vm.expectRevert(MetricSwapping.SzrPool.selector);
         mext.addPool(address(szrFirst));
-        vm.expectRevert(MetricLiquidityExtension.SzrPool.selector);
+        vm.expectRevert(MetricSwapping.SzrPool.selector);
         mext.addPool(address(szrSecond));
     }
 
@@ -342,7 +341,7 @@ contract MetricLiquidityExtensionTest is MetricExtensionWorld {
         assertEq(got, 40e18);
         vm.expectRevert(LiquidityExtension.DeadlinePassed.selector);
         mext.swapMetric(address(pool), true, 1, 0, 0, block.timestamp - 1);
-        vm.expectRevert(MetricLiquidityExtension.ZeroAmount.selector);
+        vm.expectRevert(MetricSwapping.ZeroAmount.selector);
         mext.swapMetric(address(pool), true, 0, 0, 0, block.timestamp);
         vm.expectRevert(LiquidityExtension.AboveMaximum.selector);
         mext.swapMetric(address(pool), true, MAX, 0, 0, block.timestamp);
@@ -399,7 +398,7 @@ contract MetricLiquidityExtensionTest is MetricExtensionWorld {
         SwapPool other = _pool(address(t0), address(t1), none);
         mext.addPool(address(other));
         pool.setPoke(other);
-        vm.expectRevert(MetricLiquidityExtension.NotPool.selector);
+        vm.expectRevert(MetricSwapping.NotPool.selector);
         mext.swapMetric(address(pool), true, 1e18, 0, 0, block.timestamp);
     }
 

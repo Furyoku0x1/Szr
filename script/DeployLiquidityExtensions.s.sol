@@ -45,7 +45,7 @@ contract DeployLiquidityExtensions is Script {
         if (config.hook.code.length == 0) revert MissingHook();
         if (address(config.metricFactory).code.length == 0) revert MissingMetricFactory();
         vm.startBroadcast();
-        v4 = new V4LiquidityExtension(config.liquidity, config.hook);
+        v4 = new V4LiquidityExtension(config.liquidity, config.hook, config.metricFactory);
         metric =
             new MetricLiquidityExtension(config.liquidity, config.hook, config.metricFactory);
         vm.stopBroadcast();

@@ -5,6 +5,7 @@ import { Test, console } from "forge-std/Test.sol";
 import { IERC20 } from "forge-std/interfaces/IERC20.sol";
 import { Liquidity } from "../../src/Liquidity.sol";
 import { MetricLiquidityExtension } from "../../src/extensions/MetricLiquidityExtension.sol";
+import { V4LiquidityExtension } from "../../src/extensions/V4LiquidityExtension.sol";
 import { IMetricFactory } from "../../src/interfaces/metric/IMetricFactory.sol";
 import {
     IMetricLiquidityPool,
@@ -124,6 +125,25 @@ contract LiquidityExtensionsForkTest is Test {
         ext.toCore(WETH, give);
         assertEq(IERC20(WETH).balanceOf(address(ext)), 0, "sent to Core");
         assertEq(ext.core().reserveCash(), cash + give, "backing raised");
+        vm.stopPrank();
+    }
+
+    /// The v4 extension trades on the live Metric pool directly, with no v4 wrapper.
+    function testTheV4ExtensionSwapsOnTheLiveMetricPool() public onlyFork {
+        V4LiquidityExtension v4 =
+            new V4LiquidityExtension(LIQUIDITY, address(ext.hook()), IMetricFactory(FACTORY));
+        deal(WETH, address(v4), 10e18);
+        vm.startPrank(manager);
+        v4.addPool(address(POOL));
+        (uint256 spent, uint256 got) =
+            v4.swapMetric(address(POOL), true, 10e18, 1, 0, block.timestamp);
+        assertEq(spent, 10e18, "all of the WETH was filled");
+        assertEq(IERC20(WETH).balanceOf(address(v4)), 0, "WETH paid");
+        assertEq(IERC20(USDG).balanceOf(address(v4)), got, "USDG received");
+        (spent,) =
+            v4.swapMetric(address(POOL), false, got, 1, type(uint128).max, block.timestamp);
+        assertEq(spent, got, "all of the USDG was filled");
+        assertGt(IERC20(WETH).balanceOf(address(v4)), 0, "WETH back");
         vm.stopPrank();
     }
 

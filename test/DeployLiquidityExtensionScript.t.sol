@@ -22,6 +22,7 @@ contract DeployLiquidityExtensionScriptTest is MarketsWorld {
         assertEq(address(metric.liquidity()), address(locker));
         assertEq(metric.hook(), address(hook));
         assertEq(address(metric.factory()), address(factory));
+        assertEq(address(v4.factory()), address(factory));
     }
 
     function test_revertsWithoutCodeAtAnAddress() public {

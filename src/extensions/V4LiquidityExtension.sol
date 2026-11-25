@@ -8,13 +8,15 @@ import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
 import { Currency } from "v4-core/types/Currency.sol";
 import { BalanceDelta } from "v4-core/types/BalanceDelta.sol";
 import { Liquidity } from "../Liquidity.sol";
-import { LiquidityExtension } from "./LiquidityExtension.sol";
+import { IMetricFactory } from "../interfaces/metric/IMetricFactory.sol";
+import { MetricSwapping } from "./MetricSwapping.sol";
 
 /// @notice Holds Uniswap v4 positions in pools without SZR, funded by Liquidity. A pool
 /// must be a registered route, and run no hook or the arbitrage hook: any other hook could
-/// have liquidity callbacks and hold a position.
+/// have liquidity callbacks and hold a position. It also swaps on Metric pools added with
+/// `addPool` (`MetricSwapping`), but holds no Metric positions.
 /// @dev Positions are owned by this contract. Fees land here as plain balances.
-contract V4LiquidityExtension is LiquidityExtension {
+contract V4LiquidityExtension is MetricSwapping {
     using PoolIdLibrary for PoolKey;
 
     uint256 internal constant KIND_MODIFY = 1;
@@ -28,7 +30,6 @@ contract V4LiquidityExtension is LiquidityExtension {
     uint256 public positionCount;
     mapping(uint256 id => Position) public positions;
 
-    error InvalidPool();
     error InvalidRange();
     error UnknownPosition();
     error ZeroLiquidity();
@@ -38,7 +39,9 @@ contract V4LiquidityExtension is LiquidityExtension {
     event Withdrawn(uint256 indexed id, uint256 amount0, uint256 amount1);
     event Collected(uint256 indexed id, uint256 fees0, uint256 fees1);
 
-    constructor(Liquidity liquidity_, address hook_) LiquidityExtension(liquidity_, hook_) { }
+    constructor(Liquidity liquidity_, address hook_, IMetricFactory factory_)
+        MetricSwapping(liquidity_, hook_, factory_)
+    { }
 
     function addPosition(PoolKey calldata pool, int24 tickLower, int24 tickUpper)
         external
