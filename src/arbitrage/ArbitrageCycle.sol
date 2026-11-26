@@ -57,7 +57,7 @@ abstract contract CyclePart is ArbitrageLogic {
             address protocol = shareRecipient[home];
             // Checked for the whole profit before the try below, so that a drain is never
             // turned into a claim.
-            _funded(asset, profit, true);
+            V4Read._funded(poolManager, asset, profit, true);
             if (protocol == address(core)) {
                 // Core cannot redeem a claim, so one minted to it would be stuck.
                 poolManager.take(asset, protocol, share);
@@ -86,7 +86,7 @@ abstract contract CyclePart is ArbitrageLogic {
         // A failed wrap is a named error: an empty revert would be read as too little gas.
         try IWrapped(backingAsset).deposit{ value: profit }() { }
         catch {
-            revert Unsettled();
+            revert V4Read.Unsettled();
         }
         SafeTransferLib.safeTransfer(backingAsset, shareRecipient[address(0)], share);
         if (profit != share) {

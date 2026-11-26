@@ -9,6 +9,7 @@ import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { MetricPricer } from "../src/pricers/MetricPricer.sol";
 import { MetricVenueHook } from "../src/hooks/MetricVenueHook.sol";
+import { MetricBook } from "../src/pricers/lib/MetricBook.sol";
 
 /// @dev A Metric pool that answers with set prices and set storage words.
 contract MockBook {
@@ -206,14 +207,14 @@ contract MetricPricerTest is Test {
         _standard(false);
         // A sell price of zero is the whole midpoint away.
         book.setPrices(0, uint128(8 * Q64));
-        vm.expectRevert(MetricPricer.NoPrice.selector);
+        vm.expectRevert(MetricBook.NoPrice.selector);
         pricer.price(key);
     }
 
     function testNoPriceWithoutABin() public {
         _standard(false);
         book.setBin(7, MAX_POS / 2, -5000, 2e18, 1e18, 0);
-        vm.expectRevert(MetricPricer.NoPrice.selector);
+        vm.expectRevert(MetricBook.NoPrice.selector);
         pricer.price(key);
     }
 
@@ -244,7 +245,7 @@ contract MetricPricerTest is Test {
     function testNoPriceWhenPaused() public {
         _standard(false);
         book.setPause(1);
-        vm.expectRevert(MetricPricer.NoPrice.selector);
+        vm.expectRevert(MetricBook.NoPrice.selector);
         pricer.price(key);
     }
 
@@ -261,10 +262,10 @@ contract MetricPricerTest is Test {
     function testNoPriceWhenTheBinReachesZeroPrice() public {
         _standard(false);
         book.setBin(7, MAX_POS / 2, -1_000_000, 2e18, 1e18, 10_000);
-        vm.expectRevert(MetricPricer.NoPrice.selector);
+        vm.expectRevert(MetricBook.NoPrice.selector);
         pricer.price(key);
         book.setBin(7, MAX_POS / 2, -1_500_000, 2e18, 1e18, 10_000);
-        vm.expectRevert(MetricPricer.NoPrice.selector);
+        vm.expectRevert(MetricBook.NoPrice.selector);
         pricer.price(key);
     }
 

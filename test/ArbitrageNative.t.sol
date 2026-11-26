@@ -19,6 +19,7 @@ import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { Currency } from "v4-core/types/Currency.sol";
+import { V4Read } from "../src/arbitrage/lib/V4Read.sol";
 
 /// @dev Native ETH is a token like any other, with currency zero. A market may count profit
 /// in it; the profit is then paid out as WETH. `id` is a market that counts in ETH and
@@ -330,7 +331,7 @@ contract ArbitrageNativeTest is MarketsWorld {
             if (logs[index].topics[0] != ArbitrageLogic.SearchUndone.selector) continue;
             undone = true;
             (bytes4 reason) = abi.decode(logs[index].data, (bytes4));
-            assertEq(reason, ArbitrageLogic.Unsettled.selector, "named error");
+            assertEq(reason, V4Read.Unsettled.selector, "named error");
         }
         assertTrue(undone, "the search was undone");
         _assertClean();

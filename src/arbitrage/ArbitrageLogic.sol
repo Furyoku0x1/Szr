@@ -24,16 +24,13 @@ import { BeforeSwapDelta, BeforeSwapDeltaLibrary } from "v4-core/types/BeforeSwa
 import { SzrCore } from "../SzrCore.sol";
 import { Liquidity } from "../Liquidity.sol";
 import { IVenuePricer } from "../interfaces/IVenuePricer.sol";
+import { SizingWalk } from "./lib/SizingWalk.sol";
+import { V4Read } from "./lib/V4Read.sol";
 
 /// @dev Only the WETH calls the ETH payout and the wrap link need.
 interface IWrapped {
     function deposit() external payable;
     function withdraw(uint256 amount) external;
-}
-
-/// @dev Read raw by `_funded`, so a failed read can be told from a shortage.
-interface IERC20Balance {
-    function balanceOf(address account) external view returns (uint256);
 }
 
 /// @dev `SZR_MARKET`, readable without a call to the hook by contracts that only name it.
@@ -157,25 +154,18 @@ abstract contract ArbitrageLogic {
     /// quarter and an eighth of it. The estimate reads liquidity at the current price,
     /// which can be made to mislead in either direction.
     uint256 internal constant TRIES = 5;
-    /// @dev The most boundary events (a tick crossed, or an empty word passed) one sizing
-    /// walk follows, across all its legs together. Reaching it stops the walk where it is,
-    /// which under-trades. See `size`.
-    uint256 internal constant SIZING_STEPS = 8;
+    /// @dev The walk's constants live with its engine, `SizingWalk`; see `size`.
+    uint256 internal constant SIZING_STEPS = SizingWalk.SIZING_STEPS;
     /// @dev The gas the sizing walk is given. It lets every measured route reach
     /// `SIZING_STEPS` except dust at every tick, which stops for gas a step or two short (see
     /// `docs/specs/hook-exact-sizing.md`). The walk stops when it cannot afford another step
     /// (see `SIZING_STEP_GAS`), so a walk that would need more returns the size it has found
     /// so far instead of running out.
     uint256 internal constant SIZING_GAS = 240_000;
-    /// @dev What one more step of the walk may cost per leg, and what is held back for the
-    /// answer after the last one. Measured at about 20k for a step with two legs and 28k to 33k
-    /// with three, and rounded up. The walk stops before a step it cannot afford.
-    uint256 internal constant SIZING_STEP_GAS = 12_000;
-    uint256 internal constant SIZING_TAIL_GAS = 5_000;
-    /// @dev Every size the walk answers is held back by this share of the whole cycle input
-    /// plus a few wei, so that every leg really fills whatever rounding the crossings left.
-    uint256 internal constant SIZING_SHAVE = 1_000_000;
-    uint256 internal constant SIZING_WEI = 16;
+    uint256 internal constant SIZING_STEP_GAS = SizingWalk.SIZING_STEP_GAS;
+    uint256 internal constant SIZING_TAIL_GAS = SizingWalk.SIZING_TAIL_GAS;
+    uint256 internal constant SIZING_SHAVE = SizingWalk.SIZING_SHAVE;
+    uint256 internal constant SIZING_WEI = SizingWalk.SIZING_WEI;
     /// @dev How far above the smallest profit a cycle's estimate must be to be tried, in
     /// percent.
     uint256 internal constant PLAN_MARGIN = 125;
@@ -187,22 +177,20 @@ abstract contract ArbitrageLogic {
     /// @dev A square-root price gap beyond this (a 16x price difference) is a broken or
     /// manipulated venue, not something to arbitrage.
     uint256 internal constant MAX_EDGE = 4e18;
-    /// @dev Bounds that keep the pricing arithmetic from overflowing whatever a pool's state.
-    /// An empty pool's price can be pushed anywhere for free, and one overflow would stop
-    /// the search for every pool. A square-root price outside the band (a price ratio beyond
-    /// about 5e33 either way) is treated as no price at all.
-    uint256 internal constant MIN_RATE = 1 << 40;
-    uint256 internal constant MAX_RATE = 1 << 152;
+    /// @dev Bounds that keep the pricing arithmetic from overflowing whatever a pool's state
+    /// (see `V4Read`). The ones the walk and the pool reads share are declared there.
+    uint256 internal constant MIN_RATE = V4Read.MIN_RATE;
+    uint256 internal constant MAX_RATE = V4Read.MAX_RATE;
     uint256 internal constant MAX_ROUTE_RATE = 1 << 192;
-    uint256 internal constant MAX_CYCLE_RATE = 1 << 180;
+    uint256 internal constant MAX_CYCLE_RATE = SizingWalk.MAX_CYCLE_RATE;
     uint256 internal constant MIN_CYCLE_KEEP = 1e12;
-    uint256 internal constant MAX_DEPTH = 1 << 160;
-    uint256 internal constant WAD = 1e18;
+    uint256 internal constant MAX_DEPTH = SizingWalk.MAX_DEPTH;
+    uint256 internal constant WAD = V4Read.WAD;
     /// @dev A reserved link id for converting between ETH and WETH one for one. It is no
     /// pool: it has rate `Q96`, keep `WAD` and depth `MAX_DEPTH`, and reads no storage.
     bytes32 internal constant WRAP = bytes32(uint256(1));
-    uint256 internal constant Q96 = 1 << 96;
-    uint256 internal constant Q192 = 1 << 192;
+    uint256 internal constant Q96 = V4Read.Q96;
+    uint256 internal constant Q192 = V4Read.Q192;
     address internal constant UNRELEASED = address(1);
     /// @dev While a sweep or a trigger runs its heads, `REUSE_SLOT` is set, and `ANSWERED_SLOT`
     /// holds the market whose pricers the run has asked, or zero.
@@ -403,55 +391,6 @@ abstract contract ArbitrageLogic {
         address resync;
     }
 
-    /// @dev One leg of a cycle as the sizing walk sees it, in the order value flows. `id` is
-    /// zero for Core redemption, which has no state. `rate` is the leg's marginal rate at
-    /// size zero as a Q96 square root, fee included, and `depth` its depth in input units;
-    /// `depthIn` is the depth of all the legs before it, and `flowIn` the most they can ever
-    /// supply. `reach` is the gross
-    /// input that takes the leg to `target`, the price of tick `next`, and `beyond` the
-    /// liquidity past it. `limit` is the price the real trade is given as its limit (zero for
-    /// none, as for Core), and `edge` marks a `target` that is that limit or the end of the
-    /// tick range: the end of the leg. `broken` marks a boundary that could not be read.
-    struct Leg {
-        bytes32 id;
-        bool zeroForOne;
-        bool initialized;
-        bool edge;
-        bool broken;
-        bool wrapped;
-        int24 spacing;
-        int24 tick;
-        int24 next;
-        uint24 fee;
-        uint128 liquidity;
-        uint128 beyond;
-        uint160 price;
-        uint160 target;
-        uint160 limit;
-        uint256 keep;
-        uint256 rate;
-        uint256 depth;
-        uint256 depthIn;
-        uint256 flowIn;
-        uint256 reach;
-    }
-
-    /// @dev What a sizing walk has found so far: the cycle input, the input of the focus
-    /// pool, and the profit it is expected to make. Two flags say different things.
-    /// `stopped` means the walk never declines what it found; it is set when the walk stops
-    /// at its cap on boundary events or for want of gas, and is also preset for any cycle
-    /// with a wrapped leg. `short` means the walk could not carry on to its natural end; it
-    /// is set at the four places where that happens and nowhere else, and it is what makes
-    /// a cycle partial.
-    struct Walk {
-        uint256 total;
-        uint256 focusIn;
-        int256 predicted;
-        uint256 steps;
-        bool stopped;
-        bool short;
-    }
-
     IPoolManager public immutable poolManager;
     Liquidity public immutable liquidity;
     SzrCore public immutable core;
@@ -568,16 +507,12 @@ abstract contract ArbitrageLogic {
     error InvalidPool();
     error InvalidLimit();
     error PoolNotRegistered();
-    error InvalidDelta();
     error Incomplete();
     error Unprofitable();
-    error Unsettled();
-    error Unsizable();
     error Starved();
     /// @dev What `askFrame` always reverts with when the pricer answered with five words.
     error Answer(uint256[5] answer);
     error InsufficientGas();
-    error Drained();
     error TooManyMarkets();
     error NotTrusted();
     error TooManyTriggers();
@@ -1366,7 +1301,7 @@ abstract contract ArbitrageLogic {
         // After a swap, the search is undone like any other and the next swap, `arb`
         // or `sweep` closes the gap.
         if (before) {
-            if (bytes4(reason) == Drained.selector) revert Drained();
+            if (bytes4(reason) == V4Read.Drained.selector) revert V4Read.Drained();
         }
         // If the swap, not the hook's own allowance, was what ran short, it brought
         // too little gas either to look for a gap (no revert data) or to close the one
@@ -1827,12 +1762,12 @@ abstract contract ArbitrageLogic {
             IWrapped(backingAsset).deposit{ value: amount }();
             poolManager.sync(Currency.wrap(backingAsset));
             SafeTransferLib.safeTransfer(backingAsset, address(poolManager), amount);
-            if (poolManager.settle() != amount) revert InvalidDelta();
+            if (poolManager.settle() != amount) revert V4Read.InvalidDelta();
             return;
         }
         IWrapped(backingAsset).withdraw(amount);
         poolManager.sync(Currency.wrap(address(0)));
-        if (poolManager.settle{ value: amount }() != amount) revert InvalidDelta();
+        if (poolManager.settle{ value: amount }() != amount) revert V4Read.InvalidDelta();
     }
 
     /// @dev The takes a cycle makes go through here, so that a pool manager short of the
@@ -1845,34 +1780,8 @@ abstract contract ArbitrageLogic {
     /// for, so an honest pool manager always has it. Only the profit token, SZR, ETH, WETH
     /// and the input token of a wrapped leg (see `_legLimit`) are ever asked about.
     function _take(Currency asset, address to, uint256 amount) internal {
-        _funded(asset, amount, false);
+        V4Read._funded(poolManager, asset, amount, false);
         poolManager.take(asset, to, amount);
-    }
-
-    /// @dev At payout (`payout` true) a read that failed with at least half of its gas left
-    /// failed on purpose, as no call that ran out of gas leaves more than a 64th. That is
-    /// the named `Unsettled`, which undoes the search and lets the swap go on. Anywhere else,
-    /// and when little gas is left, the empty revert stays: it reads as too little gas.
-    function _funded(Currency asset, uint256 amount, bool payout) internal view {
-        address id = Currency.unwrap(asset);
-        uint256 held;
-        if (id == address(0)) {
-            held = address(poolManager).balance;
-        } else {
-            uint256 gas = gasleft();
-            (bool ok, bytes memory data) =
-                id.staticcall(abi.encodeCall(IERC20Balance.balanceOf, (address(poolManager))));
-            bool bad = !ok;
-            if (data.length < 32) bad = true;
-            if (bad) {
-                if (payout) {
-                    if (gasleft() >= gas / 2) revert Unsettled();
-                }
-                revert();
-            }
-            held = abi.decode(data, (uint256));
-        }
-        if (held < amount) revert Drained();
     }
 
     /// @dev Re-raises `Drained` from a failed try. Only the first four bytes of what the
@@ -1888,7 +1797,7 @@ abstract contract ArbitrageLogic {
                 word := mload(ptr)
             }
         }
-        if (bytes4(word) == Drained.selector) revert Drained();
+        if (bytes4(word) == V4Read.Drained.selector) revert V4Read.Drained();
     }
 
     /// @dev The first try is sized by `size`, which walks the legs' ticks, when the cycle is
@@ -2018,9 +1927,9 @@ abstract contract ArbitrageLogic {
     /// transaction was refused at the end. Here it fails the cycle, and the swap goes on.
     function _requireTidy(uint256 open, int256 held, uint256 profit) internal view {
         int256 holding = poolManager.currencyDelta(address(this), Currency.wrap(home));
-        if (holding != held + int256(profit)) revert Unsettled();
+        if (holding != held + int256(profit)) revert V4Read.Unsettled();
         if (held == 0) open++;
-        if (poolManager.getNonzeroDeltaCount() > open) revert Unsettled();
+        if (poolManager.getNonzeroDeltaCount() > open) revert V4Read.Unsettled();
     }
 
     /// @dev Buys SZR in the pool up to the price limit, then works backwards with exact
@@ -2033,7 +1942,8 @@ abstract contract ArbitrageLogic {
         PoolKey memory own = keys[poolId];
         address base = home;
         address asset = _other(own, base);
-        (uint256 owed, uint256 bought) = _trade(own, asset, -int256(plan.spend), plan.limit);
+        (uint256 owed, uint256 bought) =
+            V4Read._trade(poolManager, own, asset, -int256(plan.spend), plan.limit);
         // The ether token to convert once it is held, and how much; `UNRELEASED` for none.
         address later = UNRELEASED;
         uint256 amount;
@@ -2078,7 +1988,8 @@ abstract contract ArbitrageLogic {
         PoolKey memory own = keys[poolId];
         address base = home;
         address asset = _other(own, base);
-        (uint256 sold, uint256 held) = _trade(own, base, -int256(plan.spend), plan.limit);
+        (uint256 sold, uint256 held) =
+            V4Read._trade(poolManager, own, base, -int256(plan.spend), plan.limit);
         for (uint256 hop; hop < 2; hop++) {
             if (plan.links[hop] == bytes32(0)) break;
             address next;
@@ -2156,7 +2067,7 @@ abstract contract ArbitrageLogic {
         uint256 received = core.redeem(amount, owed);
         poolManager.sync(Currency.wrap(backingAsset));
         SafeTransferLib.safeTransfer(backingAsset, address(poolManager), received);
-        if (poolManager.settle() != received) revert InvalidDelta();
+        if (poolManager.settle() != received) revert V4Read.InvalidDelta();
         excess = received - owed;
         if (wrapped) return (amount, excess);
         if (excess != 0) poolManager.clear(Currency.wrap(backingAsset), excess);
@@ -2167,7 +2078,9 @@ abstract contract ArbitrageLogic {
         returns (uint256 received)
     {
         uint256 spent;
-        (spent, received) = _trade(pool, input, -int256(amount), _legLimit(pool, input, gap));
+        (spent, received) = V4Read._trade(
+            poolManager, pool, input, -int256(amount), _legLimit(pool, input, gap)
+        );
         if (spent != amount) revert Incomplete();
     }
 
@@ -2177,7 +2090,9 @@ abstract contract ArbitrageLogic {
     {
         uint256 received;
         address input = _other(pool, output);
-        (spent, received) = _trade(pool, input, int256(amount), _legLimit(pool, input, gap));
+        (spent, received) = V4Read._trade(
+            poolManager, pool, input, int256(amount), _legLimit(pool, input, gap)
+        );
         if (received != amount) revert Incomplete();
     }
 
@@ -2205,47 +2120,11 @@ abstract contract ArbitrageLogic {
         if (pricers[address(pool.hooks)] != address(0)) {
             Currency asset = Currency.wrap(input);
             int256 credit = poolManager.currencyDelta(address(this), asset);
-            if (credit > 0) _funded(asset, uint256(credit), false);
+            if (credit > 0) V4Read._funded(poolManager, asset, uint256(credit), false);
             return 0;
         }
         (uint160 price,,,) = poolManager.getSlot0(pool.toId());
-        return _limitFrom(price, Currency.unwrap(pool.currency0) == input, gap);
-    }
-
-    /// @dev `price` moved against a trade by `(1 + gap)²`, inside `TickMath`'s range.
-    function _limitFrom(uint160 price, bool zeroForOne, uint256 gap)
-        internal
-        pure
-        returns (uint160)
-    {
-        uint256 wide = WAD + gap;
-        uint256 factor = FixedPointMathLib.fullMulDiv(wide, wide, WAD);
-        if (zeroForOne) {
-            uint256 low = FixedPointMathLib.fullMulDiv(price, WAD, factor);
-            return low > TickMath.MIN_SQRT_PRICE ? uint160(low) : TickMath.MIN_SQRT_PRICE + 1;
-        }
-        uint256 high = FixedPointMathLib.fullMulDiv(price, factor, WAD);
-        return high < TickMath.MAX_SQRT_PRICE ? uint160(high) : TickMath.MAX_SQRT_PRICE - 1;
-    }
-
-    /// @dev `amount` follows v4: negative is an exact input, positive an exact output.
-    /// A zero `limit` means no price limit.
-    function _trade(PoolKey memory pool, address input, int256 amount, uint160 limit)
-        internal
-        returns (uint256 spent, uint256 received)
-    {
-        bool zeroForOne = Currency.unwrap(pool.currency0) == input;
-        if (limit == 0) {
-            limit = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
-        }
-        BalanceDelta delta =
-            poolManager.swap(pool, IPoolManager.SwapParams(zeroForOne, amount, limit), "");
-        int128 paid = zeroForOne ? delta.amount0() : delta.amount1();
-        int128 got = zeroForOne ? delta.amount1() : delta.amount0();
-        if (paid > 0) revert InvalidDelta();
-        if (got < 0) revert InvalidDelta();
-        spent = uint256(-int256(paid));
-        received = uint256(int256(got));
+        return V4Read._limitFrom(price, Currency.unwrap(pool.currency0) == input, gap);
     }
 
     /// @dev A cycle owes and is owed nothing in a token it passes through. In a search over
@@ -2259,7 +2138,7 @@ abstract contract ArbitrageLogic {
         if (held == 0) {
             if (!_anyCredit()) return;
         }
-        if (held != int256(_credited(asset))) revert Unsettled();
+        if (held != int256(_credited(asset))) revert V4Read.Unsettled();
     }
 
     /// @dev What the books of this search have earned in `asset` and not yet had paid out.
@@ -2600,8 +2479,8 @@ abstract contract ArbitrageLogic {
     function _price(Venue memory venue, bytes32 word, address base) internal pure {
         uint24 fee;
         uint24 levy;
-        (venue.rate, fee, levy) = _unpack(word, base < venue.partner);
-        venue.keep = _keepFast(_swapFee(fee, levy));
+        (venue.rate, fee, levy) = V4Read._unpack(word, base < venue.partner);
+        venue.keep = V4Read._keepFast(V4Read._swapFee(fee, levy));
     }
 
     /// @dev Prices every other venue against the focus pool and keeps the cycle expected
@@ -2748,7 +2627,7 @@ abstract contract ArbitrageLogic {
         if (block.timestamp < benched[key].until) return;
         uint256 others =
             venue.id == bytes32(0) ? MAX_DEPTH : _depth(venue.id, venue.rate, venue.rate);
-        if (route.links[0] != bytes32(0)) others = _harmonic(others, route.depth);
+        if (route.links[0] != bytes32(0)) others = V4Read._harmonic(others, route.depth);
         // Above a tenth of `others` the real estimate is at least an eleventh of the
         // stand-in's, so only a gap worth under about eleven times the gate can hide.
         if (focus.depth * STANDIN_RATIO >= others) return;
@@ -2893,14 +2772,14 @@ abstract contract ArbitrageLogic {
         }
         depth = focus.depth;
         if (venue.id != bytes32(0)) {
-            depth = _harmonic(depth, _depth(venue.id, venue.rate, venue.rate));
+            depth = V4Read._harmonic(depth, _depth(venue.id, venue.rate, venue.rate));
         }
         if (route.links[0] == bytes32(0)) return depth;
         if (!route.sized) {
             route.depth = _routeDepth(focus.rate, route);
             route.sized = true;
         }
-        depth = _harmonic(depth, route.depth);
+        depth = V4Read._harmonic(depth, route.depth);
     }
 
     function _routeDepth(uint256 flow, Route memory route)
@@ -2912,7 +2791,7 @@ abstract contract ArbitrageLogic {
         depth = _linkDepth(route.links[0], route.rates[0], flow);
         if (route.links[1] == bytes32(0)) return depth;
         flow = FixedPointMathLib.fullMulDiv(flow, Q96, route.rates[0]);
-        depth = _harmonic(depth, _linkDepth(route.links[1], route.rates[1], flow));
+        depth = V4Read._harmonic(depth, _linkDepth(route.links[1], route.rates[1], flow));
     }
 
     /// @dev `candidate.gap` is how far the square-root prices are apart beyond fees, as a
@@ -3042,13 +2921,6 @@ abstract contract ArbitrageLogic {
         return _depth(poolId, rate, flow);
     }
 
-    /// @dev Depths in a chain combine like resistors in parallel. An empty leg gives zero.
-    function _harmonic(uint256 a, uint256 b) internal pure returns (uint256) {
-        if (a == 0) return 0;
-        if (b == 0) return 0;
-        return FixedPointMathLib.fullMulDiv(a, b, a + b);
-    }
-
     /// @dev Square-root price of the quote token per base token, and the square root of the
     /// share of a trade the pool's fees leave. Zero for a pool that does not exist.
     function _quote(bytes32 poolId, bool baseFirst)
@@ -3058,53 +2930,8 @@ abstract contract ArbitrageLogic {
     {
         uint24 fee;
         uint24 levy;
-        (rate, fee, levy) = _unpack(_word(poolId), baseFirst);
-        keep = _keepFast(_swapFee(fee, levy));
-    }
-
-    /// @dev A pool's first storage word holds, from the low end: the square-root price (160
-    /// bits), the tick (24), the protocol fee (24) and the pool's own fee (24).
-    function _unpack(bytes32 word, bool baseFirst)
-        internal
-        pure
-        returns (uint256 rate, uint24 fee, uint24 levy)
-    {
-        uint256 packed = uint256(word);
-        uint256 price = uint160(packed);
-        levy = uint24(packed >> 184);
-        fee = uint24(packed >> 208);
-        if (price == 0) return (0, fee, levy);
-        rate = baseFirst ? price : Q192 / price;
-        if (rate < MIN_RATE) return (0, fee, levy);
-        if (rate > MAX_RATE) return (0, fee, levy);
-    }
-
-    /// @dev What a swap pays in all, as v4 combines the two fees. The protocol fee is set
-    /// separately for each direction; the larger is used for both, which can only make a
-    /// cycle look slightly less profitable than it is.
-    function _swapFee(uint24 fee, uint24 levy) internal pure returns (uint24) {
-        if (levy == 0) return fee;
-        uint256 forward = levy & 0xFFF;
-        uint256 backward = levy >> 12;
-        uint256 larger = forward > backward ? forward : backward;
-        return uint24(larger + fee - larger * fee / 1e6);
-    }
-
-    /// @dev The square root of the share a trade keeps after `fee`, in WAD. The four common
-    /// tiers are constants, each equal to what `_keep` gives, since this runs for every
-    /// venue of every search. Only the book and the routes use it: the sizing walk keeps the
-    /// `sqrt` of `_keep`, because its cost is part of what fits in `SIZING_GAS`.
-    function _keepFast(uint24 fee) internal pure returns (uint256) {
-        if (fee == 3000) return 998498873309329277;
-        if (fee == 500) return 999749968742185057;
-        if (fee == 10000) return 994987437106619954;
-        if (fee == 100) return 999949998749937496;
-        return _keep(fee);
-    }
-
-    function _keep(uint24 fee) internal pure returns (uint256) {
-        if (fee >= 1e6) return 0;
-        return FixedPointMathLib.sqrt((1e6 - uint256(fee)) * 1e30);
+        (rate, fee, levy) = V4Read._unpack(_word(poolId), baseFirst);
+        keep = V4Read._keepFast(V4Read._swapFee(fee, levy));
     }
 
     /// @dev Core pays exactly NAV in WETH per SZR and takes no fee.
@@ -3153,98 +2980,20 @@ abstract contract ArbitrageLogic {
         view
         returns (uint160 limit, uint256 spend, uint256 steps, bool declined, bool short)
     {
-        (Leg[] memory legs, uint256 focus) = _legs(poolId, plan);
+        (SizingWalk.Leg[] memory legs, uint256 focus) = _legs(poolId, plan);
         _load(legs, plan.gap, plan.full, focus);
-        Walk memory walk;
+        SizingWalk.Walk memory walk;
         // Reaching a wrapped leg's range end is an under-trade, never a dead end: the venue
         // may hold deep liquidity past what its pricer reports, so the walk never declines.
         for (uint256 index; index < legs.length; index++) {
             if (legs[index].wrapped) walk.stopped = true;
         }
         for (uint256 round; round <= SIZING_STEPS; round++) {
-            if (!_round(legs, walk, focus, round)) break;
+            if (!SizingWalk._round(poolManager, legs, walk, focus, round)) break;
         }
         steps = walk.steps;
         short = walk.short;
         (limit, spend, steps, declined) = _answer(walk, plan, steps);
-    }
-
-    /// @dev One round of the walk: crosses a hole, or solves the legs within their ranges and
-    /// moves them to the nearest boundary. False when the walk is over. Whatever the walk
-    /// could not carry on with after it has found a size is a stop, never a decline.
-    function _round(Leg[] memory legs, Walk memory walk, uint256 focus, uint256 round)
-        internal
-        view
-        returns (bool)
-    {
-        // Short of gas for another step: what has been found is an under-trade.
-        if (gasleft() < legs.length * SIZING_STEP_GAS + SIZING_TAIL_GAS) {
-            walk.stopped = true;
-            walk.short = true;
-            return false;
-        }
-        uint256 empty = _shapeAll(legs);
-        if (empty != legs.length) return _pass(legs[empty], walk, round);
-        (uint256 rate, uint256 depth, bool fits) = _compose(legs);
-        if (!fits) {
-            walk.stopped = true;
-            walk.short = true;
-            return false;
-        }
-        if (rate <= Q96) return false;
-        uint256 cycle = FixedPointMathLib.fullMulDiv(depth, rate - Q96, Q96);
-        uint256 hit;
-        // A best size of zero, or of no more than the few wei that rounding is worth, with the
-        // rate still above break-even is a range too thin to matter, not the optimum: go to
-        // its nearest boundary, and across it if that is zero too.
-        bool thin = cycle <= SIZING_WEI;
-        (cycle, hit) = _bounded(legs, thin ? type(uint256).max : cycle);
-        bool crossing = hit != legs.length;
-        if (!crossing) {
-            if (thin) return false;
-        }
-        // The next boundary is further than the few wei that rounding is worth: this is the
-        // optimum, not a range to skip.
-        if (thin) {
-            if (cycle > SIZING_WEI) return false;
-        }
-        if (crossing) {
-            if (_ends(legs[hit])) crossing = false;
-        }
-        _step(legs, walk, cycle, hit, focus, crossing);
-        if (!crossing) return false;
-        return _carryOn(legs[hit], walk, round);
-    }
-
-    /// @dev A leg in a hole, or in a range too thin to shape, crosses to its next boundary
-    /// for nothing, as in v4. The end of the leg is the only dead end.
-    function _pass(Leg memory leg, Walk memory walk, uint256 round)
-        internal
-        view
-        returns (bool)
-    {
-        if (_ends(leg)) return false;
-        return _carryOn(leg, walk, round);
-    }
-
-    function _carryOn(Leg memory leg, Walk memory walk, uint256 round)
-        internal
-        view
-        returns (bool)
-    {
-        if (round == SIZING_STEPS) {
-            walk.stopped = true;
-            walk.short = true;
-            return false;
-        }
-        _cross(leg);
-        walk.steps++;
-        if (leg.broken) {
-            walk.stopped = true;
-            walk.short = true;
-            return false;
-        }
-        return true;
     }
 
     /// @dev What the walk answers. A walk that ran to its natural end, the optimum within
@@ -3252,7 +3001,7 @@ abstract contract ArbitrageLogic {
     /// so no size can earn what this one cannot. One that stopped short answers only if what
     /// it found is enough. Every size is held back by a millionth and a few wei, so that
     /// every leg still fills whatever rounding the crossings left.
-    function _answer(Walk memory walk, Plan calldata plan, uint256 steps)
+    function _answer(SizingWalk.Walk memory walk, Plan calldata plan, uint256 steps)
         internal
         view
         returns (uint160, uint256, uint256, bool)
@@ -3265,33 +3014,11 @@ abstract contract ArbitrageLogic {
         if (poor) {
             return (plan.limit, plan.spend, steps, !walk.stopped);
         }
-        uint256 spend = _shaved(plan.buying ? walk.focusIn : walk.total);
+        uint256 spend = SizingWalk._shaved(plan.buying ? walk.focusIn : walk.total);
         uint256 most = uint256(uint128(type(int128).max));
         if (spend > most) spend = most;
         if (spend == 0) return (plan.limit, plan.spend, steps, false);
         return (plan.full, spend, steps, false);
-    }
-
-    function _shaved(uint256 spend) internal pure returns (uint256) {
-        uint256 cut = spend / SIZING_SHAVE + SIZING_WEI;
-        return spend > cut ? spend - cut : 0;
-    }
-
-    /// @dev Moves every leg by `cycle` of cycle input and books the result.
-    function _step(
-        Leg[] memory legs,
-        Walk memory walk,
-        uint256 cycle,
-        uint256 hit,
-        uint256 focus,
-        bool force
-    ) internal pure {
-        uint256 out;
-        uint256 focusIn;
-        (out, focusIn) = _advance(legs, cycle, force ? hit : legs.length, focus);
-        walk.total += cycle;
-        walk.focusIn += focusIn;
-        walk.predicted += int256(out) - int256(cycle);
     }
 
     /// @dev The legs of a cycle in the order value flows, and the focus pool's place in it.
@@ -3301,9 +3028,9 @@ abstract contract ArbitrageLogic {
     function _legs(bytes32 poolId, Plan calldata plan)
         internal
         view
-        returns (Leg[] memory legs, uint256 focus)
+        returns (SizingWalk.Leg[] memory legs, uint256 focus)
     {
-        Leg[] memory found = new Leg[](4);
+        SizingWalk.Leg[] memory found = new SizingWalk.Leg[](4);
         uint256 count;
         bool buying = plan.buying;
         PoolKey memory key = keys[poolId];
@@ -3327,7 +3054,7 @@ abstract contract ArbitrageLogic {
             key = keys[plan.venue];
             found[count++] = _leg(plan.venue, key, buying ? _other(key, asset) : asset);
         }
-        legs = new Leg[](count);
+        legs = new SizingWalk.Leg[](count);
         for (uint256 index; index < count; index++) {
             legs[buying ? count - 1 - index : index] = found[index];
         }
@@ -3336,14 +3063,14 @@ abstract contract ArbitrageLogic {
 
     function _coreRate() internal view returns (uint256 rate) {
         (rate,) = _redeemQuote();
-        if (rate == 0) revert Unsizable();
+        if (rate == 0) revert SizingWalk.Unsizable();
     }
 
     /// @dev A pool as a leg whose input is `input`.
     function _leg(bytes32 poolId, PoolKey memory key, address input)
         internal
         pure
-        returns (Leg memory leg)
+        returns (SizingWalk.Leg memory leg)
     {
         leg.id = poolId;
         leg.zeroForOne = Currency.unwrap(key.currency0) == input;
@@ -3354,7 +3081,10 @@ abstract contract ArbitrageLogic {
     /// finds each one's first boundary. A wrapped pool is read from the search's answers
     /// instead, and its boundary is the end of the range it reports. Whatever is out of
     /// bounds reverts.
-    function _load(Leg[] memory legs, uint256 gap, uint160 full, uint256 focus) internal view {
+    function _load(SizingWalk.Leg[] memory legs, uint256 gap, uint160 full, uint256 focus)
+        internal
+        view
+    {
         uint256 count = legs.length;
         bool asks = asking != 0;
         bytes32[] memory slots = new bytes32[](count * 2);
@@ -3372,7 +3102,7 @@ abstract contract ArbitrageLogic {
         bytes32[] memory words = poolManager.extsload(slots);
         read = 0;
         for (uint256 index; index < count; index++) {
-            Leg memory leg = legs[index];
+            SizingWalk.Leg memory leg = legs[index];
             if (leg.id == bytes32(0)) continue;
             if (_asked(asks, leg.id)) {
                 _loadWrapped(leg, gap);
@@ -3381,11 +3111,11 @@ abstract contract ArbitrageLogic {
             // Read into locals: the order arguments are evaluated in is not specified.
             uint256 first = uint256(words[read++]);
             uint256 second = uint256(words[read++]);
-            _read(leg, first, second, gap);
+            SizingWalk._read(leg, first, second, gap);
             if (index == focus) leg.limit = full;
-            _bound(leg);
+            SizingWalk._bound(poolManager, leg);
             // Nothing is found yet, so a boundary that cannot be read is a guard.
-            if (leg.broken) revert Unsizable();
+            if (leg.broken) revert SizingWalk.Unsizable();
         }
     }
 
@@ -3393,214 +3123,12 @@ abstract contract ArbitrageLogic {
     /// them. It has no ticks and ignores a price limit, so the end of the range the pricer
     /// reports, in the direction the leg trades, is where it ends. Without a price, or with
     /// no room before that end, the walk gives up and the estimate is used.
-    function _loadWrapped(Leg memory leg, uint256 gap) internal view {
+    function _loadWrapped(SizingWalk.Leg memory leg, uint256 gap) internal view {
         uint256[5] memory answer = _ask(leg.id);
-        _read(leg, answer[0] | (answer[1] << 208), answer[2], gap);
+        SizingWalk._read(leg, answer[0] | (answer[1] << 208), answer[2], gap);
         leg.target = uint160(leg.zeroForOne ? answer[3] : answer[4]);
         leg.edge = true;
         leg.wrapped = true;
-        if (leg.target == leg.price) revert Unsizable();
-    }
-
-    /// @dev Fills in a leg from the first word of its pool's state, as `Pool.swap` reads it:
-    /// the fee is the one for the leg's direction.
-    function _read(Leg memory leg, uint256 packed, uint256 units, uint256 gap) internal pure {
-        leg.price = uint160(packed);
-        leg.tick = int24(uint24(packed >> 160));
-        uint16 levy = uint16(leg.zeroForOne ? (packed >> 184) & 0xfff : (packed >> 196) & 0xfff);
-        uint24 lpFee = uint24(packed >> 208);
-        leg.fee = levy == 0 ? lpFee : ProtocolFeeLibrary.calculateSwapFee(levy, lpFee);
-        leg.liquidity = uint128(units);
-        if (leg.price == 0) revert Unsizable();
-        if (leg.fee >= 1e6) revert Unsizable();
-        uint256 rate = leg.zeroForOne ? leg.price : Q192 / leg.price;
-        if (rate < MIN_RATE) revert Unsizable();
-        if (rate > MAX_RATE) revert Unsizable();
-        leg.keep = _keep(leg.fee);
-        // The limit the real trade is given, `_legLimit`; the focus leg's is set by the caller.
-        leg.limit = _limitFrom(leg.price, leg.zeroForOne, gap);
-    }
-
-    /// @dev The next tick `Pool.swap` would stop at going the leg's way: the next
-    /// initialised one within a bitmap word, or the word's edge when it has none. Reaching
-    /// the end of the tick range is the end of liquidity.
-    function _bound(Leg memory leg) internal view {
-        int24 compressed = TickBitmap.compress(leg.tick, leg.spacing);
-        PoolId pool = PoolId.wrap(leg.id);
-        int24 next;
-        unchecked {
-            if (leg.zeroForOne) {
-                (int16 word, uint8 bit) = TickBitmap.position(compressed);
-                uint256 masked =
-                    poolManager.getTickBitmap(pool, word) & (type(uint256).max >> (255 - bit));
-                leg.initialized = masked != 0;
-                uint8 back = leg.initialized ? bit - BitMath.mostSignificantBit(masked) : bit;
-                next = (compressed - int24(uint24(back))) * leg.spacing;
-            } else {
-                (int16 word, uint8 bit) = TickBitmap.position(++compressed);
-                uint256 masked =
-                    poolManager.getTickBitmap(pool, word) & ~((uint256(1) << bit) - 1);
-                leg.initialized = masked != 0;
-                uint8 ahead = leg.initialized
-                    ? BitMath.leastSignificantBit(masked) - bit
-                    : type(uint8).max - bit;
-                next = (compressed + int24(uint24(ahead))) * leg.spacing;
-            }
-        }
-        leg.edge = next <= TickMath.MIN_TICK || next >= TickMath.MAX_TICK;
-        if (next <= TickMath.MIN_TICK) next = TickMath.MIN_TICK;
-        if (next >= TickMath.MAX_TICK) next = TickMath.MAX_TICK;
-        leg.next = next;
-        leg.target = TickMath.getSqrtPriceAtTick(next);
-        // The real trade is stopped at its limit, so that is where the leg ends if nearer.
-        if (leg.zeroForOne) {
-            if (leg.target <= leg.limit) (leg.target, leg.edge) = (leg.limit, true);
-            if (leg.target > leg.price) leg.broken = true;
-        } else {
-            if (leg.target >= leg.limit) (leg.target, leg.edge) = (leg.limit, true);
-            if (leg.target < leg.price) leg.broken = true;
-        }
-    }
-
-    /// @dev The cycle's whole chain of legs, at their current prices, as one curve:
-    /// its marginal rate at size zero (a Q96 square root) and its depth in input units. Each
-    /// leg also keeps the same for the legs before it. See `docs/specs/hook-exact-sizing.md`.
-    function _compose(Leg[] memory legs)
-        internal
-        pure
-        returns (uint256 rate, uint256 depth, bool fits)
-    {
-        rate = Q96;
-        depth = MAX_DEPTH;
-        for (uint256 index; index < legs.length; index++) {
-            Leg memory leg = legs[index];
-            leg.depthIn = depth;
-            uint256 flow = FixedPointMathLib.fullMulDiv(
-                FixedPointMathLib.fullMulDiv(depth, rate, Q96), rate, Q96
-            );
-            leg.flowIn = flow;
-            depth = FixedPointMathLib.fullMulDiv(depth, leg.depth, leg.depth + flow);
-            rate = FixedPointMathLib.fullMulDiv(rate, leg.rate, Q96);
-            if (rate > MAX_CYCLE_RATE) return (0, 0, false);
-        }
-        return (rate, depth, true);
-    }
-
-    /// @dev Shapes every leg, and says which is the first with no depth to compose: in a hole,
-    /// or in a range so thin that its depth rounds to zero. Such a leg is crossed for
-    /// nothing. `legs.length` if there is none.
-    function _shapeAll(Leg[] memory legs) internal pure returns (uint256 empty) {
-        empty = legs.length;
-        for (uint256 index; index < legs.length; index++) {
-            if (legs[index].id == bytes32(0)) continue;
-            _shape(legs[index]);
-            if (empty == legs.length) {
-                if (legs[index].depth == 0) empty = index;
-            }
-        }
-    }
-
-    /// @dev A leg's rate and depth from its price and liquidity: the input token's side of
-    /// its virtual reserves, with the fee taken from the input.
-    function _shape(Leg memory leg) internal pure {
-        uint256 price = leg.price;
-        uint256 reserve;
-        if (leg.liquidity == 0) {
-            leg.depth = 0;
-            return;
-        }
-        if (leg.zeroForOne) {
-            leg.rate = FixedPointMathLib.fullMulDiv(price, leg.keep, WAD);
-            reserve = FixedPointMathLib.fullMulDiv(leg.liquidity, Q96, price);
-        } else {
-            leg.rate = FixedPointMathLib.fullMulDiv(Q192, leg.keep, price * WAD);
-            reserve = FixedPointMathLib.fullMulDiv(leg.liquidity, price, Q96);
-        }
-        uint256 depth = FixedPointMathLib.fullMulDiv(reserve, 1e6, 1e6 - leg.fee);
-        leg.depth = depth > MAX_DEPTH ? MAX_DEPTH : depth;
-    }
-
-    /// @dev The cycle input at which the first leg to reach its boundary does, if that is
-    /// less than `cycle`, and which leg it is (`legs.length` for none). A leg gets `x` of
-    /// its own input from the legs before it when the cycle puts in `x * P / (M * P - x)`,
-    /// `M` and `P` being their price and depth; if they can never supply `x` the leg never
-    /// gets there.
-    function _bounded(Leg[] memory legs, uint256 cycle)
-        internal
-        pure
-        returns (uint256, uint256 hit)
-    {
-        hit = legs.length;
-        for (uint256 index; index < legs.length; index++) {
-            Leg memory leg = legs[index];
-            if (leg.id == bytes32(0)) continue;
-            leg.reach = _reach(leg);
-            uint256 input = leg.reach;
-            if (index != 0) {
-                if (input >= leg.flowIn) continue;
-                input = FixedPointMathLib.fullMulDiv(input, leg.depthIn, leg.flowIn - input);
-            }
-            if (input < cycle) {
-                cycle = input;
-                hit = index;
-            }
-        }
-        return (cycle, hit);
-    }
-
-    /// @dev The gross input, fee included, that takes a leg from its price to its boundary.
-    function _reach(Leg memory leg) internal pure returns (uint256 amount) {
-        amount = leg.zeroForOne
-            ? SqrtPriceMath.getAmount0Delta(leg.target, leg.price, leg.liquidity, true)
-            : SqrtPriceMath.getAmount1Delta(leg.price, leg.target, leg.liquidity, true);
-        amount += FullMath.mulDivRoundingUp(amount, leg.fee, 1e6 - leg.fee);
-    }
-
-    /// @dev Whether the leg's boundary is the end of the leg, its price limit or the end of the
-    /// tick range. If not, it also finds the liquidity past it, for `_cross`. Zero liquidity
-    /// past it is a hole, which is crossed, not an end.
-    function _ends(Leg memory leg) internal view returns (bool) {
-        if (leg.edge) return true;
-        leg.beyond = leg.liquidity;
-        if (!leg.initialized) return false;
-        (, int128 net) = poolManager.getTickLiquidity(PoolId.wrap(leg.id), leg.next);
-        leg.beyond = LiquidityMath.addDelta(leg.liquidity, leg.zeroForOne ? -net : net);
-        return false;
-    }
-
-    /// @dev Moves a leg across its boundary, as `Pool.swap` does, and finds the next one.
-    function _cross(Leg memory leg) internal view {
-        leg.price = leg.target;
-        leg.liquidity = leg.beyond;
-        leg.tick = leg.zeroForOne ? leg.next - 1 : leg.next;
-        _bound(leg);
-    }
-
-    /// @dev Trades `cycle` through every leg in turn, as `SwapMath` would, and returns what
-    /// the last one pays out and what went into the focus pool. The leg at `hit` is taken to
-    /// its boundary whatever rounding says, since it is the one the walk is stopping at.
-    function _advance(Leg[] memory legs, uint256 cycle, uint256 hit, uint256 focus)
-        internal
-        pure
-        returns (uint256 amount, uint256 focusIn)
-    {
-        amount = cycle;
-        for (uint256 index; index < legs.length; index++) {
-            Leg memory leg = legs[index];
-            if (leg.id == bytes32(0)) {
-                amount = FixedPointMathLib.fullMulDiv(
-                    FixedPointMathLib.fullMulDiv(amount, leg.rate, Q96), leg.rate, Q96
-                );
-                continue;
-            }
-            if (index == hit) {
-                if (amount < leg.reach) amount = leg.reach;
-            }
-            if (index == focus) focusIn = amount;
-            if (amount == 0) continue;
-            (leg.price,, amount,) = SwapMath.computeSwapStep(
-                leg.price, leg.target, leg.liquidity, -int256(amount), leg.fee
-            );
-        }
+        if (leg.target == leg.price) revert SizingWalk.Unsizable();
     }
 }

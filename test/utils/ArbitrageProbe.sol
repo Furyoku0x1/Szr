@@ -10,6 +10,8 @@ import { PoolId } from "v4-core/types/PoolId.sol";
 import { StateLibrary } from "v4-core/libraries/StateLibrary.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
+import { SizingWalk } from "../../src/arbitrage/lib/SizingWalk.sol";
+import { V4Read } from "../../src/arbitrage/lib/V4Read.sol";
 
 /// @dev The hook with its scan exposed, so tests can measure what the gas constants assume.
 /// It is one contract with every module's functions and no routing, the way the hook was
@@ -187,7 +189,7 @@ contract ArbitrageProbe is ArbitrageApi {
     }
 
     function keepOf(uint24 fee) external pure returns (uint256) {
-        return _keepFast(fee);
+        return V4Read._keepFast(fee);
     }
 
     /// The constants `gasForSwap` is built from.
@@ -392,7 +394,7 @@ contract ArbitrageProbe is ArbitrageApi {
         } catch (bytes memory reason) {
             // A walk that gives up with `Unsizable` reverted on purpose; any other failure
             // is the gas running out.
-            if (bytes4(reason) == Unsizable.selector) sizingReverted = true;
+            if (bytes4(reason) == SizingWalk.Unsizable.selector) sizingReverted = true;
             else sizingCut = true;
         }
     }
@@ -405,11 +407,11 @@ contract ArbitrageProbe is ArbitrageApi {
         external
         returns (bool more, uint256 total, uint256 steps)
     {
-        Leg[] memory legs = new Leg[](2);
+        SizingWalk.Leg[] memory legs = new SizingWalk.Leg[](2);
         bool[2] memory zero = [true, false];
         uint160[2] memory prices = [priceA, priceB];
         for (uint256 index; index < 2; index++) {
-            Leg memory leg = legs[index];
+            SizingWalk.Leg memory leg = legs[index];
             leg.id = poolId;
             leg.zeroForOne = zero[index];
             leg.spacing = 60;
@@ -417,13 +419,13 @@ contract ArbitrageProbe is ArbitrageApi {
             leg.tick = TickMath.getTickAtSqrtPrice(leg.price);
             leg.liquidity = units;
             leg.fee = 500;
-            leg.keep = _keep(500);
+            leg.keep = V4Read._keep(500);
             leg.depth = 1;
-            leg.limit = _limitFrom(leg.price, leg.zeroForOne, 1e17);
-            _bound(leg);
+            leg.limit = V4Read._limitFrom(leg.price, leg.zeroForOne, 1e17);
+            SizingWalk._bound(poolManager, leg);
         }
-        Walk memory walk;
-        more = _round(legs, walk, 0, 0);
+        SizingWalk.Walk memory walk;
+        more = SizingWalk._round(poolManager, legs, walk, 0, 0);
         return (more, walk.total, walk.steps);
     }
 

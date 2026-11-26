@@ -9,6 +9,7 @@ import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { Currency } from "v4-core/types/Currency.sol";
+import { V4Read } from "../src/arbitrage/lib/V4Read.sol";
 
 /// @dev The search after a swap cannot tell a drained pool manager from a swapper that has
 /// not paid yet: routers pay after swapping. So a shortage there undoes that search and the
@@ -53,7 +54,7 @@ contract ArbitrageDrainedAfterTest is WrapWorld {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
             if (logs[index].topics[0] != ArbitrageLogic.SearchUndone.selector) continue;
-            if (abi.decode(logs[index].data, (bytes4)) == ArbitrageLogic.Drained.selector) {
+            if (abi.decode(logs[index].data, (bytes4)) == V4Read.Drained.selector) {
                 count++;
             }
         }
@@ -136,7 +137,7 @@ contract ArbitrageDrainedAfterTest is WrapWorld {
             abi.encodeCall(drain.trade, (usdPool, address(usd), 1e18, address(szr), 0))
         );
         assertFalse(ok, "the swap fails");
-        assertEq(_has(data, ArbitrageLogic.Drained.selector), true, "with Drained");
+        assertEq(_has(data, V4Read.Drained.selector), true, "with Drained");
         assertEq(_has(data, ArbitrageLogic.InsufficientGas.selector), false, "not gas");
     }
 

@@ -17,6 +17,7 @@ import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { Currency } from "v4-core/types/Currency.sol";
 import { BalanceDelta } from "v4-core/types/BalanceDelta.sol";
 import { BeforeSwapDelta } from "v4-core/types/BeforeSwapDelta.sol";
+import { V4Read } from "../src/arbitrage/lib/V4Read.sol";
 
 /// @dev Marks a token as synced and pays it in inside one unlock, then has the probe run a
 /// failed cycle with that payment waiting in the pool manager's sync slot.
@@ -235,7 +236,7 @@ contract ArbitrageCleanupTest is WrapWorld {
     function testZeroBalanceWithCreditIsUnsettled() public {
         ArbitrageProbe probe = _probeInHook();
         probe.settledWithCredit(address(usd), 0);
-        vm.expectRevert(ArbitrageLogic.Unsettled.selector);
+        vm.expectRevert(V4Read.Unsettled.selector);
         probe.settledWithCredit(address(usd), 1e18);
     }
 }

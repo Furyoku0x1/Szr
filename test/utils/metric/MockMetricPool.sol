@@ -20,6 +20,10 @@ contract MockMetricFactory {
     function register(address pool) external {
         isPool[pool] = true;
     }
+
+    function deregister(address pool) external {
+        isPool[pool] = false;
+    }
 }
 
 /// @dev A Metric pool with one flat price and whatever it holds as liquidity. It keeps

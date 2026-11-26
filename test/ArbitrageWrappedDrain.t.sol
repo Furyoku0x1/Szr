@@ -8,6 +8,7 @@ import { WrappedPool, WrappedPricer } from "./utils/WrappedPool.sol";
 import { DrainRouter } from "./utils/ArbitrageDrain.sol";
 import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
+import { V4Read } from "../src/arbitrage/lib/V4Read.sol";
 
 /// @dev The drain guard on wrapped pools (`docs/specs/hook-wrapped-drain.md`). A wrapped
 /// pool's own hook takes the leg's input from the pool manager, so a router that borrows
@@ -157,7 +158,7 @@ contract ArbitrageWrappedDrainTest is WrapWorld {
 
     function _assertDrained(bool ok, bytes memory data) internal pure {
         assertFalse(ok, "the swap fails");
-        assertTrue(_has(data, ArbitrageLogic.Drained.selector), "with Drained");
+        assertTrue(_has(data, V4Read.Drained.selector), "with Drained");
     }
 
     /// Cycles that bought and sold, cycles that failed, and searches undone by `Drained`.
@@ -171,7 +172,7 @@ contract ArbitrageWrappedDrainTest is WrapWorld {
             bytes32 topic = logs[index].topics[0];
             if (topic == ArbitrageLogic.CycleFailed.selector) failed++;
             if (topic != ArbitrageLogic.SearchUndone.selector) continue;
-            if (abi.decode(logs[index].data, (bytes4)) == ArbitrageLogic.Drained.selector) {
+            if (abi.decode(logs[index].data, (bytes4)) == V4Read.Drained.selector) {
                 undone++;
             }
         }
@@ -279,9 +280,9 @@ contract ArbitrageWrappedDrainTest is WrapWorld {
         assertGt(hook.sweep(id, address(backing)), 0, "sweep control");
         vm.revertToState(snapshot);
         _empty(address(coin));
-        vm.expectRevert(ArbitrageLogic.Drained.selector);
+        vm.expectRevert(V4Read.Drained.selector);
         hook.arb(_id(first));
-        vm.expectRevert(ArbitrageLogic.Drained.selector);
+        vm.expectRevert(V4Read.Drained.selector);
         hook.sweep(id, address(backing));
     }
 

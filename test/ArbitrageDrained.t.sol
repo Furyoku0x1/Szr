@@ -10,6 +10,7 @@ import { DrainRouter } from "./utils/ArbitrageDrain.sol";
 import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
+import { V4Read } from "../src/arbitrage/lib/V4Read.sol";
 
 /// @dev Whoever controls the current unlock can borrow the pool manager's whole balance of a
 /// token with `take` and repay it at the end. A swap that needs the hook to take that token
@@ -61,7 +62,7 @@ contract ArbitrageDrainedTest is WrapWorld {
 
     function _assertDrained(bool ok, bytes memory data) internal pure {
         assertFalse(ok, "the swap fails");
-        assertTrue(_has(data, ArbitrageLogic.Drained.selector), "with Drained");
+        assertTrue(_has(data, V4Read.Drained.selector), "with Drained");
     }
 
     /// A sale into the SZR/USD pool with SZR's market switched off, so the gap stays open.
@@ -291,7 +292,7 @@ contract ArbitrageDrainedTest is WrapWorld {
         assertGt(hook.arb(_id(usdPool)), 0, "control");
         vm.revertToState(snapshot);
         _empty(address(szr));
-        vm.expectRevert(ArbitrageLogic.Drained.selector);
+        vm.expectRevert(V4Read.Drained.selector);
         hook.arb(_id(usdPool));
     }
 
@@ -305,9 +306,9 @@ contract ArbitrageDrainedTest is WrapWorld {
         assertGt(hook.sweep(1, address(szr)), 0, "sweep control");
         vm.revertToState(snapshot);
         _empty(address(szr));
-        vm.expectRevert(ArbitrageLogic.Drained.selector);
+        vm.expectRevert(V4Read.Drained.selector);
         hook.arb(_id(mainPool));
-        vm.expectRevert(ArbitrageLogic.Drained.selector);
+        vm.expectRevert(V4Read.Drained.selector);
         hook.sweep(1, address(szr));
     }
 

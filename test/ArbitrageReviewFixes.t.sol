@@ -12,6 +12,7 @@ import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { Currency } from "v4-core/types/Currency.sol";
+import { V4Read } from "../src/arbitrage/lib/V4Read.sol";
 
 /// @dev A token whose balance read fails for one caller: cheaply (mode 1) or by using all
 /// the gas it is given (mode 2).
@@ -126,7 +127,7 @@ contract ArbitrageReadFailTest is ReviewWorld {
         (bool seen, bytes4 reason, uint256 paid) = _undone();
         assertTrue(ok, "swap passes");
         assertTrue(seen, "search undone");
-        assertEq(reason, ArbitrageLogic.Unsettled.selector, "named Unsettled");
+        assertEq(reason, V4Read.Unsettled.selector, "named Unsettled");
         assertEq(paid, 0, "nothing paid");
     }
 
@@ -185,7 +186,7 @@ contract ArbitrageReadFailTest is ReviewWorld {
                 continue;
             }
             failed++;
-            assertFalse(_has(data, ArbitrageLogic.Unsettled.selector), "quiet pass");
+            assertFalse(_has(data, V4Read.Unsettled.selector), "quiet pass");
         }
         assertGt(failed, 0, "some gas values fail");
         assertGt(passed, 0, "and some pass");
@@ -209,7 +210,7 @@ contract ArbitrageReadFailTest is ReviewWorld {
                 refused++;
                 continue;
             }
-            if (seen) assertTrue(reason != ArbitrageLogic.Unsettled.selector, "quiet pass");
+            if (seen) assertTrue(reason != V4Read.Unsettled.selector, "quiet pass");
             assertGt(paid, 0, "settled without paying");
             paidCount++;
         }

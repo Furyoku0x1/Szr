@@ -13,6 +13,7 @@ import { SearchManyPart } from "../src/arbitrage/ArbitrageSearchMany.sol";
 import { CyclePart } from "../src/arbitrage/ArbitrageCycle.sol";
 import { SizerPart } from "../src/arbitrage/ArbitrageSizer.sol";
 import { AdminPart } from "../src/arbitrage/ArbitrageAdmin.sol";
+import { V4Read } from "../src/arbitrage/lib/V4Read.sol";
 
 /// @dev Only to reach `_hopped`, the cap a self-call is given for its hop to a module.
 contract Hopper is ArbitrageLogic {
@@ -179,7 +180,7 @@ contract ArbitrageSplitTest is ArbitrageWorld {
         vm.expectRevert(ArbitrageLogic.NotSelf.selector);
         hook.retire(1);
         vm.prank(address(hook));
-        vm.expectRevert(ArbitrageLogic.Drained.selector);
+        vm.expectRevert(V4Read.Drained.selector);
         hook.retire(type(uint128).max);
     }
 

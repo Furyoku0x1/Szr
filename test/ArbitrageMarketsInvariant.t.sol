@@ -23,6 +23,7 @@ import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
 import { Currency } from "v4-core/types/Currency.sol";
 import { BalanceDelta } from "v4-core/types/BalanceDelta.sol";
+import { V4Read } from "../src/arbitrage/lib/V4Read.sol";
 
 /// @dev A token whose balance can be made to misreport: a huge figure, a revert, or a
 /// loop that burns gas. Anyone can open a market for a token like this.
@@ -501,7 +502,7 @@ contract MarketsHandler is Test {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 index; index < logs.length; index++) {
             if (logs[index].topics[0] != ArbitrageLogic.SearchUndone.selector) continue;
-            if (abi.decode(logs[index].data, (bytes4)) == ArbitrageLogic.Drained.selector) {
+            if (abi.decode(logs[index].data, (bytes4)) == V4Read.Drained.selector) {
                 return true;
             }
         }

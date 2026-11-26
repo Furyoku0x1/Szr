@@ -9,6 +9,7 @@ import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
+import { V4Read } from "../src/arbitrage/lib/V4Read.sol";
 
 /// @dev Pools on the other ether token are venues too: a TEAM/ETH pool and a TEAM/WETH pool
 /// are compared with each other when a market chooses both ETH and WETH. TEAM's address is
@@ -442,7 +443,7 @@ contract ArbitrageEtherDrainTest is EtherWorld {
         uint256 snapshot = vm.snapshotState();
         (bool ok, bytes memory data) = _try(hooked, drained, 0);
         assertFalse(ok, "the swap fails");
-        assertTrue(_has(data, ArbitrageLogic.Drained.selector), "with Drained");
+        assertTrue(_has(data, V4Read.Drained.selector), "with Drained");
         vm.revertToState(snapshot);
         (ok,) = _try(hooked, drained, NONE);
         assertTrue(ok, "the control fills");
