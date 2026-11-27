@@ -7,6 +7,13 @@ import { IERC20 } from "forge-std/interfaces/IERC20.sol";
 import { ISzrLiquidity } from "../../src/interfaces/ISzrModules.sol";
 import { IndexPool } from "../../src/index/IndexPool.sol";
 import { IndexPoolFactory } from "../../src/index/IndexPoolFactory.sol";
+import { IndexPositions } from "../../src/index/IndexPositions.sol";
+import { Liquidity } from "../../src/Liquidity.sol";
+import { IHooks } from "v4-core/interfaces/IHooks.sol";
+import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
+import { TickMath } from "v4-core/libraries/TickMath.sol";
+import { Currency } from "v4-core/types/Currency.sol";
+import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { MockIndexHook } from "../utils/IndexWorld.sol";
 
 /// @dev A three-token index pool of two real Robinhood stock tokens and USDG, at the latest
@@ -20,6 +27,7 @@ contract IndexPoolForkTest is Test {
     address internal constant NVDA = 0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC;
     address internal constant TSLA = 0x322F0929c4625eD5bAd873c95208D54E1c003b2d;
     uint256 internal constant FAR = type(uint256).max;
+    uint128 internal constant UNITS = 1e21;
 
     IndexPoolFactory internal factory;
     address internal protocol = makeAddr("protocol");
@@ -84,6 +92,78 @@ contract IndexPoolForkTest is Test {
         }
         console2.log("the same in the next window, levels kept", later);
         assertLt(_max(worst, later), pool.SWAP_GAS());
+    }
+
+    /// An ordinary owner's full-range INDEX/WETH position on the live pool manager: fees
+    /// paid in the index pool raise its growth index, and the harvest pays the owner half
+    /// that growth of the position, as the share is half its value.
+    function testOrdinaryOwnerHarvestsAnIndexWethPosition() public {
+        if (!live) return vm.skip(true);
+        IndexPool pool = _pool(address(0));
+        address weth = Liquidity(LIQUIDITY).backingAsset();
+        (IndexPositions positions, uint256 id) = _openWeth(pool, weth);
+        uint256 last = _baseline(positions, id, pool);
+        _payFees(pool);
+        uint256 current = pool.growthIndex();
+        uint256 f = (current - last) * 1e18 / current;
+        console2.log("growth fraction, WAD", f);
+        uint256 shares = pool.balanceOf(alice);
+        uint256 wethBefore = IERC20(weth).balanceOf(alice);
+        vm.prank(alice);
+        uint128 removed = positions.harvest(id, 0, 0, FAR);
+        console2.log("liquidity harvested", removed);
+        assertApproxEqRel(removed, uint256(UNITS) * f / 2e18, 1e6, "f / 2");
+        // At a price of one, the position holds `UNITS` of each, so each payment is the
+        // liquidity removed, less rounding.
+        assertApproxEqAbs(pool.balanceOf(alice) - shares, removed, 2, "shares paid");
+        assertApproxEqAbs(IERC20(weth).balanceOf(alice) - wethBefore, removed, 2, "weth paid");
+        assertEq(pool.balanceOf(address(positions)), 0);
+        assertEq(IERC20(weth).balanceOf(address(positions)), 0);
+    }
+
+    function _openWeth(IndexPool pool, address weth)
+        internal
+        returns (IndexPositions positions, uint256 id)
+    {
+        IPoolManager manager = Liquidity(LIQUIDITY).poolManager();
+        positions = new IndexPositions(manager, address(factory));
+        bool shareFirst = address(pool) < weth;
+        PoolKey memory key = PoolKey(
+            Currency.wrap(shareFirst ? address(pool) : weth),
+            Currency.wrap(shareFirst ? weth : address(pool)),
+            3000,
+            60,
+            IHooks(address(0))
+        );
+        manager.initialize(key, uint160(1 << 96));
+        pool.transfer(alice, 1e23);
+        deal(weth, alice, 1e23);
+        vm.startPrank(alice);
+        pool.approve(address(positions), FAR);
+        IERC20(weth).approve(address(positions), FAR);
+        id = positions.open(
+            key, TickMath.minUsableTick(60), TickMath.maxUsableTick(60), UNITS, FAR, FAR, FAR
+        );
+        vm.stopPrank();
+    }
+
+    function _baseline(IndexPositions positions, uint256 id, IndexPool pool)
+        internal
+        view
+        returns (uint256)
+    {
+        (, PoolKey memory key,,,, uint256 last0, uint256 last1) = positions.position(id);
+        return Currency.unwrap(key.currency0) == address(pool) ? last0 : last1;
+    }
+
+    function _payFees(IndexPool pool) internal {
+        address[] memory list = pool.tokens();
+        vm.startPrank(alice);
+        for (uint256 round; round < 10; round++) {
+            (, uint256 got) = pool.swap(list[0], list[2], 50e18, true, 1, alice, FAR);
+            pool.swap(list[2], list[0], got, true, 1, alice, FAR);
+        }
+        vm.stopPrank();
     }
 
     function _pool(address hook) internal returns (IndexPool pool) {

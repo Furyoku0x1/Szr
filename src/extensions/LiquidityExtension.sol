@@ -106,7 +106,7 @@ abstract contract LiquidityExtension is ReentrancyGuard, Multicallable, IUnlockC
 
     /// @dev Plain ETH is taken only from WETH (an unwrap) and the pool manager (a take). A
     /// donor sends ETH through `donate`.
-    receive() external payable {
+    receive() external payable virtual {
         if (msg.sender == weth) return;
         if (msg.sender == address(poolManager)) return;
         revert UnexpectedEther();

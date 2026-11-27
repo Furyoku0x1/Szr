@@ -406,6 +406,27 @@ contract IndexPool is ERC20, ReentrancyGuard {
         return (quote.amountIn, quote.amountOut);
     }
 
+    /// @notice Invariant per share, WAD. Rises only with swap fees and released donations.
+    /// @dev `Π (bᵢ × scaleᵢ) ^ wᵢ × 1e18 / supply`, each power and product rounded down.
+    /// Overflow bound, at 8 tokens of raw `type(uint128).max` with 0 decimals, so a scaled
+    /// balance of B = 3.4e56 (3.4e38 whole tokens): the weights sum to one, so every running
+    /// product, and so every `mulWad` result, is at most `max(1e18, B)`. A `mulWad` input is
+    /// the previous product times the next power, which is that result times 1e18, so at
+    /// most 3.4e74, as is the final `divWad`'s product times 1e18: all under 2^256 (1.2e77).
+    /// `lnWad` of B is 88.7e18 (ln 2^128), and times a weight below one it stays inside
+    /// `expWad`'s 135e18 limit. The bound is not enforced: a pool whose balances pass it, as
+    /// a large donation can make them, reverts here.
+    function growthIndex() external view returns (uint256 value) {
+        uint256 supply = _supply();
+        uint256[] memory current = balances();
+        value = 1e18;
+        for (uint256 index; index < current.length; index++) {
+            uint256 scaled = current[index] * scaleList[index];
+            value = value.mulWad(IndexMath.powDown(scaled, weightList[index]));
+        }
+        return value.divWad(supply);
+    }
+
     function previewJoin(uint256 shares) external view returns (uint256[] memory amounts) {
         amounts = balances();
         uint256 supply = _supply();
