@@ -158,7 +158,7 @@ contract ArbitrageMarketsTest is MarketsWorld {
     }
 
     /// A market's search touches nothing in SZR's market, and the reverse.
-    function testMarketsAreSearchedApart() public {
+    function testMarketsAreSearchedApart() public virtual {
         hook.setLimits(1, address(szr), 0, 0, 1.0001e18);
         _trade(usdPool, address(szr), 50_000e18);
         hook.setLimits(1, address(szr), 8_000_000, 10e18, 1.0001e18);
@@ -217,7 +217,7 @@ contract ArbitrageMarketsTest is MarketsWorld {
 
     /// A pool on the hook joins a market only by being created through the hook, and never
     /// holds SZR.
-    function testHookedPoolsJoinOnlyByBeingCreatedThroughTheHook() public {
+    function testHookedPoolsJoinOnlyByBeingCreatedThroughTheHook() public virtual {
         vm.startPrank(team);
         vm.expectRevert(ArbitrageLogic.InvalidPool.selector);
         hook.createPool(id, publicPool, uint160(1 << 96));
@@ -246,7 +246,7 @@ contract ArbitrageMarketsTest is MarketsWorld {
 
     /// Connecting pools of an open market may run no hook but this one, and then only as a
     /// pool of the same market. They may not hold SZR.
-    function testConnectingPoolRules() public {
+    function testConnectingPoolRules() public virtual {
         PoolKey memory own = _create(address(coin), address(usd), 3_000);
         vm.prank(address(0xBEEF));
         uint256 rival = hook.openMarket(address(0xBEEF));

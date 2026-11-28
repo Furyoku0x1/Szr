@@ -34,7 +34,8 @@ contract ConfigureArbitrageHook is Script {
         address[] profitTokens;
         /// Receives the protocol's share of each of `profitTokens`.
         address treasury;
-        /// Authority mode only: zero leaves the hook's `swapGasCeiling` as it is.
+        /// Authority mode only, and required there: the hook's `swapGasCeiling`, which has to be
+        /// under the chain's per-transaction cap.
         uint256 swapGasCeiling;
     }
 
@@ -51,6 +52,7 @@ contract ConfigureArbitrageHook is Script {
     error ProfitTokenRefused(address token);
     error ValueTooLarge();
     error NotForAuthorityMode();
+    error MissingSwapGasCeiling();
 
     function run() external {
         run(_readConfig());
@@ -114,6 +116,9 @@ contract ConfigureArbitrageHook is Script {
         if (config.groups.length != 0) revert NotForAuthorityMode();
         if (config.connectors.length != 0) revert NotForAuthorityMode();
         if (config.gasLimit != 0) revert NotForAuthorityMode();
+        // The hook's default ceiling is 30M, Robinhood Chain's; another chain's cap may be
+        // lower, so it is always chosen here.
+        if (config.swapGasCeiling == 0) revert MissingSwapGasCeiling();
         ArbitrageApi hook = config.hook;
         vm.startBroadcast(hook.liquidity().manager());
         address[2] memory shared = [hook.backingAsset(), address(0)];
@@ -132,10 +137,8 @@ contract ConfigureArbitrageHook is Script {
                 1, token, 0, hook.minimumProfit(1, token), hook.market(1).minimumEdge
             );
         }
-        if (config.swapGasCeiling != 0) {
-            if (hook.swapGasCeiling() != config.swapGasCeiling) {
-                hook.setSwapGasCeiling(config.swapGasCeiling);
-            }
+        if (hook.swapGasCeiling() != config.swapGasCeiling) {
+            hook.setSwapGasCeiling(config.swapGasCeiling);
         }
         vm.stopBroadcast();
         console2.log("AUTHORITY_MODE", address(hook.liquidity()));

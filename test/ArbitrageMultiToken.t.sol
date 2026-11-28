@@ -21,7 +21,7 @@ abstract contract MultiWorld is MarketsWorld {
     PoolKey internal usdCoin;
     PoolKey internal usdDai;
 
-    function setUp() public override {
+    function setUp() public virtual override {
         super.setUp();
         dai = _newAsset();
         _approve(dai);
@@ -92,7 +92,7 @@ contract ArbitrageMultiTokenTest is MultiWorld {
 
     /// No route passes through a pool that is not its market's connecting pool, so its swap
     /// is still left alone.
-    function testPoolThatIsNotAConnectorIsNotSearched() public {
+    function testPoolThatIsNotAConnectorIsNotSearched() public virtual {
         vm.prank(team);
         hook.setConnector(id, stable, false);
         uint256 price = _price(stable);
