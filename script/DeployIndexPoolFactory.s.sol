@@ -6,6 +6,9 @@ import { Script } from "forge-std/Script.sol";
 import { ISzrLiquidity } from "../src/interfaces/ISzrModules.sol";
 import { IndexPoolFactory } from "../src/index/IndexPoolFactory.sol";
 
+/// @dev Production factories are created by `SzrTreasury`, whose constructor makes one that
+/// pays its cut to the treasury. A factory from this script pays whatever `protocol` it is
+/// given, and the treasury cannot route through its pools.
 /// @notice Deploys the index pool factory, and nothing else. Pools are created later through
 /// `create`, by anyone; hooks are approved later by Liquidity's manager.
 /// @dev `LIQUIDITY` is the Liquidity whose manager runs the hook list. `PROTOCOL` receives

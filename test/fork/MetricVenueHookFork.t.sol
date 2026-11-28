@@ -90,7 +90,7 @@ contract MetricVenueHookForkTest is Test {
     }
 
     modifier onlyFork() {
-        if (!live) return;
+        if (!live) vm.skip(true);
         _;
     }
 
@@ -137,7 +137,7 @@ contract MetricVenueHookForkTest is Test {
         assertEq(IERC20(USDG).balanceOf(address(hook)), 0);
     }
 
-    function testBindRecordsTheMetricPool() public view onlyFork {
+    function testBindRecordsTheMetricPool() public onlyFork {
         MetricImmutables memory imm = POOL.getImmutables();
         console.log("token0 is WETH:", imm.token0 == WETH);
         console.log("scale0", imm.token0ScaleMultiplier);

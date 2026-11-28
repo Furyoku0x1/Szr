@@ -34,6 +34,8 @@ contract ConfigureArbitrageHook is Script {
         address[] profitTokens;
         /// Receives the protocol's share of each of `profitTokens`.
         address treasury;
+        /// Authority mode only: zero leaves the hook's `swapGasCeiling` as it is.
+        uint256 swapGasCeiling;
     }
 
     struct Group {
@@ -48,6 +50,7 @@ contract ConfigureArbitrageHook is Script {
     error TreasuryIsHook();
     error ProfitTokenRefused(address token);
     error ValueTooLarge();
+    error NotForAuthorityMode();
 
     function run() external {
         run(_readConfig());
@@ -57,6 +60,11 @@ contract ConfigureArbitrageHook is Script {
     function run(Config memory config) public {
         if (address(config.hook).code.length == 0) revert MissingHook();
         _checkProfitTokens(config);
+        // On a chain without SZR the hook runs against a `HookAuthority`, which is its own
+        // Core; on Robinhood Chain that is never so (docs/specs/hook-authority.md).
+        if (address(config.hook.core()) == address(config.hook.liquidity())) {
+            return _runAuthority(config);
+        }
         Liquidity liquidity = config.hook.liquidity();
         vm.startBroadcast(liquidity.manager());
         // The allowance has to cover the leaders set below, so it goes up before they are.
@@ -93,6 +101,45 @@ contract ConfigureArbitrageHook is Script {
         console2.log("GROUPS", config.hook.groupsOf(1, token).length);
         console2.log("GAS_LIMIT", config.hook.market(1).gasLimit);
         console2.log("MINIMUM_GAS_LIMIT", config.hook.minimumGasLimit(1));
+    }
+
+    /// @dev Authority mode: SZR's market is left empty and switched off, and the protocol's
+    /// share of WETH and native ETH goes to the treasury, as the listed tokens' does. Nothing
+    /// for SZR's market (positions, leaders, connectors, an allowance) is accepted. Running it
+    /// again changes nothing.
+    function _runAuthority(Config memory config) internal {
+        if (config.treasury == address(0)) revert MissingTreasury();
+        if (config.treasury == address(config.hook)) revert TreasuryIsHook();
+        if (config.positions.length != 0) revert NotForAuthorityMode();
+        if (config.groups.length != 0) revert NotForAuthorityMode();
+        if (config.connectors.length != 0) revert NotForAuthorityMode();
+        if (config.gasLimit != 0) revert NotForAuthorityMode();
+        ArbitrageApi hook = config.hook;
+        vm.startBroadcast(hook.liquidity().manager());
+        address[2] memory shared = [hook.backingAsset(), address(0)];
+        for (uint256 index; index < shared.length; index++) {
+            if (hook.shareRecipient(shared[index]) == config.treasury) continue;
+            hook.setProfitToken(shared[index], config.treasury);
+        }
+        for (uint256 index; index < config.profitTokens.length; index++) {
+            address asset = config.profitTokens[index];
+            if (hook.shareRecipient(asset) == config.treasury) continue;
+            hook.setProfitToken(asset, config.treasury);
+        }
+        address token = hook.token();
+        if (hook.market(1).gasLimit != 0) {
+            hook.setLimits(
+                1, token, 0, hook.minimumProfit(1, token), hook.market(1).minimumEdge
+            );
+        }
+        if (config.swapGasCeiling != 0) {
+            if (hook.swapGasCeiling() != config.swapGasCeiling) {
+                hook.setSwapGasCeiling(config.swapGasCeiling);
+            }
+        }
+        vm.stopBroadcast();
+        console2.log("AUTHORITY_MODE", address(hook.liquidity()));
+        console2.log("SWAP_GAS_CEILING", hook.swapGasCeiling());
     }
 
     /// @dev Checked before anything is sent, so a bad list changes nothing.
@@ -139,6 +186,7 @@ contract ConfigureArbitrageHook is Script {
         }
         config.profitTokens = vm.envOr("PROFIT_TOKENS", ",", new address[](0));
         config.treasury = vm.envOr("TREASURY", address(0));
+        config.swapGasCeiling = vm.envOr("HOOK_SWAP_GAS_CEILING", uint256(0));
         config.gasLimit =
             uint32(_narrow(vm.envOr("HOOK_GAS_LIMIT", uint256(0)), type(uint32).max));
         config.positions = vm.envOr("TRACK_POSITIONS", ",", new uint256[](0));

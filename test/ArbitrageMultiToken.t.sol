@@ -23,7 +23,7 @@ abstract contract MultiWorld is MarketsWorld {
 
     function setUp() public override {
         super.setUp();
-        dai = new TestAsset();
+        dai = _newAsset();
         _approve(dai);
         wethDai = _create(address(backing), address(dai), 3_000);
         _lead(address(backing), address(dai), _list(_id(wethDai)));

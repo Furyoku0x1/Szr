@@ -19,6 +19,7 @@ import { StateLibrary } from "v4-core/libraries/StateLibrary.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
 import { Currency } from "v4-core/types/Currency.sol";
+import { FixedPointMathLib } from "solady/utils/FixedPointMathLib.sol";
 
 /// @dev The real PoolManager with three pools: the hookless SZR/WETH main pool, a hooked
 /// SZR/USD pool, and an outside WETH/USD pool connecting the two partner tokens. Helpers add
@@ -57,17 +58,48 @@ abstract contract ArbitrageWorld is SzrWorld, ArbitrageDeploy {
         szr = TestAsset(address(core.token()));
         // Only the beforeSwap and afterSwap permission bits are set in the address.
         hook = ArbitrageApi(payable(address(uint160(0xA4B1 << 24 | 1 << 7 | 1 << 6))));
-        _deployHookAt(address(hook), locker);
+        _deployHookAt(address(hook), _hookLiquidity());
         provider = new PoolModifyLiquidityTest(manager);
         _approve(backing);
         // SZR cannot be minted; this contract still holds what it migrated.
         szr.approve(address(provider), type(uint256).max);
         szr.approve(address(swapper), type(uint256).max);
         mainPool = locker.key(0);
+        _setupSzrMarket();
+    }
+
+    /// What the hook is deployed against: SZR's Liquidity. A world on a chain without SZR
+    /// answers with a `HookAuthority` instead (`test/HookAuthority*.t.sol`).
+    function _hookLiquidity() internal virtual returns (Liquidity) {
+        return locker;
+    }
+
+    /// SZR's market: the main pool tracked and leading, and a hooked SZR/USD pool with the
+    /// connecting pool that joins them.
+    function _setupSzrMarket() internal virtual {
         hook.track(0);
         _lead(mainPool);
-        usd = new TestAsset();
+        usd = _newAsset();
         usdPool = _addPartner(usd);
+    }
+
+    /// Puts SZR's main pool at `ratio` (WAD) times Core's NAV, by donating real backing to
+    /// Core: 1.5e18 is a pool 1.5 times above NAV, 0.9e18 a pool below it. The legacy price
+    /// leaves NAV about 1e-15 of the pool's, which no launch looks like. Returns the NAV.
+    function _poolAtNavRatio(uint256 ratio) internal returns (uint256 nav) {
+        (uint160 root,,,) = StateLibrary.getSlot0(manager, mainPool.toId());
+        bool szrFirst = Currency.unwrap(mainPool.currency0) == address(szr);
+        uint256 square = FixedPointMathLib.fullMulDiv(uint256(root), uint256(root), 1 << 64);
+        uint256 price = szrFirst
+            ? FixedPointMathLib.fullMulDiv(square, 1e18, 1 << 128)
+            : FixedPointMathLib.fullMulDiv(1 << 128, 1e18, square);
+        nav = FixedPointMathLib.fullMulDiv(price, 1e18, ratio);
+        uint256 wanted = FixedPointMathLib.fullMulDiv(nav, core.activeSupply(), 1e18);
+        uint256 held = core.backingAmount();
+        require(wanted > held, "NAV already above");
+        backing.mint(address(this), wanted - held);
+        core.donateBacking(wanted - held);
+        nav = core.NAV();
     }
 
     function _approve(TestAsset asset) internal {

@@ -86,7 +86,7 @@ contract MetricVaultForkTest is Test {
     }
 
     modifier onlyFork() {
-        if (!live) return;
+        if (!live) vm.skip(true);
         _;
     }
 

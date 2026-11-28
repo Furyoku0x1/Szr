@@ -35,7 +35,7 @@ abstract contract MarketsWorld is ArbitrageWorld {
 
     function setUp() public virtual override {
         super.setUp();
-        coin = new TestAsset();
+        coin = _newAsset();
         _approve(coin);
         hook.setProfitToken(address(usd), desk);
         publicPool = _pair(address(backing), address(usd), 3_000, address(0));

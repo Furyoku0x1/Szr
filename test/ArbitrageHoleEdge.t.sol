@@ -17,6 +17,13 @@ contract ArbitrageHoleEdgeTest is HoleWorld {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
 
+    /// What the control gap must exceed to be worth taking, in SZR. A world with SZR first
+    /// in the pool turns a sale into a purchase, whose gap yields less SZR for the same
+    /// price move (`test/ArbitrageTokenOrder.t.sol`).
+    function controlFloor() internal pure virtual returns (uint256) {
+        return 700e18;
+    }
+
     /// Spec test 1 and 2: a swap to the exact edge, against the same swap stopped one wei
     /// short, which leaves the liquidity in range.
     function _edge(uint256 dust, bool zeroForOne, uint256 percent) internal {
@@ -25,7 +32,7 @@ contract ArbitrageHoleEdgeTest is HoleWorld {
         uint256 control = _retired(zeroForOne, false);
         vm.revertToState(snapshot);
         uint256 attack = _retired(zeroForOne, true);
-        assertGt(control, 700e18, "the control gap is worth taking");
+        assertGt(control, controlFloor(), "the control gap is worth taking");
         assertGe(attack * 100, control * percent, "the edge swap's gap is taken as well");
     }
 

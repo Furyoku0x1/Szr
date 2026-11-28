@@ -42,8 +42,23 @@ abstract contract SzrWorld is Test {
         _fundPosition();
     }
 
+    /// How many tokens `_highAsset` has made.
+    uint256 internal highCount;
+
+    /// A token for a world to use; worlds that need another sort order override this.
+    function _newAsset() internal virtual returns (TestAsset) {
+        return new TestAsset();
+    }
+
+    /// A token at an address above every contract the world deploys, so that it sorts after
+    /// SZR and the tokens made before it (docs/specs/hook-fund-safety-tests.md, item 2).
+    function _highAsset() internal returns (TestAsset made) {
+        made = TestAsset(address(type(uint160).max - 1_000 + uint160(highCount++)));
+        deployCodeTo("TestAsset.sol:TestAsset", address(made));
+    }
+
     function _deploy() internal {
-        backing = new TestAsset();
+        backing = _newAsset();
         core = SzrCore(
             deployCode(
                 "SzrCore.sol:SzrCore",
