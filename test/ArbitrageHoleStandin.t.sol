@@ -231,19 +231,32 @@ contract ArbitrageHoleStandinTest is HoleWorld {
     // ----- the ratio of the focus to the rest of the cycle -----
 
     function testAStandInNeedsAThinFocus() public {
+        // An empty focus pool, so its shape never decides: only the ratio does.
+        _build(0);
+        _unposition(centre - WIDTH, centre + WIDTH, BIG);
         ArbitrageProbe probe = _probeInHook();
         bytes32 venue = _id(mainPool);
+        bytes32 pool = _id(focus);
         uint256 others = probe.othersOf(venue);
         uint256 rate = 1 << 96;
-        assertTrue(probe.standInMade(venue, 0, rate, true), "an empty focus");
-        assertTrue(probe.standInMade(venue, others / 10 - 1, rate, true), "just under a tenth");
-        assertFalse(probe.standInMade(venue, others / 10 + 1, rate, true), "just over a tenth");
-        assertFalse(probe.standInMade(venue, others, rate, true), "as deep as the rest");
+        assertTrue(probe.standInMade(venue, pool, 0, rate, true, true, 0), "an empty focus");
+        assertTrue(
+            probe.standInMade(venue, pool, others / 10 - 1, rate, true, true, 0), "just under"
+        );
+        assertFalse(
+            probe.standInMade(venue, pool, others / 10 + 1, rate, true, true, 0), "just over"
+        );
+        assertFalse(probe.standInMade(venue, pool, others, rate, true, true, 0), "as deep");
     }
 
     function testNoStandInOffTheStartPool() public {
+        _build(0);
+        _unposition(centre - WIDTH, centre + WIDTH, BIG);
         ArbitrageProbe probe = _probeInHook();
         bytes32 venue = _id(mainPool);
-        assertFalse(probe.standInMade(venue, 0, 1 << 96, false), "not the start pool");
+        assertFalse(
+            probe.standInMade(venue, _id(focus), 0, 1 << 96, false, true, 0),
+            "not the start pool"
+        );
     }
 }

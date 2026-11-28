@@ -526,6 +526,25 @@ abstract contract MetricVenueHookBase is Test {
         hook.acceptOwnership();
     }
 
+    /// 23-L-5: a searcher with no code would make every swap revert for good.
+    function testConstructorRefusesASearcherWithNoCode() public {
+        address at = address(uint160(0x4445 << 144 | 0x2888 | 1 << 6));
+        vm.expectRevert(MetricVenueHook.NoHook.selector);
+        deployCodeTo(
+            "MetricVenueHook.sol:MetricVenueHook",
+            abi.encode(OWNER, FACTORY, address(manager), address(0xBEEF)),
+            at
+        );
+    }
+
+    /// Zero is the supported "no arbitrage hook": it is accepted, and swaps run without a search.
+    function testNoSearcherIsAcceptedAndSwapsWork() public {
+        assertEq(hook.arbitrage(), address(0));
+        (,, int256 pmLow, int256 pmHigh) = _run(true, -int256(IN));
+        assertEq(pmLow, 0);
+        assertEq(pmHigh, 0);
+    }
+
     function testConstructorRefusesAWrongAddress() public {
         vm.expectRevert(MetricVenueHook.InvalidHookAddress.selector);
         new MetricVenueHook(OWNER, FACTORY, manager, address(0));

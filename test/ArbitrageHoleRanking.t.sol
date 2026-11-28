@@ -6,6 +6,7 @@ import { ArbitrageProbe } from "./utils/ArbitrageProbe.sol";
 import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
+import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 
 /// @dev The real book, ranking and ordering code with a stand-in and a real plan side by
 /// side (docs/specs/hook-hole-edge.md): the real plan must win in a book and across books,
@@ -17,6 +18,19 @@ contract ArbitrageHoleRankingTest is HoleWorld {
         _provide(pool, units);
     }
 
+    /// Deep ranges start at the next initialised tick on both sides of `tick`, so a trade
+    /// either way meets a hundred times the liquidity at the price: the thin pool is hiding
+    /// what a stand-in exists to find (docs/specs/hook-standin-ahead.md).
+    function _ranges(PoolKey memory pool, int24 tick) internal {
+        int24 floor = tick / 60 * 60;
+        provider.modifyLiquidity(
+            pool, IPoolManager.ModifyLiquidityParams(floor + 60, floor + 660, 1e24, 0), ""
+        );
+        provider.modifyLiquidity(
+            pool, IPoolManager.ModifyLiquidityParams(floor - 600, floor, 1e24, 0), ""
+        );
+    }
+
     /// A smallest profit that the thin pool's own estimate misses against a gap of 5%, and
     /// a deep one's meets against 2%.
     function _gate() internal {
@@ -26,6 +40,7 @@ contract ArbitrageHoleRankingTest is HoleWorld {
 
     function testAThinStartPoolMakesAStandIn() public {
         PoolKey memory thin = _at(1_000, 100, 1e22);
+        _ranges(thin, 1_000);
         _gate();
         ArbitrageLogic.Plan memory plan = _probeInHook().planFrom(_id(thin), address(backing));
         assertGt(plan.score, 0, "a plan");
@@ -34,6 +49,7 @@ contract ArbitrageHoleRankingTest is HoleWorld {
 
     function testARealPlanBeatsAStandInInTheSameBook() public {
         PoolKey memory thin = _at(1_000, 100, 1e22);
+        _ranges(thin, 1_000);
         PoolKey memory far = _at(5_000, 200, 1e22);
         _gate();
         ArbitrageLogic.Plan memory plan = _probeInHook().planFrom(_id(thin), address(backing));
@@ -44,6 +60,7 @@ contract ArbitrageHoleRankingTest is HoleWorld {
 
     function testARealPlanBeatsAStandInAcrossBooks() public {
         PoolKey memory thin = _at(1_000, 100, 1e22);
+        _ranges(thin, 1_000);
         PoolKey memory deep = _at(-400, 200, 1e24);
         _gate();
         bytes32[] memory centres = new bytes32[](2);

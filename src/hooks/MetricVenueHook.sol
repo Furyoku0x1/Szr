@@ -107,9 +107,15 @@ contract MetricVenueHook is IMetricSwapCallback {
     error Incomplete();
     error AmountTooLarge();
     error BadFill();
+    error NoHook();
 
     constructor(address firstOwner, address factory, IPoolManager manager, address searcher) {
         if (uint160(address(this)) & Hooks.ALL_HOOK_MASK != FLAGS) revert InvalidHookAddress();
+        // Zero means no arbitrage hook. Any other address with no code would make every swap on
+        // every binding revert for good.
+        if (searcher != address(0)) {
+            if (searcher.code.length == 0) revert NoHook();
+        }
         owner = firstOwner;
         metricFactory = factory;
         poolManager = manager;

@@ -441,6 +441,32 @@ contract ArbitrageProbe is ArbitrageApi {
         active = 0;
     }
 
+    /// The gas `_best` uses ranking a book of the pool `focusId` and `ids`, all of SZR/WETH,
+    /// and the plan it picks. The book is priced first, as it is in a search, so only the
+    /// ranking is counted.
+    function rankGas(bytes32 focusId, bytes32[] calldata ids)
+        external
+        returns (uint256 used, Plan memory plan)
+    {
+        active = SZR_MARKET;
+        home = token;
+        _begin(SZR_MARKET);
+        Venue[] memory book = new Venue[](ids.length + 1);
+        book[0].id = focusId;
+        for (uint256 index; index < ids.length; index++) {
+            book[index + 1].id = ids[index];
+        }
+        for (uint256 index; index < book.length; index++) {
+            book[index].partner = _other(keys[book[index].id], token);
+            _requote(book[index]);
+        }
+        used = gasleft();
+        plan = _best(book);
+        used -= gasleft();
+        asking = 0;
+        active = 0;
+    }
+
     function pickAmong(bytes32[] calldata centres, address partner)
         external
         returns (uint256 pick, Plan memory best)
@@ -483,13 +509,25 @@ contract ArbitrageProbe is ArbitrageApi {
 
     /// Whether a stand-in plan is made for a focus of `depth` and square-root price `rate`
     /// against the venue `venueId`, for a 10% gap that the focus's own depth leaves short of
-    /// the gate, in SZR's market. `start` is whether the search started from the focus.
-    function standInMade(bytes32 venueId, uint256 depth, uint256 rate, bool start)
-        external
-        returns (bool)
-    {
+    /// the gate, in SZR's market. `start` is whether the search started from the focus, and
+    /// `focusId` is the real pool whose shape `_ahead` reads. The venue's price is the focus's
+    /// target, `buying` is the direction the cycle trades the focus, and `far`, when nonzero,
+    /// is a target to use instead of the venue's.
+    function standInMade(
+        bytes32 venueId,
+        bytes32 focusId,
+        uint256 depth,
+        uint256 rate,
+        bool start,
+        bool buying,
+        uint256 far
+    ) external returns (bool) {
         (Venue memory venue, uint256 target) = _venueOf(venueId);
+        // A venue price to aim the gap at, in place of the venue's own, when nonzero.
+        if (far != 0) target = far;
         Focus memory focus;
+        focus.id = focusId;
+        focus.partner = _other(keys[focusId], token);
         focus.rate = rate;
         focus.keep = WAD;
         focus.depth = depth;
@@ -497,7 +535,7 @@ contract ArbitrageProbe is ArbitrageApi {
         Plan memory candidate;
         candidate.gap = WAD / 10;
         candidate.venue = venueId;
-        candidate.buying = true;
+        candidate.buying = buying;
         Plan memory best;
         Route memory route;
         _standIn(best, focus, venue, route, candidate, target);

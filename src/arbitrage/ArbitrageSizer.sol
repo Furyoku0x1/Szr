@@ -36,6 +36,31 @@ abstract contract SizerPart is ArbitrageLogic {
     {
         (limit, spend,, declined, short) = _walk(poolId, plan);
     }
+
+    /// @notice The square-root price of the next tick boundary of the focus pool `poolId`, with
+    /// `units` of liquidity at its price, if it has at least `STANDIN_RATIO` times as much just
+    /// across it in the direction a cycle trades it (`buying` is whether the hook buys the
+    /// market's token in it); zero when it has not. The caller clamps it to its own limit. One
+    /// bitmap word is looked at, as the walk does; a word's edge or the end of the range shows
+    /// no jump. It lives here, as `size` does, to keep the search modules small.
+    function ahead(bytes32 poolId, bool buying, uint256 units)
+        external
+        view
+        onlySelf
+        returns (uint160)
+    {
+        PoolKey memory key = keys[poolId];
+        SizingWalk.Leg memory leg = _leg(poolId, key, buying ? _other(key, home) : home);
+        // The focus rate is inside the band, and so is its inverse, so `_read` cannot revert.
+        SizingWalk._read(leg, uint256(_word(poolId)), units, MAX_EDGE);
+        SizingWalk._bound(poolManager, leg);
+        if (leg.broken) return 0;
+        // At a word's edge or the end of the range `beyond` is left at zero or at the liquidity
+        // now, neither of which is ten times it, so those need no test of their own.
+        SizingWalk._ends(poolManager, leg);
+        if (uint256(leg.beyond) < units * STANDIN_RATIO) return 0;
+        return leg.target;
+    }
 }
 
 /// @notice The deployed Sizer module. The hook reaches it by delegatecall, so it runs on

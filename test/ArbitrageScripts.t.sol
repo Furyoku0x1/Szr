@@ -13,6 +13,13 @@ import { IHooks } from "v4-core/interfaces/IHooks.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { Currency } from "v4-core/types/Currency.sol";
 
+/// @dev Reads the script's environment so the test can see what it refuses.
+contract ConfigureReader is ConfigureArbitrageHook {
+    function read() external view returns (Config memory) {
+        return _readConfig();
+    }
+}
+
 /// @dev The two scripts for the hook: deploying it at an address with the right permission
 /// bits, and the manager's setup steps.
 contract ArbitrageScriptsTest is ArbitrageWorld {
@@ -184,5 +191,44 @@ contract ArbitrageScriptsTest is ArbitrageWorld {
         for (uint256 index; index < logs.length; index++) {
             assertTrue(logs[index].topics[0] != ArbitrageLogic.ProfitTokenSet.selector);
         }
+    }
+
+    function _setConnector(string memory fee, string memory spacing) internal {
+        vm.setEnv("CONNECTOR_TOKEN0", vm.toString(address(backing)));
+        vm.setEnv("CONNECTOR_TOKEN1", vm.toString(address(usd)));
+        vm.setEnv("CONNECTOR_HOOKS", vm.toString(address(0)));
+        vm.setEnv("CONNECTOR_FEE", fee);
+        vm.setEnv("CONNECTOR_TICK_SPACING", spacing);
+    }
+
+    function _clearEnv() internal {
+        vm.setEnv("HOOK_GAS_LIMIT", "0");
+        vm.setEnv("CONNECTOR_TOKEN0", "");
+        vm.setEnv("CONNECTOR_TOKEN1", "");
+        vm.setEnv("CONNECTOR_HOOKS", "");
+        vm.setEnv("CONNECTOR_FEE", "");
+        vm.setEnv("CONNECTOR_TICK_SPACING", "");
+    }
+
+    /// 27-L-1: a value too large for its type is refused, not cut down to something that the
+    /// hook would accept.
+    function testSetupScriptRefusesValuesTooLargeForTheirTypes() public {
+        ConfigureReader reader = new ConfigureReader();
+        vm.setEnv("ARBITRAGE_HOOK", vm.toString(address(hook)));
+        vm.setEnv("HOOK_GAS_LIMIT", "80000000000");
+        vm.expectRevert(ConfigureArbitrageHook.ValueTooLarge.selector);
+        reader.read();
+        vm.setEnv("HOOK_GAS_LIMIT", "4294967295");
+        assertEq(reader.read().gasLimit, type(uint32).max, "the largest is accepted");
+        vm.setEnv("HOOK_GAS_LIMIT", "0");
+        _setConnector("16777216", "60");
+        vm.expectRevert(ConfigureArbitrageHook.ValueTooLarge.selector);
+        reader.read();
+        _setConnector("3000", "8388608");
+        vm.expectRevert(ConfigureArbitrageHook.ValueTooLarge.selector);
+        reader.read();
+        _setConnector("16777215", "8388607");
+        assertEq(reader.read().connectors[0].fee, type(uint24).max);
+        _clearEnv();
     }
 }

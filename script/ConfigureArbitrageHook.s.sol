@@ -47,6 +47,7 @@ contract ConfigureArbitrageHook is Script {
     error MissingTreasury();
     error TreasuryIsHook();
     error ProfitTokenRefused(address token);
+    error ValueTooLarge();
 
     function run() external {
         run(_readConfig());
@@ -122,6 +123,11 @@ contract ConfigureArbitrageHook is Script {
         }
     }
 
+    function _narrow(uint256 value, uint256 most) internal pure returns (uint256) {
+        if (value > most) revert ValueTooLarge();
+        return value;
+    }
+
     /// @dev Connecting pools are given as five parallel lists, one entry per pool. One
     /// group's leaders can be given per run, as its partner token and its position ids.
     function _readConfig() internal view returns (Config memory config) {
@@ -133,7 +139,8 @@ contract ConfigureArbitrageHook is Script {
         }
         config.profitTokens = vm.envOr("PROFIT_TOKENS", ",", new address[](0));
         config.treasury = vm.envOr("TREASURY", address(0));
-        config.gasLimit = uint32(vm.envOr("HOOK_GAS_LIMIT", uint256(0)));
+        config.gasLimit =
+            uint32(_narrow(vm.envOr("HOOK_GAS_LIMIT", uint256(0)), type(uint32).max));
         config.positions = vm.envOr("TRACK_POSITIONS", ",", new uint256[](0));
         address[] memory token0 = vm.envOr("CONNECTOR_TOKEN0", ",", new address[](0));
         address[] memory token1 = vm.envOr("CONNECTOR_TOKEN1", ",", new address[](0));
@@ -149,8 +156,8 @@ contract ConfigureArbitrageHook is Script {
             config.connectors[index] = PoolKey(
                 Currency.wrap(token0[index]),
                 Currency.wrap(token1[index]),
-                uint24(fee[index]),
-                int24(int256(spacing[index])),
+                uint24(_narrow(fee[index], type(uint24).max)),
+                int24(int256(_narrow(spacing[index], uint24(type(int24).max)))),
                 IHooks(hooks[index])
             );
         }

@@ -11,6 +11,7 @@ import { ArbitrageLogic } from "../src/arbitrage/ArbitrageLogic.sol";
 import { SearchPart } from "../src/arbitrage/ArbitrageSearch.sol";
 import { SearchManyPart } from "../src/arbitrage/ArbitrageSearchMany.sol";
 import { Liquidity } from "../src/Liquidity.sol";
+import { ArbitrageApi } from "../src/arbitrage/ArbitrageApi.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { Currency } from "v4-core/types/Currency.sol";
@@ -633,6 +634,33 @@ contract ArbitrageWrappedStartTest is StartWorld {
     }
 }
 
+/// @dev Calls `venueSearch` as the wrapping hook from inside an unlock, as a swap through it
+/// would, without needing the wrapped pool to trade.
+contract VenueUnlocker {
+    Vm internal constant VM = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+    IPoolManager internal immutable manager;
+    address internal immutable wrapper;
+    address internal immutable hook;
+    bytes32 internal poolId;
+
+    constructor(IPoolManager manager_, address wrapper_, address hook_) {
+        manager = manager_;
+        wrapper = wrapper_;
+        hook = hook_;
+    }
+
+    function run(bytes32 id) external {
+        poolId = id;
+        manager.unlock("");
+    }
+
+    function unlockCallback(bytes calldata) external returns (bytes memory) {
+        VM.prank(wrapper);
+        ArbitrageApi(payable(hook)).venueSearch(poolId, false, address(this));
+        return "";
+    }
+}
+
 /// @dev A swap through a wrapped pool that holds the trigger's token is searched once, from
 /// that pool, before the fill and after it. The pool is no leader of its group.
 contract ArbitrageWrappedTriggerTest is StartWorld {
@@ -702,6 +730,48 @@ contract ArbitrageWrappedTriggerTest is StartWorld {
         wrapper.watch(wrapped, address(hook), id, address(backing), CAP);
         vm.expectCall(address(hook), abi.encodeWithSelector(SearchPart.search.selector), 2);
         _trade(wrapped, address(coin), 1e15);
+    }
+
+    /// Makes `pool` a venue of the market, watched for a trigger counting in `base`, and runs
+    /// one `venueSearch` on it as the wrapper would; `searches` is how many `search` calls
+    /// that makes.
+    function _ethPoolSearches(PoolKey memory pool, address base, uint64 searches) internal {
+        vm.startPrank(team);
+        hook.setLimits(id, address(backing), 0, 1e15, 1.0001e18);
+        hook.addVenue(id, pool);
+        vm.stopPrank();
+        _on();
+        wrapper.watch(pool, address(hook), id, base, CAP);
+        VenueUnlocker unlocker =
+            new VenueUnlocker(IPoolManager(address(manager)), address(wrapper), address(hook));
+        vm.expectCall(
+            address(hook), abi.encodeWithSelector(SearchPart.search.selector), searches
+        );
+        vm.recordLogs();
+        unlocker.run(_id(pool));
+        assertEq(_count(vm.getRecordedLogs(), ArbitrageLogic.CycleFailed.selector), 0, "failed");
+    }
+
+    /// A wrapped pool of native ETH and a token T below WETH's address, priced far from 1:1,
+    /// with the trigger counting in WETH, is not "held": it holds WETH's twin, and starting a
+    /// search from it would price it as WETH with the pair the wrong way round. It keeps the
+    /// old route of one search per group head (two groups), and nothing fails.
+    function testAnEtherWrappedPoolInWethKeepsOneSearchPerGroup() public {
+        address low = address(0x1234);
+        deployCodeTo("TestAsset.sol:TestAsset", low);
+        PoolKey memory pool = _pair(address(0), low, 3_000, address(wrapper));
+        manager.initialize(pool, uint160(1 << 96));
+        wrapper.seed(pool, 1_000_000e18, 4_000_000e18);
+        _ethPoolSearches(pool, address(backing), 2);
+    }
+
+    /// The pool's partner is native ETH, address zero, which is a real partner and not "none"
+    /// (23-L-3 as the review found it): triggered in USD it is still one search.
+    function testAnEtherPartnerOfTheTriggerTokenIsSearchedOnce() public {
+        PoolKey memory pool = _pair(address(0), address(usd), 3_000, address(wrapper));
+        manager.initialize(pool, uint160(1 << 96));
+        wrapper.seed(pool, 1_000_000e18, 1_000_000e18);
+        _ethPoolSearches(pool, address(usd), 1);
     }
 
     /// With too little gas the search is skipped and reported, and the swap still settles;

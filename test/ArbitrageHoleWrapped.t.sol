@@ -4,11 +4,17 @@ pragma solidity 0.8.30;
 import { StartWorld, StartProbe } from "./ArbitrageWrappedStart.t.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
+import { StateLibrary } from "v4-core/libraries/StateLibrary.sol";
+import { PoolIdLibrary } from "v4-core/types/PoolId.sol";
+import { PoolKey } from "v4-core/types/PoolKey.sol";
 
 /// @dev A search that starts from a wrapped pool compares it with plain pools only, and
 /// stays as it was: a thin plain pool next to it makes no stand-in
 /// (docs/specs/hook-hole-edge.md, spec test 7).
 contract ArbitrageHoleWrappedTest is StartWorld {
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
+
     function _probeInPlace() internal returns (StartProbe) {
         address at = address(uint160(0xA4B3 << 24 | 1 << 7 | 1 << 6));
         deployCodeTo("ArbitrageWrappedStart.t.sol:StartProbe", abi.encode(locker), at);
@@ -32,6 +38,16 @@ contract ArbitrageHoleWrappedTest is StartWorld {
         _off();
         _trade(first, address(coin), 1e15);
         _on();
+        // Deep ranges start at the next initialised tick on both sides of its price, so the
+        // pool hides what a stand-in exists to find (docs/specs/hook-standin-ahead.md).
+        (, int24 tick,,) = manager.getSlot0(first.toId());
+        int24 floor = tick / 60 * 60;
+        provider.modifyLiquidity(
+            first, IPoolManager.ModifyLiquidityParams(floor + 60, floor + 660, 1e24, 0), ""
+        );
+        provider.modifyLiquidity(
+            first, IPoolManager.ModifyLiquidityParams(floor - 600, floor, 1e24, 0), ""
+        );
     }
 
     function testAThinPlainPoolMakesNoStandInFromAWrappedStart() public {

@@ -21,7 +21,8 @@ import { Liquidity } from "../src/Liquidity.sol";
 /// a fitting address, about 16,000 tries.
 contract DeployArbitrageHook is Script {
     /// @dev The Safe singleton factory: plain CREATE2, calldata is the salt then the initcode.
-    /// It is deployed on Robinhood Chain; Foundry's default CREATE2 deployer is not.
+    /// It is used because the hook's address is mined against it. Foundry's default CREATE2
+    /// deployer is on Robinhood Chain too, but the mined salt would not fit it.
     address public constant FACTORY = 0x914d7Fec6aaC8cd542e72Bca78B30650d45643d7;
     uint256 internal constant MAX_TRIES = 1_000_000;
     uint160 internal constant PERMISSION_MASK = (1 << 14) - 1;

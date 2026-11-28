@@ -70,6 +70,8 @@ interface IArbitrageSelf {
         view
         returns (uint160 limit, uint256 spend, bool declined, bool short);
 
+    function ahead(bytes32 poolId, bool buying, uint256 units) external view returns (uint160);
+
     function askFrame(address pricer, bytes32 poolId) external;
 
     function retire(uint256 profit) external;
@@ -170,10 +172,17 @@ abstract contract ArbitrageLogic {
     /// percent.
     uint256 internal constant PLAN_MARGIN = 125;
     /// @dev A stand-in plan is made only for a focus pool with less than one in this many
-    /// of the rest of the cycle's depth. Pools of ordinary depth stay clear of it: at
-    /// a tenth, the real estimate is at least an eleventh of the stand-in's, so only a gap
-    /// worth under about eleven times the gate can hide.
+    /// of the rest of the cycle's depth, and only when its own liquidity looks unrepresentative:
+    /// none at all, or at least this many times as much just across its next tick boundary
+    /// (`_ahead`). Pools of ordinary depth stay clear of the first: at a tenth, the real
+    /// estimate is at least an eleventh of the stand-in's, so only a gap worth under about
+    /// eleven times the gate can hide. A pool that is merely thin next to the rest, with
+    /// nothing deeper ahead, would be declined by the walk anyway after costing the swap a
+    /// required attempt (27-M-1).
     uint256 internal constant STANDIN_RATIO = 10;
+    /// @dev The top bit of `Bench.gap`, set when the bench came from a stand-in. A real gap is
+    /// under `MAX_EDGE`, so it never sets it.
+    uint192 internal constant STANDIN_MARK = 1 << 191;
     /// @dev A square-root price gap beyond this (a 16x price difference) is a broken or
     /// manipulated venue, not something to arbitrage.
     uint256 internal constant MAX_EDGE = 4e18;
@@ -274,9 +283,18 @@ abstract contract ArbitrageLogic {
         uint256 known;
         // Whether the search started from this pool, the only one a stand-in is made for.
         bool start;
+        // What `_ahead` found for each direction the focus is traded in: 0 not read yet, 1 no
+        // jump, the largest number for zero liquidity, otherwise the square-root price of the
+        // boundary the deeper liquidity starts at. Read at most once each per scan.
+        uint256 aheadSell;
+        uint256 aheadBuy;
     }
 
-    /// @dev `gap` is how far apart the prices were, beyond fees, when the cycle failed.
+    /// @dev `gap` is how far apart the prices were, beyond fees, when the cycle failed. A
+    /// stand-in's bench has `STANDIN_MARK` set on top of its gap: it never blocks a real plan
+    /// (the gap it guessed at is not one that was seen), but it blocks a stand-in unless that
+    /// one's gap is `BENCH_ESCAPE` times wider, so forcing one failure at a small gap cannot
+    /// hide a larger one (27-M-2).
     struct Bench {
         uint64 until;
         uint192 gap;
@@ -948,11 +966,12 @@ abstract contract ArbitrageLogic {
         uint256 cap = FixedPointMathLib.min(markets[entry.market].gasLimit, entry.gasCap);
         uint256 start = gasleft();
         uint256 needed = _needed(entry.market, entry.base, before);
-        address[] memory list = groups[entry.market][entry.base];
         // A wrapped pool that holds the token is searched from itself, once; it is compared
         // with the plain pools of every group (`_bestFromWrapped`).
-        address mine = _wrappedPartner(entry.market, poolId, entry.base);
-        uint256 length = mine == address(0) ? list.length : 1;
+        // Native ETH is address zero, so whether the pool holds the token is the flag, never the
+        // partner being zero (23-L-3).
+        (bool held, address mine) = _wrappedPartner(entry.market, poolId, entry.base);
+        uint256 length = held ? 1 : groups[entry.market][entry.base].length;
         _reuseAnswers(true);
         for (uint256 index; index < length; index++) {
             uint256 left = _budgetLeft(cap, start, needed);
@@ -962,35 +981,36 @@ abstract contract ArbitrageLogic {
             }
             remembered = bytes32(0);
             _forgetCentres();
-            if (mine == address(0)) {
-                _attemptHead(
-                    entry.market, entry.base, list[index], bytes32(0), before, sender, left
-                );
-            } else {
+            if (held) {
                 _attemptHead(entry.market, entry.base, mine, poolId, before, sender, left);
+            } else {
+                address head = groups[entry.market][entry.base][index];
+                _attemptHead(entry.market, entry.base, head, bytes32(0), before, sender, left);
             }
         }
         _reuseAnswers(false);
     }
 
-    /// @dev The other token of a swapped wrapped pool of the market that holds `base`; zero
-    /// when the pool is not one, or does not hold it (the twin of an ether token included).
-    /// A pool of both ether tokens is never searched, so it is not one either.
+    /// @dev Whether a swapped wrapped pool of the market holds `base` itself, and if so its
+    /// other token. `found` is what says so: the partner can be native ETH, which is address
+    /// zero, so zero cannot mean "none". A pool that holds only the twin of an ether `base`
+    /// is not found (it would be priced as if it held `base`), and neither is a pool of both
+    /// ether tokens, which is never searched.
     function _wrappedPartner(uint256 id, bytes32 poolId, address base)
         internal
         view
-        returns (address)
+        returns (bool found, address partner)
     {
-        if (wrappedAt[id][poolId] == 0) return address(0);
+        if (wrappedAt[id][poolId] == 0) return (false, address(0));
         PoolKey storage key = keys[poolId];
         address lower = Currency.unwrap(key.currency0);
         address higher = Currency.unwrap(key.currency1);
         if (_isEther(lower)) {
-            if (_isEther(higher)) return address(0);
+            if (_isEther(higher)) return (false, address(0));
         }
-        if (lower == base) return higher;
-        if (higher == base) return lower;
-        return address(0);
+        if (lower == base) return (true, higher);
+        if (higher == base) return (true, lower);
+        return (false, address(0));
     }
 
     /// @dev What a trigger's next search may use: what is left of its cap, and no more than
@@ -1718,8 +1738,10 @@ abstract contract ArbitrageLogic {
     function _bench(bytes32 poolId, Plan memory plan, bool aside) internal {
         emit CycleFailed(poolId, plan.venue);
         if (!aside) return;
-        benched[_pair(active, home, poolId, plan.venue, plan.buying)] =
-            Bench(uint64(block.timestamp + BENCH_TIME), plan.standin ? 0 : uint192(plan.gap));
+        benched[_pair(active, home, poolId, plan.venue, plan.buying)] = Bench(
+            uint64(block.timestamp + BENCH_TIME),
+            plan.standin ? uint192(plan.gap) | STANDIN_MARK : uint192(plan.gap)
+        );
     }
 
     function _traded(address asset) internal view returns (bool) {
@@ -2117,7 +2139,7 @@ abstract contract ArbitrageLogic {
         view
         returns (uint160)
     {
-        if (pricers[address(pool.hooks)] != address(0)) {
+        if (_priced(address(pool.hooks))) {
             Currency asset = Currency.wrap(input);
             int256 credit = poolManager.currencyDelta(address(this), asset);
             if (credit > 0) V4Read._funded(poolManager, asset, uint256(credit), false);
@@ -2194,8 +2216,12 @@ abstract contract ArbitrageLogic {
         address base = home;
         if (!redeemable) {
             if (_isEther(base)) {
-                (ids, partners) = _grow(ids, partners, count);
-                count = _twinVenues(ids, partners, count, partner);
+                // `setLeaders` keeps a partner in `groups` exactly when it has leaders, so an
+                // empty list of groups means the twin has no venues to read.
+                if (groups[active][_twin(base)].length != 0) {
+                    (ids, partners) = _grow(ids, partners, count);
+                    count = _twinVenues(ids, partners, count, partner);
+                }
             }
         }
         book = new Venue[](redeemable ? count + 1 : count);
@@ -2512,7 +2538,15 @@ abstract contract ArbitrageLogic {
         focus.keep = venue.keep;
         focus.edge = edge;
         focus.seen = new address[](routes);
-        focus.routes = new Route[](routes);
+        // The array is made without zero-filled structs: `_routeFrom` assigns an element before
+        // anything reads it, and reads only the first `known` of them.
+        Route[] memory list;
+        assembly ("memory-safe") {
+            list := mload(0x40)
+            mstore(list, routes)
+            mstore(0x40, add(list, mul(add(routes, 1), 0x20)))
+        }
+        focus.routes = list;
     }
 
     /// @dev A search that starts from a wrapped pool compares it with plain pools only, and
@@ -2607,11 +2641,14 @@ abstract contract ArbitrageLogic {
         _standIn(best, focus, venue, route, candidate, target);
     }
 
-    /// @dev The estimate missed the gate. If the focus pool is thin, it may be hiding a gap
-    /// (an empty pool past a range edge, dust, a pulled position): the rest of the cycle has
-    /// depth, so a plan is made as if the focus had as much, and the sizing walk finds the
-    /// real amount. Only for the pool a search started from; a venue or link with no depth
-    /// is never planned against, because its price can be pushed anywhere for free.
+    /// @dev The estimate missed the gate. If the focus pool is thin next to the rest of the
+    /// cycle and its own liquidity at the price is not representative (none, or far more just
+    /// across the next tick, as with an empty pool past a range edge, dust or a pulled
+    /// position), it may be hiding a gap: a plan is made as if the focus had as much depth as
+    /// the rest, and the sizing walk finds the real amount. Only for the pool a search
+    /// started from; a venue or link with no depth is never planned against, because its
+    /// price can be pushed anywhere for free. A failed stand-in's bench blocks another only
+    /// below `BENCH_ESCAPE` times its gap. The shape is checked last: it reads the pool.
     function _standIn(
         Plan memory best,
         Focus memory focus,
@@ -2621,17 +2658,68 @@ abstract contract ArbitrageLogic {
         uint256 target
     ) internal view {
         if (!focus.start) return;
-        // A failed stand-in benches stand-ins only (its bench has no gap, so it never blocks a
-        // real plan), and none is made while any bench on the pair is active.
-        bytes32 key = _pair(active, home, focus.id, candidate.venue, candidate.buying);
-        if (block.timestamp < benched[key].until) return;
         uint256 others =
             venue.id == bytes32(0) ? MAX_DEPTH : _depth(venue.id, venue.rate, venue.rate);
         if (route.links[0] != bytes32(0)) others = V4Read._harmonic(others, route.depth);
         // Above a tenth of `others` the real estimate is at least an eleventh of the
         // stand-in's, so only a gap worth under about eleven times the gate can hide.
         if (focus.depth * STANDIN_RATIO >= others) return;
+        // The bench is read after the depth test: both only return early, and most candidates
+        // end at the depth test.
+        // A bench of either kind blocks a stand-in unless its gap is wide enough to escape.
+        Bench memory bench =
+            benched[_pair(active, home, focus.id, candidate.venue, candidate.buying)];
+        if (block.timestamp < bench.until) {
+            if (candidate.gap / BENCH_ESCAPE < (bench.gap & ~STANDIN_MARK)) return;
+        }
+        if (!_hidden(focus, candidate.buying, _limit(focus, target))) return;
         _offer(best, focus, candidate, target, others, true);
+    }
+
+    /// @dev Whether the focus's liquidity hides a gap for a candidate whose whole gap ends at
+    /// the price limit `full`. The read (`_ahead`) is made once per direction and its answer
+    /// kept; each candidate then asks whether the deeper range starts before its own limit,
+    /// since one that starts past it is where the cycle would never trade (27-M-4).
+    function _hidden(Focus memory focus, bool buying, uint256 full)
+        internal
+        view
+        returns (bool)
+    {
+        uint256 seen = buying ? focus.aheadBuy : focus.aheadSell;
+        if (seen == 0) {
+            seen = _ahead(focus, buying);
+            if (buying) focus.aheadBuy = seen;
+            else focus.aheadSell = seen;
+        }
+        if (seen == 1) return false;
+        if (seen == type(uint256).max) return true;
+        // The price falls with the trade when SZR is the pool's first token and it is sold, or
+        // when it is the second and it is bought.
+        if ((home < focus.partner) != buying) return seen >= full;
+        return seen <= full;
+    }
+
+    /// @dev What the focus pool's liquidity at its price hides: the largest number if it is
+    /// zero (no limit applies, the walk finds the amount), 1 if nothing deeper is in view,
+    /// otherwise the price of the next tick boundary in the direction the cycle trades the
+    /// focus, when the liquidity just across it is at least `STANDIN_RATIO` times as much
+    /// (`SizerPart.ahead`, kept in the Sizer for the search modules' size). The call is not
+    /// caught: it is given all the gas there is, so it can only fail by running out of it,
+    /// which ends the search with no revert data exactly as running out in ranking does
+    /// (`_judge`), and never reads as "no jump".
+    function _ahead(Focus memory focus, bool buying) internal view returns (uint256) {
+        uint256 units = _units(focus.id);
+        if (units == 0) return type(uint256).max;
+        uint256 price = IArbitrageSelf(address(this)).ahead(focus.id, buying, units);
+        return price == 0 ? 1 : price;
+    }
+
+    /// @dev Whether `hooked` has a pricer. `setPricer` refuses no hook and this hook, so those
+    /// are never priced and the read is skipped: most pools of a search are on this hook.
+    function _priced(address hooked) internal view returns (bool) {
+        if (hooked == address(0)) return false;
+        if (hooked == address(this)) return false;
+        return pricers[hooked] != address(0);
     }
 
     /// @dev Whether a buy would run a wrapped leg whose input the hook does not yet hold: a
@@ -2644,10 +2732,10 @@ abstract contract ArbitrageLogic {
             bytes32 link = route.links[hop];
             if (link == bytes32(0)) continue;
             if (link == WRAP) continue;
-            if (pricers[address(keys[link].hooks)] != address(0)) return true;
+            if (_priced(address(keys[link].hooks))) return true;
         }
         if (venue == bytes32(0)) return false;
-        if (pricers[address(keys[venue].hooks)] == address(0)) return false;
+        if (!_priced(address(keys[venue].hooks))) return false;
         return _holdsTwin(venue, home);
     }
 
@@ -2822,8 +2910,11 @@ abstract contract ArbitrageLogic {
         if (!_outranks(best, standin, score)) return false;
         Bench memory bench =
             benched[_pair(active, home, focus.id, candidate.venue, candidate.buying)];
+        // A stand-in's bench (marked) never blocks a real plan.
         if (block.timestamp < bench.until) {
-            if (gap / BENCH_ESCAPE < bench.gap) return false;
+            if (bench.gap < STANDIN_MARK) {
+                if (gap / BENCH_ESCAPE < bench.gap) return false;
+            }
         }
         // A stand-in takes the whole cycle's depth as the focus pool's own.
         uint256 own = standin ? depth : focus.depth;
@@ -2965,7 +3056,7 @@ abstract contract ArbitrageLogic {
             if (asking == 0) return false;
             return pricers[wrapper] != address(0);
         }
-        return pricers[address(keys[poolId].hooks)] == address(0);
+        return !_priced(address(keys[poolId].hooks));
     }
 
     /// @dev Whether the walk reads this pool from the search's answers instead of the pool

@@ -220,9 +220,10 @@ contract ArbitrageGasTest is ArbitrageWorld {
         _addHooked(address(usd), 100);
         uint256 few = _noGapCost();
         assertLt(few, 420_000, "six pools, all leaders");
-        // The figure after the gas audit (docs/specs/hook-gas-2026-11-23.md), 245,150, and the
-        // same small margin as before: 211 gas. It was 252,000 before the audit.
-        assertLe(few, 245_361, "six pools, no gap, gas");
+        // The figure after R1 and R2 of docs/specs/hook-gas-audit-2026-11-28.md, 241,003, and
+        // the same small margin as before: 211 gas. It was 245,150 after the 2026-11-23 audit
+        // and 252,000 before it.
+        assertLe(few, 241_214, "six pools, no gap, gas");
         emit log_named_uint("no-gap swap gas, six pools", few);
         poolUnits = 1_000e18;
         for (uint256 index; index < 60; index++) {

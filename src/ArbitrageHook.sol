@@ -129,6 +129,7 @@ contract ArbitrageHook is EntryPart {
         if (sig == CyclePart.execute.selector) return cycleModule;
         if (sig == CyclePart.retire.selector) return cycleModule;
         if (sig == SizerPart.size.selector) return sizerModule;
+        if (sig == SizerPart.ahead.selector) return sizerModule;
         return adminModule;
     }
 }

@@ -60,8 +60,9 @@ contract OpenArbitrageMarket is Script {
         uint64 edge;
     }
 
-    /// More than the largest set of leaders a market can have needs.
-    uint32 internal constant CEILING = 9_000_000;
+    /// What a market that is on is raised to before its leaders change, enough for two full
+    /// tokens (12.56M). A larger set needs `MARKET_GAS_LIMIT` to say so.
+    uint32 internal constant CEILING = 13_000_000;
 
     error MissingHook();
     error MismatchedLists();
@@ -118,19 +119,20 @@ contract OpenArbitrageMarket is Script {
 
     /// @dev Naming more leaders, or choosing tokens whose groups are already set, needs a
     /// larger gas allowance, and is refused without it.
-    /// A market that is on is given the most any leaders can need first, so that it never
-    /// has to be switched off; `_setLimits` then sets what was asked for.
+    /// A market that is on is given the larger of `CEILING` and the allowance asked for
+    /// first, so that it never has to be switched off; `_setLimits` then sets what was asked for.
     function _makeRoom(Config memory config, uint256 id) internal {
         if (config.groups.length == 0) {
             if (config.tokens.length == 0) return;
         }
         ArbitrageLogic.Market memory settings = config.hook.market(id);
         if (settings.gasLimit == 0) return;
-        if (settings.gasLimit >= CEILING) return;
+        uint32 room = config.gasLimit > CEILING ? config.gasLimit : CEILING;
+        if (settings.gasLimit >= room) return;
         address base = config.tokens.length != 0 ? config.tokens[0] : config.groups[0].base;
         config.hook
             .setLimits(
-                id, base, CEILING, config.hook.minimumProfit(id, base), settings.minimumEdge
+                id, base, room, config.hook.minimumProfit(id, base), settings.minimumEdge
             );
     }
 
@@ -140,7 +142,9 @@ contract OpenArbitrageMarket is Script {
         uint64 edge = config.edge;
         if (edge == 0) edge = config.hook.market(id).minimumEdge;
         uint256 needed = config.hook.minimumGasLimit(id);
-        uint32 gas = config.gasLimit > needed ? config.gasLimit : uint32(needed);
+        uint32 gas = config.gasLimit > needed
+            ? config.gasLimit
+            : uint32(_narrow(needed, type(uint32).max));
         for (uint256 index; index < config.limits.length; index++) {
             Limit memory limit = config.limits[index];
             config.hook.setLimits(id, limit.base, gas, limit.profit, edge);
@@ -153,42 +157,48 @@ contract OpenArbitrageMarket is Script {
     }
 
     /// @dev Pools are given as parallel lists, one entry per pool. One group of leaders
-    /// and one profit floor can be given per run; leave `PROFIT_TOKEN` out to set none.
+    /// and one profit floor can be given per run; leave `MARKET_PROFIT_TOKEN` out to set none.
     function _readConfig() internal view returns (Config memory config) {
         config.hook = ArbitrageApi(payable(vm.envAddress("ARBITRAGE_HOOK")));
         config.owner = vm.envAddress("MARKET_OWNER");
         config.market = vm.envOr("MARKET_ID", uint256(0));
         config.recipient = vm.envOr("MARKET_RECIPIENT", config.owner);
         config.tokens = vm.envOr("MARKET_TOKENS", ",", new address[](0));
-        config.pools = _readPools("POOL", address(config.hook));
-        uint256[] memory prices = vm.envOr("POOL_PRICE", ",", new uint256[](0));
+        config.pools = _readPools("MARKET_POOL", address(config.hook));
+        uint256[] memory prices = vm.envOr("MARKET_POOL_PRICE", ",", new uint256[](0));
         config.prices = new uint160[](prices.length);
         for (uint256 index; index < prices.length; index++) {
             config.prices[index] = uint160(_narrow(prices[index], type(uint160).max));
         }
-        config.venues = _readPools("VENUE", address(0));
-        config.connectors = _readPools("CONNECTOR", address(0));
-        address base = vm.envOr("LEADER_BASE", address(0));
+        config.venues = _readPools("MARKET_VENUE", address(0));
+        config.connectors = _readPools("MARKET_CONNECTOR", address(0));
+        address base = vm.envOr("MARKET_LEADER_BASE", address(0));
         if (base != address(0)) {
             config.groups = new Group[](1);
             config.groups[0] = Group(
-                base, vm.envAddress("LEADER_PARTNER"), vm.envBytes32("LEADER_POOLS", ",")
+                base,
+                vm.envAddress("MARKET_LEADER_PARTNER"),
+                vm.envBytes32("MARKET_LEADER_POOLS", ",")
             );
         }
-        address profitToken = vm.envOr("PROFIT_TOKEN", address(0));
+        address profitToken = vm.envOr("MARKET_PROFIT_TOKEN", address(0));
         if (profitToken != address(0)) {
             config.limits = new Limit[](1);
             config.limits[0] = Limit(
-                profitToken, uint128(_narrow(vm.envUint("MINIMUM_PROFIT"), type(uint128).max))
+                profitToken,
+                uint128(_narrow(vm.envUint("MARKET_MINIMUM_PROFIT"), type(uint128).max))
             );
         }
         config.gasLimit =
             uint32(_narrow(vm.envOr("MARKET_GAS_LIMIT", uint256(0)), type(uint32).max));
-        config.edge = uint64(_narrow(vm.envOr("MINIMUM_EDGE", uint256(0)), type(uint64).max));
+        config.edge =
+            uint64(_narrow(vm.envOr("MARKET_MINIMUM_EDGE", uint256(0)), type(uint64).max));
     }
 
-    /// @dev `<PREFIX>_TOKEN0`, `_TOKEN1`, `_FEE` and `_TICK_SPACING`, with `_HOOKS` where a
-    /// list of connecting pools includes the market's own pools on the hook.
+    /// @dev Every name starts with `MARKET_`, so none collides with the other scripts'
+    /// (Foundry loads `.env` into all of them). `<PREFIX>_TOKEN0`, `_TOKEN1`, `_FEE` and
+    /// `_TICK_SPACING`, with `_HOOKS` where a list of connecting pools includes the market's
+    /// own pools on the hook.
     function _readPools(string memory prefix, address hooks)
         internal
         view
